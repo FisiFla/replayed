@@ -3859,3 +3859,9 @@ that can be prepared and *checked* without the remote has been:
 What remains is not preparation: pushing `main`, cutting the tag(s), and installing the result to
 watch it update — decisions and a release page, not code or measurements. The `0.2.1` bump is
 committed on `main` and **not tagged**.
+
+### The prepared tree, checked on the box at HEAD
+After the `0.2.1` bump, the box's clone was fast-forwarded to `bf900b8` and re-run rather than
+trusting the older numbers: `cargo check --workspace` finishes clean there, and the desktop crate's
+suite is **283 passed, 0 failed** at that commit. So the version bump and the changelog section on
+disk are the ones that compile and test on Windows, not just on the development host.
