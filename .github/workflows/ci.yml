@@ -139,6 +139,10 @@ jobs:
           # The exact compiler, not the `stable` branch's head: a release is reproducible only if
           # the version that compiled it is named. Bump this and `Cargo.lock` together.
           toolchain: 1.99.1
+          # A named toolchain installs without the default components, so the ones this
+          # job runs (`cargo fmt`, `cargo clippy`) must be asked for or the steps fail
+          # with "is not installed for the toolchain".
+          components: rustfmt, clippy
           # Add the cross-check target's std here; no MSVC linker is needed because
           # `cargo check` and `cargo clippy` both stop before linking.
           targets: x86_64-pc-windows-msvc
@@ -348,6 +352,8 @@ jobs:
         with:
           # The exact compiler, not the `stable` branch's head (see the note above).
           toolchain: 1.99.1
+          # As in the macOS job: a named toolchain has no clippy unless it is asked for.
+          components: clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
