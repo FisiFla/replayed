@@ -380,6 +380,29 @@ pub fn frames_per_second(frames: u64, window: Duration) -> Option<f64> {
     fps.is_finite().then_some(fps)
 }
 
+/// When the frame fed `index` frames into a probe exchange was "captured": an exact `fps` grid
+/// from the first frame.
+///
+/// It lives here, outside the Windows-only module, because it is arithmetic and can be tested on
+/// every host. It is the probe's synthetic timeline: the hardware-encoder probe has no capture
+/// behind it, so it makes times up — but they must be the *recording's* times, a frame per
+/// `1/fps`, because the timeline is what the encoder's rate control budgets the bitrate against.
+/// Frames a second apart told the encoder its stream was one frame per second while the sample
+/// durations said otherwise.
+///
+/// Microseconds rather than milliseconds, so a rate that does not divide a second evenly still
+/// marches without accumulating whole-unit error. `fps = 0` is read as one frame per second rather
+/// than dividing by zero; no configuration produces it (the encoder validates a non-zero rate),
+/// and a probe must not panic on the way to saying so.
+///
+/// Built on Windows, where the hardware probe uses it, and in tests, where the arithmetic is
+/// pinned on every host: off Windows a non-test build has no caller, and a helper that is only
+/// ever unused is dead code that `-D warnings` refuses.
+#[cfg(any(windows, test))]
+pub(crate) fn frame_time(index: u64, fps: u32) -> Duration {
+    Duration::from_micros(index.saturating_mul(1_000_000) / u64::from(fps.max(1)))
+}
+
 /// Write `frame` to `sink` as fast as it is accepted, until `budget` elapses or the sink stops
 /// taking it. Returns the frames accepted in the measured window and how long it was.
 ///
@@ -466,6 +489,20 @@ fn probe_frame(size: (u32, u32)) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_probe_timeline_marches_at_the_frames_own_interval() {
+        // What the hardware probe tells the encoder each synthetic frame cost, in time. The first
+        // frame is the origin, the sixtieth is one second in at 60fps, and a rate that does not
+        // divide a second leaves the grid exact in microseconds rather than drifting.
+        assert_eq!(frame_time(0, 60), Duration::ZERO);
+        assert_eq!(frame_time(1, 60), Duration::from_micros(16_666));
+        assert_eq!(frame_time(59, 60), Duration::from_micros(983_333));
+        assert_eq!(frame_time(60, 60), Duration::from_secs(1));
+        assert_eq!(frame_time(120, 30), Duration::from_secs(4));
+        // A zero rate is not a division by zero on the failure path.
+        assert_eq!(frame_time(3, 0), Duration::from_secs(3));
+    }
     use crate::VideoCodec;
 
     /// A configuration at a small size: these tests are about the arithmetic and bounds, not 4K speed.

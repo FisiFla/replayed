@@ -49,7 +49,7 @@ Order: correctness → parity you asked for → Windows proof → unsigned relea
 5. Watch-list editor in the panel (add/remove `[[games.watch]]` entries by exe name, writing `config.toml`); optional per-game `save_session` override only if the global toggle proves too coarse.
 6. Session naming/metadata: auto sessions carry the game name (already known to the supervisor) so the Sessions view reads "Valorant — full session" instead of a bare timestamp.
 
-### Phase C — Windows verification sweep (ledger §9)
+### Phase C — Windows verification sweep (ledger §9; step 7 is manual and open, step 8's probe fix is in — ledger §40)
 
 7. By hand on the Windows box: auto full-session with a non-integrated game (R6 under BattlEye conditions already used); one LoL bot game + one CS2 round; hidden-window `Ctrl+F8`; CLI+app hotkey collision; every tray item; `start_with_system` registry write/removal.
 8. Fix #79 (per-frame texture in MFT probe; run its Windows-only test on Windows). Diagnose MFT at 4K120; measure zero-copy 120 fps or cap the picker. `cargo xtask verify` clean; watch 3 clips with audio; start 72-hour soak. Document the ≈1.8–2× bitrate overshoot honestly in USER-GUIDE.

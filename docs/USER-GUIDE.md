@@ -230,6 +230,14 @@ Recording above 60 fps at 4K asks more of the machine than 4K at 60 does, and a 
 cannot be encoded in time is dropped rather than held — the panel's live counters say so while
 it happens.
 
+**The quality preset is a target, not a cap: expect about 1.8–2× the bitrate it names.** Two
+paired runs on the test machine, both asked for 20 Mbit/s, wrote 39.6 Mbit/s with H.264 (1.98×)
+and 35.7 Mbit/s with HEVC (1.79×), and the measurement is in the ledger (§18). The encoder's own
+rate-control interface was set to the target afterwards and the file did not move (§19), so this
+is the hardware encoder aiming near a number rather than holding it. Budget disk from the
+overshoot: the preset says "Balanced (20 Mbit/s)" but a 4K/60 recording is closer to 40 Mbit/s,
+which is about 18 GB an hour rather than 9.
+
 ---
 
 ## The games that are supported

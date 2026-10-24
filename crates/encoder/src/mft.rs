@@ -24,6 +24,7 @@
 //! than two that can disagree.
 
 use crate::ffmpeg::{VideoChunk, MFT_TIMEOUT};
+use crate::throughput::frame_time;
 use crate::timeline::{capture_pts, FramePairing};
 use crate::{
     choose_output_type, classify_output_failure, type_change_refusal, OutputFailure,
@@ -62,9 +63,10 @@ use windows::Win32::Media::MediaFoundation::{
     MFVideoFormat_ARGB32, MFVideoFormat_H264, MFVideoFormat_HEVC, MFVideoFormat_HEVC_ES,
     MFVideoFormat_NV12, MFVideoFormat_P010, MFVideoFormat_RGB32, MFVideoFormat_YUY2,
     MFVideoInterlace_Progressive, MFSTARTUP_FULL, MFT_CATEGORY_VIDEO_ENCODER,
-    MFT_CATEGORY_VIDEO_PROCESSOR, MFT_ENUM_FLAG_HARDWARE, MFT_MESSAGE_COMMAND_DRAIN,
-    MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, MFT_MESSAGE_NOTIFY_END_OF_STREAM,
-    MFT_MESSAGE_NOTIFY_START_OF_STREAM, MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER,
+    MFT_CATEGORY_VIDEO_PROCESSOR, MFT_ENUM_FLAG_HARDWARE, MFT_INPUT_STATUS_ACCEPT_DATA,
+    MFT_MESSAGE_COMMAND_DRAIN, MFT_MESSAGE_NOTIFY_BEGIN_STREAMING,
+    MFT_MESSAGE_NOTIFY_END_OF_STREAM, MFT_MESSAGE_NOTIFY_START_OF_STREAM,
+    MFT_MESSAGE_SET_D3D_MANAGER, MFT_OUTPUT_DATA_BUFFER, MFT_OUTPUT_STATUS_SAMPLE_READY,
     MF_EVENT_FLAG_NO_WAIT, MF_MT_AVG_BITRATE, MF_MT_FRAME_RATE, MF_MT_FRAME_SIZE,
     MF_MT_INTERLACE_MODE, MF_MT_MAJOR_TYPE, MF_MT_MAX_KEYFRAME_SPACING, MF_MT_MPEG2_LEVEL,
     MF_MT_MPEG2_PROFILE, MF_MT_MPEG_SEQUENCE_HEADER, MF_MT_PIXEL_ASPECT_RATIO, MF_MT_SUBTYPE,
@@ -2545,6 +2547,17 @@ pub struct MftThroughput {
     pub renegotiations: u32,
 }
 
+/// How many textures the probe rotates through, one per fed frame.
+///
+/// The recording hands the encoder the texture it just captured, so every frame it encodes is a
+/// different resource. The probe used to hand over the *same* texture on every frame: legal (the
+/// sample is refcounted and the encoder does not write to it) but not what the recording does, and
+/// the one difference between the probe and the recording that is on the probe's side of the
+/// boundary. A small rotating pool reproduces "a different surface each frame" without holding a
+/// frame buffer: these are GPU surfaces, zero-filled, and the encoder is their only reader. Four
+/// is enough that a texture the encoder still references is not the next one handed over.
+const PROBE_TEXTURES: usize = 4;
+
 /// How long the encoder is given to settle before the measured window opens.
 ///
 /// The first frames of an encode session are not representative of the rest: the session is
@@ -2582,6 +2595,50 @@ fn renegotiation_note(renegotiated: u32) -> String {
              renegotiated."
         )
     }
+}
+
+/// What the encoder says about itself when the probe's exchange fails.
+///
+/// The COM error names the call that failed, not the reason. An encoder that answers
+/// `0x8000FFFF` ("catastrophic failure") to `ProcessInput` has usually already told its event
+/// queue what it wanted and been refused, and the probe used to report the error alone and discard
+/// the rest. What can still be asked, after a failure, is the state the transform is in:
+///
+/// * whether it is accepting input (`MFT_INPUT_STATUS_ACCEPT_DATA`), which separates "the encoder
+///   refused this texture" from "the encoder was already busy";
+/// * whether a sample is ready (`MFT_OUTPUT_STATUS_SAMPLE_READY`), which separates "the exchange
+///   stopped reading output" from "the encoder never produced any";
+/// * which encoder it was and how many times it renegotiated its type.
+///
+/// All read-only queries on a live transform, so they are safe to ask on the failure path.
+fn probe_failure_note(encoder: &MftEncoder, fed: u64, finished: u64) -> String {
+    // SAFETY: both are queries on this transform's own streams; neither changes its state.
+    let input = unsafe { encoder.transform.GetInputStatus(0) }
+        .map(|flags| {
+            if flags & MFT_INPUT_STATUS_ACCEPT_DATA.0 as u32 != 0 {
+                "accepting input".to_string()
+            } else {
+                format!("not accepting input (0x{flags:08X})")
+            }
+        })
+        .unwrap_or_else(|err| format!("unreadable (0x{:08X})", err.code().0));
+    // SAFETY: as above, output stream 0 is the encoder's only one.
+    let output = unsafe { encoder.transform.GetOutputStatus() }
+        .map(|flags| {
+            if flags & MFT_OUTPUT_STATUS_SAMPLE_READY.0 as u32 != 0 {
+                "a sample is ready".to_string()
+            } else {
+                format!("no sample ready (0x{flags:08X})")
+            }
+        })
+        .unwrap_or_else(|err| format!("unreadable (0x{:08X})", err.code().0));
+    format!(
+        "the hardware encoder ({} at {}x{}) failed after {fed} frame(s) handed over and          {finished} finished: it is {input}, and {output}.{}",
+        encoder.encoder_name,
+        encoder.size.0,
+        encoder.size.1,
+        renegotiation_note(encoder.renegotiated)
+    )
 }
 
 /// Measure how many frames per second this machine's hardware encoder encodes at `size`.
@@ -2622,7 +2679,12 @@ pub fn measure_encode_fps(
     )?;
     let encoder_name = encoder.encoder_name.clone();
     let input_format = encoder.input_format.clone();
-    let texture = synthetic_capture_texture(&device, size, dxgi_for_input(&input_format))?;
+    // One texture per fed frame (see `PROBE_TEXTURES`): the recording hands the encoder a fresh
+    // captured surface every frame, and a probe that re-used one was not measuring that.
+    let format = dxgi_for_input(&input_format);
+    let textures = (0..PROBE_TEXTURES)
+        .map(|_| synthetic_capture_texture(&device, size, format))
+        .collect::<Result<Vec<_>>>()?;
     encoder.start()?;
 
     // The exchange, counted. `frames` counts what the encoder *finished*, which is the only
@@ -2647,18 +2709,27 @@ pub fn measure_encode_fps(
                 renegotiation_note(encoder.renegotiated)
             );
         }
-        match encoder.next_event()? {
+        let event = encoder
+            .next_event()
+            .with_context(|| probe_failure_note(&encoder, fed, frames))?;
+        match event {
             Some(EncoderEvent::NeedInput) => {
-                // The probe has no capture behind it, so it makes up a capture time: the frames
-                // it hands over are a second apart, which is what the recording's own frames are
-                // not. The encoder is told the frame's time so that the stream it sees is a
-                // timeline, exactly as the recording's is.
+                // The probe has no capture behind it, so it makes up a capture time. The interval
+                // is the one the encoder will actually be fed at — a frame per 1/fps — because
+                // the timeline is what the rate control budgets against: frames a second apart
+                // told the encoder this stream was one frame per second while `fps` said
+                // otherwise, which is not the recording's stream either way.
                 fed = fed.saturating_add(1);
-                let captured_at = Duration::from_secs(fed.saturating_sub(1));
-                encoder.push_texture(&texture, captured_at)?;
+                let captured_at = frame_time(fed - 1, fps);
+                let texture = &textures[(fed as usize - 1) % textures.len()];
+                encoder
+                    .push_texture(texture, captured_at)
+                    .with_context(|| probe_failure_note(&encoder, fed, frames))?;
             }
             Some(EncoderEvent::HaveOutput) => {
-                let produced = encoder.take_output(&mut scratch)?;
+                let produced = encoder
+                    .take_output(&mut scratch)
+                    .with_context(|| probe_failure_note(&encoder, fed, frames))?;
                 // The bytes are not the measurement; the count is. Dropped so the probe does
                 // not hold a window's worth of encoded video.
                 scratch.clear();

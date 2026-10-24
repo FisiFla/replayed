@@ -3263,3 +3263,50 @@ remove / refuse-empty / warning behaviour in jsdom.
   one has added a game in a real window and watched a real title start recording.
 - No real game has been auto-recorded through the new section, so "Fortnite in, one session out"
   is still a claim about code rather than a measurement.
+## 40. The throughput probe hands over a texture per frame, and says what the encoder said (2026-10-24)
+
+### The fault, as far as it is known
+Issue #79: the Media Foundation throughput probe fails on the Windows test machine with
+`IMFTransform::ProcessOutput: Catastrophic failure (0x8000FFFF)`, while the recording's own
+encoder runs the whole session on the same machine at the same size, rate and mode. The probe is
+the only thing that tells the app what the machine can sustain, so when it fails the recording
+runs at the configured rate with no evidence of whether that is achievable — fail-soft, and
+therefore quiet.
+
+The issue listed three candidate differences between the probe and the recording. Two of them
+were the probe's, and are now gone:
+
+1. **It submitted the same texture every frame.** The recording hands over the texture it just
+   captured, so every frame it encodes is a different D3D11 resource. The probe built one
+   zero-filled surface and re-submitted it for the whole measurement — legal (the sample is
+   refcounted and the encoder does not write to it) but not what the recording does, which made
+   it the single difference between the two on the probe's side of the boundary. The probe now
+   rotates a pool of four (`PROBE_TEXTURES`), so a surface the encoder still references is not
+   the one handed over next.
+2. **It told the encoder a one-frame-per-second timeline.** Its synthetic `captured_at` advanced
+   by a whole second per frame while the sample duration said `1/fps`, so the stream's timestamps
+   and its declared durations disagreed by 600× at 60fps — and the timeline is exactly what the
+   hardware rate control budgets bits against. The synthetic clock now marches on the real frame
+   interval (`frame_time`, in `throughput.rs` so it is tested on every host; 60 frames at 60fps
+   is exactly one second).
+
+And its diagnostics are no longer just the COM code. `probe_failure_note` reports, on the failure
+path, what the transform will still answer: whether it is accepting input
+(`MFT_INPUT_STATUS_ACCEPT_DATA`), whether a sample is ready (`MFT_OUTPUT_STATUS_SAMPLE_READY`),
+which encoder it is, and how many times it renegotiated its type. That is the difference between
+"a catastrophic failure" and "the encoder was already busy" or "the encoder never produced output".
+
+### Evidence
+`cargo check -p replayed-encoder --target x86_64-pc-windows-msvc` and the CI's Windows-target
+clippy over the cross-checkable crates (`-D warnings`, `--all-targets`, `test-encoders`) both
+pass, so the Windows-only code compiles and is lint-clean. The one part that is not Windows-only
+— the synthetic timeline — has a host test (`the_probe_timeline_marches_at_the_frames_own_interval`)
+and the encoder crate's suite is green.
+
+### What is NOT verified
+**Nothing here has run on Windows, and #79 is not closed by this.** Whether the fault follows the
+input (the probe's fault) or the encoder/machine (not the probe's) is exactly what only a Windows
+run can say: `cargo test -p replayed-encoder --test ...` for
+`the_hardware_encoders_rate_is_measured_the_same_way_on_every_run` (which measures 4K three times
+and asserts the spread) has still never run on the box, and the probe has not been re-run there.
+The measurement step of the plan's Phase C remains open, as do the 4K120 question and the soak.
