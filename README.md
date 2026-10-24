@@ -82,7 +82,9 @@ these is a bug, not a tradeoff.
 **Pre-alpha, but far past "initialized".** The replay-buffer pipeline, the storage
 manager and the desktop app all exist; Phase 1 has run on real Windows hardware six times
 (2026-09-23, 09-24, 09-25, 10-15, 10-16 and 10-17), and the desktop GUI was run in a real
-session on 2026-09-26; the game-event integrations are implemented. What those runs
+session on 2026-09-26; the game-event integrations are implemented. On 2026-10-24 the whole
+automated sweep ran there again and `cargo xtask verify` passed (29 checks, 0 failed), and the
+app's UI was read out of a real window (§47–§54). What those runs
 *proved* and *refuted* — and, critically, the large amount of Windows code that has been
 written and type-checked but **never executed** — is recorded item by item in
 [`docs/verification-status.md`](docs/verification-status.md). **Read that file before
@@ -92,7 +94,9 @@ The short version: on 4K Windows hardware the pipeline runs and produces correct
 The 2026-09-23 session failed the frame-rate and CPU criteria (~24 fps against 30
 configured, 1183 of 1814 frames submitted dropped — 65% — and ~50.8% of a core); both are
 now met on the zero-copy path — 59.6 of 60 fps with no dropped frames at 3.1–4.0% of one
-core (§13, §15). Everything after the 2026-09-24 session is itemised in the ledger, which
+core (§13, §15). That CPU figure is against a *still* screen: the cost is per frame the screen
+presents, so on 2026-10-24 the harness read 6.55% while the display offered 58.5 frames/s, inside
+a bound that scales with the offered rate (§48, issue #93). Everything after the 2026-09-24 session is itemised in the ledger, which
 records what has since been re-measured on Windows and what has not. The *capture path*
 targets Windows only; off Windows the pipeline runs a synthetic stub, so a green `cargo
 test` proves none of the eight acceptance criteria.
@@ -432,8 +436,10 @@ stays manual.
       recording wiring exist, and so do the tray, the global clip hotkey and the
       hide-on-close behaviour that make it a background application; all of it is exercised
       **headlessly in CI**, and the window itself was opened once on the Windows test
-      machine on 2026-09-26 — the tray, the keypress and the hide have never been observed
-      on any machine.
+      machine on 2026-09-26. The UI has since been read out of a real session through UI
+      Automation (§54), and on 2026-10-24 hide-on-close and the hotkey *installation* were
+      observed on the Windows box (§51) — the tray's icon and a physically pressed key still
+      have not been.
 - [x] **Phase 3** — SQLite index, storage manager, auto-cleanup policies *(host-verified,
       and the bundled-SQLite store now builds and its tests run on the Windows box too)*
 - [x] **Phase 4** — LoL Live Client + CS2/Dota2 GSI event integrations *(implemented and
@@ -463,8 +469,11 @@ stays manual.
 > audio timeline, not a test defect at all — was later explained and fixed (ledger §10.4).
 > What has *still* never run anywhere: the
 > either game integration against a real game, and any synthesised keypress. (The desktop GUI
-> did run on the Windows test machine on 2026-09-26, and `cargo xtask verify` on 2026-10-15; the tray, the
-> keypress and hide-on-close are still unobserved.) The per-item truth is in
+> did run on the Windows test machine on 2026-09-26, and `cargo xtask verify` on 2026-10-15; on
+> 2026-10-24 `cargo xtask verify` passed there (29 checks, §47–§48), the UI was read out of a real
+> window (§54), hide-on-close and the hotkey install were observed (§51), and autostart wrote and
+> then removed its registry value (§50). Still unobserved: the tray icon itself in the notification
+> area, and a physically pressed key.) The per-item truth is in
 > [`docs/verification-status.md`](docs/verification-status.md) — §10 is that session, and its
 > headline paragraph is the short version.
 
