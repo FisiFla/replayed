@@ -21,11 +21,12 @@ verification harness — one criterion fails there.** Written 2026-10-24 against
   value (§50); closing the window hides it and the process stays, with the log saying so (§51);
   the clip hotkey really installs (`the clip hotkey Ctrl+F8 is installed`, §51).
 - **Still open in Phase C:** a real game with an integration (LoL / CS2 / Dota 2) — the one item
-  that needs the owner at the machine — the tray icon as *seen* (visibility/menu, the last
-  observation is the 2026-09-26 session), and 4K120, which is unmeasurable on this box: its display
-  runs at ~60 Hz, so the picker cannot offer 120 (the probe's ceiling at 4K is ~155 fps, §49). The
-  **72-hour soak is dropped by the owner's decision** (§48) — a measurement that will not be made,
-  not one that was failed.
+  that needs the owner at the machine — the tray icon's *visibility* (Windows 11 keeps it in the
+  overflow, and the accessible tree does not list it; §53), the UI as *rendered* (§53 looked and
+  found the `devUrl` error page, because a `cargo build` binary is not the shipping UI), and 4K120,
+  which is unmeasurable on this box: its display runs at ~60 Hz, so the picker cannot offer 120
+  (the probe's ceiling at 4K is ~155 fps, §49). The **72-hour soak is dropped by the owner's
+  decision** (§48) — a measurement that will not be made, not one that was failed.
 - **Step 9 is prepared and not executed.** No tag has ever been cut; the tree is now version
   `0.2.1` with a `[0.2.1]` changelog section the updater's notes extractor matches, and the
   sidecar pin has been verified on the box (fetch + SHA-256 + the two binaries run, ledger §52).
