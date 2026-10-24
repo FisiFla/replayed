@@ -507,6 +507,15 @@ owner may be mid-game. So, stated explicitly:
 - **Building an installer is a compile-and-bundle step.** It runs `cargo build`, the Vite
   frontend build, `npm run sidecars:check`, and (on Windows) NSIS or WiX. It does **not** launch
   the application — `npm run tauri -- build` never does; that is `tauri dev`'s job.
+- **A `cargo build` binary is not the shipping UI.** The desktop crate's `tauri.conf.json` carries
+  both `frontendDist` (`../dist`) and `devUrl` (`http://localhost:5173`), and a binary produced by
+  `cargo build` or `cargo build --release` *in this workspace* loads the dev URL — so its window
+  shows `ERR_CONNECTION_REFUSED` unless the Vite server is running. Verified the hard way on the
+  Windows box (2026-10-24): both profiles rendered the error page, and UI Automation read
+  `ERR_CONNECTION_REFUSED` out of the window. To look at the real UI, either run
+  `npm run tauri -- dev` (or `npm run dev` beside the binary) or build through the CLI
+  (`npm run tauri -- build`), which is what the installer is made from. `cargo build` alone
+  compiles the crate and proves nothing about what the window will show.
 - **Installing and running are separate, later, human decisions.** Nothing here requires them,
   and §5.6/5.8 record them as not done.
 - **No part of the packaging path captures the screen, enumerates windows, or synthesises
