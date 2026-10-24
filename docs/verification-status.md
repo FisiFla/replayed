@@ -3865,3 +3865,56 @@ After the `0.2.1` bump, the box's clone was fast-forwarded to `bf900b8` and re-r
 trusting the older numbers: `cargo check --workspace` finishes clean there, and the desktop crate's
 suite is **283 passed, 0 failed** at that commit. So the version bump and the changelog section on
 disk are the ones that compile and test on Windows, not just on the development host.
+## 53. Looking at the window: the app is up, its UI is not what a `cargo build` shows (2026-10-24)
+
+Phase C had two items in the "a human has to look" column: the tray icon as *seen*, and the window
+as *rendered*. This section is what happened when the looking was done programmatically — a real
+desktop capture plus Windows' accessibility tree — and it is a mixed answer, which is why it is
+written down.
+
+**What was captured.** The capture crate's frame test grew an opt-in (`REPLAYED_WGC_FRAME_OUT`) that
+keeps the PNG instead of deleting it with the temporary directory, so a verification run can look
+at the frame. With the app running in the logged-on session and activated, the box produced a
+3840x2160 PNG of its desktop (3,142,655 bytes), which is the first *picture* of this application on
+Windows that the ledger has. A crop to the window's exact rectangle (1942x1376 at 190,190, read
+from UI Automation's `BoundingRectangle`) is 146 KiB.
+
+**What UI Automation says about the window.** The window exists and belongs to the process —
+`[ControlType.Window] replayed` — with one child pane, `io.github.fisifla.replayed-siw`, which is
+the WebView2 surface. So the shell, its window and its webview are real on that machine.
+
+**What the webview is showing is an error page.** Walking the window's subtree (the renderer runs in
+its own `msedgewebview2.exe` process, so a process-scoped query cannot see it) returns, in tree
+order:
+
+```
+Pane | localhost
+Text | Hmmm. can't reach this page
+Text | localhost
+Text | refused to connect.
+Text | ERR_CONNECTION_REFUSED
+Button | Refresh
+```
+
+That is `devUrl` — `http://localhost:5173` — and neither `cargo build` nor `cargo build --release`
+produces a binary that loads anything else: both profiles were run and both showed the same page,
+and Vite was not running on the box (its clone has no `node_modules`, and the attempt to start it
+failed with `'vite' is not recognized`). **So this round proves the window and the webview, and does
+not prove the UI.** The `docs/packaging.md` note records the trap; the shipping UI comes from
+`npm run tauri -- build`, which the installer uses.
+
+**The tray icon is not in the accessible notification area.** UI Automation's `Shell_TrayWnd`
+subtree has 31 elements; the names include the taskbar's buttons (`Start`, `Search`,
+`replayed - 2 running windows`, and the pinned apps) but **no tray entry for replayed**. Windows 11
+keeps new icons in the overflow flyout, whose contents are not in the tree until it is opened, and
+opening it would mean synthesising a click — which this project does not do on that machine. So the
+tray's *visibility* stays unverified; what is verified is that the app uses the tray (the
+`tray: quit` line in §10's session, and `the window is hidden … stays in the tray` in §51), and
+that the taskbar shows a window button for the process. The stale `- 2 running windows` count is an
+artefact of the force-killed instance earlier in this session, not a second window: the process owns
+exactly one `ControlType.Window` element.
+
+**For the next attempt at the UI:** run `npm install` in `apps/desktop` on the box (it was never
+run there — only `dist` was shipped), then `npm run dev` beside the binary, or build through
+`npm run tauri -- build`. The UIA dump is the instrument that worked: it read the error page's text
+character for character where a screenshot only suggested it.
