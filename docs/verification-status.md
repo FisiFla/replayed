@@ -3641,3 +3641,53 @@ node is not on that machine's `PATH` — the shell's crate was not built there t
 game session with an integration (LoL/CS2/Dota 2); the tray, hide-on-close and autostart as
 observed behaviour; the 72-hour soak; and 4K120 (the verify run's probe sustained 156 fps at
 60 fps configured, but the 120 fps question is about the live path, not the probe).
+## 48. The CPU criterion is a cost per offered frame, and this box offers 58 a second (2026-10-24)
+
+§47 recorded four `xtask verify` runs on the box, every one failing the same check: steady-state
+CPU against a **< 5% of one core** target. This section is what four runs and the reports' own
+numbers say about it.
+
+| run | window | CPU | frames the display offered |
+|---|---|---|---|
+| 1 (`--seconds 20`) | 16.2 s | **5.22%** | ~58/s |
+| 2 (`--seconds 20`) | 16.2 s | **5.49%** | 60.0/s |
+| 3 (`--seconds 20`, the fixed script) | 16.2 s | **7.45%** | 59.4/s |
+| 4 (`--seconds 45`, the default window) | 34.4 s | **5.55%** | 58.2/s |
+
+**It is not the short window.** The 45-second run has a 34-second steady-state window and the
+figure is unchanged, so this is steady state, reproducibly missed by 0.2–2.5 points.
+
+**What the figure is a cost of.** The pipeline is judged on the frames the *display* presents, not
+the frames the pacer keeps: at `configured=30` the pacer admits 30, skips the rest, and the run
+offers **~58–60 frames/s** — because the desktop is continuously changing. That machine runs
+**23 Chrome processes**, two virtual display adapters (SudoMaker, Sunshine) and a 3840×2160
+desktop at 150%; connecting with the capture's own words, `capture_wait` and `capture` together
+account for ~22–23% of the loop's wall clock and `pacer_sleep` for ~76%, so ~98% of the recorder
+loop is *waiting*, and what the other threads do is hand ~60 4K frames a second from WGC to the
+encoder — 33 MB each, none of it crossing to the CPU on the zero-copy path.
+
+The ledger's **3.1–4.0%** (§15, and §13's 59.6/60 fps run) was measured on the same code path but
+a **quiet screen**: WGC presents a frame when the screen *changes*, and a still desktop offers a
+few frames a second, so the handover cost per second is a fraction of what an animating one
+costs. The number is not wrong; the criterion is not conditioned on the thing that dominates it.
+
+**What was done about it:** nothing that moves the target. The harness now reports the offered
+rate next to the CPU figure and says, in the criterion itself, that the cost is per frame the
+screen presents. The parsing is `offered_frame_rate`, tested against the shape of the box's own
+status lines. **The threshold stays where it is.**
+
+**What this means, and what it does not.** Phase C's "`cargo xtask verify` clean" is **not met on
+this machine as configured**, and neither is it evidence of a regression from this session: none
+of the new work (screenshots, the watch list, the probe) executes during a steady recording. The
+honest options are the maintainer's:
+
+1. run the criterion on a quiet desktop (the condition §15 measured it under) and record the offer
+   rate with it;
+2. make the criterion frame-rate-aware (e.g. CPU per offered frame, or a bound that scales with
+   the offer rate) — a change to the acceptance criterion, which is a specification decision and
+   not something to slip in under a failing check;
+3. treat 5.2–7.5% on a 4K60 animating desktop as acceptable and raise the target with the numbers
+   written down.
+
+Until one of those is chosen, the ledger says the criterion fails on this box, with the numbers
+and the context that explain why the same code once read 3.1–4.0%.

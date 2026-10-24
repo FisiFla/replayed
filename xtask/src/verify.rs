@@ -1592,6 +1592,23 @@ impl Session {
             SAMPLE_INTERVAL.as_secs_f64()
         );
 
+        // What the display was doing while that was measured. The cost the pipeline is being
+        // judged on is per frame it is *offered*, and Windows Graphics Capture offers a frame
+        // whenever the screen changes: a still desktop offers a few per second, a playing video or
+        // an animating page offers the display's full rate. The same code therefore reads several
+        // times higher on a busy screen, and a number without this context cannot be compared
+        // with a run that had a quiet one (the ledger's 3.1–4.0% was measured on a screen offering
+        // almost nothing; the box's 2026-10-24 runs offered ~58/s with Chrome animating and read
+        // 5.2–7.5%). The target is unchanged — this only says what it was measured against.
+        let offered = offered_frame_rate(run);
+        let context = match offered {
+            Some((rate, skipped)) => format!(
+                "; the display offered {rate:.1} frames/s during the run (pacer skipped \
+                 {skipped}), so the cost is per offered frame, not per admitted one"
+            ),
+            None => String::new(),
+        };
+
         self.hardware_check(
             "cpu",
             "steady-state CPU under 5% of one core",
@@ -1599,14 +1616,16 @@ impl Session {
             "CPU < 5% of ONE core (ΔCPU / Δwall over the window, for the replayed-cli process \
              itself — the same process the runbook's `Get-Process replayed-cli` recipe reads, \
              so the ffmpeg encoder child's own CPU is not counted; Task Manager's per-process \
-             column is normalised across cores and would read 5/N%)",
-            format!("{cpu_percent:.2}% of one core over {window_desc}"),
+             column is normalised across cores and would read 5/N%). **Read it with the display's \
+             offered rate**: the cost is per frame the screen presents, so a still screen reads \
+             far lower than an animating one",
+            format!("{cpu_percent:.2}% of one core over {window_desc}{context}"),
             if cpu_percent < 5.0 {
                 Outcome::Pass
             } else {
                 Outcome::Fail(format!(
                     "the pipeline costs {cpu_percent:.1}% of a core at steady state against a \
-                     < 5% target (issue #1 measured 50.8% at 4K)"
+                     < 5% target (issue #1 measured 50.8% at 4K){context}"
                 ))
             },
         );
@@ -2453,6 +2472,32 @@ struct Status {
     configured: u32,
 }
 
+/// The rate the display offered the pacer over the run, and the count it skipped.
+///
+/// Computed from the same `frames=`/`skipped=` status lines the rate checks read: offered is
+/// `frames + skipped` between the first and last sample, over the wall time between them. `None`
+/// when the run has fewer than two samples to difference (the caller then says nothing rather
+/// than naming a rate it does not have).
+///
+/// It exists because the CPU criterion is a cost *per offered frame*: the same pipeline reads
+/// several times higher on a screen that presents 60 frames a second than on one that presents
+/// three, and a figure without that context is not comparable with a run that had a quieter
+/// screen.
+fn offered_frame_rate(run: &RunOutput) -> Option<(f64, u64)> {
+    let parsed: Vec<(Option<u64>, Status)> = run
+        .find_all("frames=")
+        .filter_map(|line| parse_status(&line.text).map(|status| (line.at_ms, status)))
+        .collect();
+    let (first_t, first) = parsed.first()?;
+    let (last_t, last) = parsed.last()?;
+    let offered = (last.frames + last.skipped).saturating_sub(first.frames + first.skipped);
+    let wall_s = match (first_t, last_t) {
+        (Some(a), Some(b)) if b > a => (b - a) as f64 / 1000.0,
+        _ => return None,
+    };
+    (wall_s > 0.0).then(|| (offered as f64 / wall_s, last.skipped))
+}
+
 fn parse_status(line: &str) -> Option<Status> {
     let fps_field = field(line, "fps")?;
     let (achieved, declared) = fps_field.split_once('/')?;
@@ -3076,6 +3121,41 @@ mod tests {
         assert_eq!((older.declared, older.configured), (30, 30));
         // A line that is missing a field is not a status line, not a half-filled one.
         assert!(parse_status("frames=1 segments=2").is_none());
+    }
+
+    #[test]
+    fn the_offered_rate_is_frames_plus_skips_over_the_wall_time() {
+        // The two samples the box's run really produced (frames admitted, skips closed), a second
+        // apart in `at_ms` terms and 2s apart in wall time: 40 admitted + 76 skipped over 2s.
+        let run = RunOutput {
+            stdout: vec![
+                LogLine {
+                    at_ms: Some(1_000),
+                    text: "frames=10 segments=1 bytes=0 span=1000ms evicted=0 dropped=0 \
+                           dropped_audio=0 skipped=30 fps=10.0/30 configured=30"
+                        .to_string(),
+                },
+                LogLine {
+                    at_ms: Some(3_000),
+                    text: "frames=50 segments=1 bytes=0 span=5000ms evicted=0 dropped=0 \
+                           dropped_audio=0 skipped=106 fps=25.0/30 configured=30"
+                        .to_string(),
+                },
+            ],
+            command: "replayed-cli buffer".to_string(),
+            exit_code: Some(0),
+            timed_out: false,
+            stderr: String::new(),
+            wall: Duration::from_secs(120),
+            samples: Vec::new(),
+        };
+        let (rate, skipped) = offered_frame_rate(&run).expect("two samples are enough");
+        assert!((rate - 58.0).abs() < 0.001, "offered {rate}/s");
+        assert_eq!(skipped, 106);
+        // One sample cannot be differenced, and guessing would be worse than saying nothing.
+        let mut single = run;
+        single.stdout.truncate(1);
+        assert_eq!(offered_frame_rate(&single), None);
     }
 
     #[test]
