@@ -20,7 +20,11 @@ export function describeSettingsUpdate(outcome: UpdateSettingsOutcome): string {
     outcome.applied.length === 0
       ? 'No changes.'
       : `Saved ${outcome.applied.join(', ')}.`;
-  return outcome.restart_reason === null ? saved : `${saved} ${outcome.restart_reason}`;
+  const restart = outcome.restart_reason === null ? '' : ` ${outcome.restart_reason}`;
+  // The registry is a second truth: the setting can be saved while Windows was not changed, and
+  // the notice is the only place that says so.
+  const autostart = outcome.autostart === null ? '' : ` ${outcome.autostart.detail}`;
+  return `${saved}${restart}${autostart}`.trim();
 }
 
 /** The quality presets, mirroring the backend table (`QUALITY_PRESETS` in config.rs). */

@@ -3415,3 +3415,47 @@ Storage view is what found it.
 ### What is NOT verified
 The button has not been pressed in a real window on Windows; what it spawns (`explorer <folder>`)
 is the same command the tray item already uses, and that has been run on the box (§10).
+## 44. Start with Windows is a checkbox, and the first run explains itself (2026-10-24)
+
+### The start-with-Windows switch
+`[app] start_with_system` was the last setting the panel refused to edit, for a reason the guide
+said out loud: "the file is the only switch, because an autostart entry that disagreed with the
+file would be a second, invisible source of truth". That reason is still the design; the
+conclusion was just too strong. The file stays the switch, and the panel can edit the file:
+
+- `SettingEdit::StartWithSystem` writes `[app] start_with_system` through the same `toml_edit`
+  path as every other setting, so comments and the rest of the file survive;
+- `update_settings` then asks Windows, through `background::apply_autostart` — the same
+  `sync_autostart` the startup already runs, with its own injected `reg.exe` boundary — and puts
+  the answer in `UpdateSettingsOutcome.autostart` as a report rather than an error;
+- a failed registry write is reported with the setting **saved** (`applied: false, detail: …`),
+  because the next launch re-syncs the registry from the file. Failing the whole command would
+  claim nothing was saved, which would be false;
+- off Windows the same field carries `NotApplicable`, so the checkbox still persists what the
+  file should say and the notice states that nothing was registered.
+
+The split matters: `update_settings_file` has no executable path and must not spawn `reg.exe`, so
+`apply_autostart_update` takes the boundary as a parameter and is tested with a closure. The
+registry rules themselves were already tested (`background::sync_autostart`, a fake `reg.exe`);
+what is new is the wiring and its reporting.
+
+### The first-run checklist
+An empty library now shows the three steps — start recording, press the chord this process
+installed, find the clip in the grid — instead of one sentence. The chord comes from
+`app_status.hotkey.chord` (the live one, not the documented default), and when nothing is
+installed the card says the hotkey is not active rather than naming a key nothing answers.
+
+### Evidence
+Desktop crate 283 tests (+4): the setting round-trips through the writer and the reader; the
+update reports `app.start_with_system` and leaves the registry alone (it has no `reg.exe` there);
+`apply_autostart_update` maps Enabled/Removed/Unchanged/NotApplicable and a failure to the right
+report; the DTO's JSON key set includes the new field. Frontend 341 tests (+2 in `settings.test.ts`
+for the notice, +2 in `ClipList.test.ts` for the checklist with a live chord and with none),
+`svelte-check` 0/0, the production build. The screenshot harness's settings fixture and its
+`update_settings` fake gained the field and the off-Windows report, so the contract test stays
+true.
+
+### What is NOT verified
+The registry write has still never run on Windows — the checkbox has not been clicked on the box,
+and `reg.exe` is a boundary this host does not implement (the argv and the sync rules are tested,
+the effect is not). The checklist has been rendered in jsdom only, never in a real window.

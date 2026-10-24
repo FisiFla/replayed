@@ -27,6 +27,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     output_size: '',
     mic_enabled: false,
     auto_record: false,
+    start_with_system: false,
     bitrate_kbps: 20000,
     quality: 'balanced',
     capture_monitor: 0,
@@ -48,6 +49,7 @@ function outcome(overrides: Partial<UpdateSettingsOutcome> = {}): UpdateSettings
     applied: [],
     restart_required: false,
     restart_reason: null,
+    autostart: null,
     ...overrides,
   };
 }
@@ -135,6 +137,26 @@ describe('the capture drafts', () => {
 function watch(name: string, exe: string, signal = 'process') {
   return { name, exe, signal };
 }
+
+describe('the settings notice', () => {
+  it('says what the registry did, after what the file says', () => {
+    const message = describeSettingsUpdate(
+      outcome({
+        applied: ['app.start_with_system'],
+        autostart: {
+          applied: false,
+          detail: 'this build is not Windows and has nothing to register',
+        },
+      }),
+    );
+    expect(message).toContain('Saved app.start_with_system.');
+    expect(message).toContain('nothing to register');
+  });
+
+  it('adds nothing when no autostart change was made', () => {
+    expect(describeSettingsUpdate(outcome({ applied: ['encode.fps'] }))).toBe('Saved encode.fps.');
+  });
+});
 
 describe('the watch list', () => {
   it('names a new entry from the executable when the user gives no name', () => {

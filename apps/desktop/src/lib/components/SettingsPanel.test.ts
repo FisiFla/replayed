@@ -33,6 +33,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     output_device: '',
     save_session: false,
     auto_record: false,
+    start_with_system: false,
     bitrate_kbps: 20_000,
     quality: 'balanced',
     capture_monitor: 0,
@@ -188,6 +189,22 @@ describe('the automatic-recording section', () => {
     expect(listed(target)).toEqual([]);
     expect(text(target)).toContain('cannot be empty');
     expect(applyAutomatic(target)!.disabled).toBe(true);
+  });
+
+  it('persists the start-with-Windows switch on its own Apply', async () => {
+    // The file is the switch; the registry is applied after the write and reported separately.
+    const { target, onApply } = await mountPanel(settings());
+    const checkboxes = [...target.querySelectorAll<HTMLInputElement>('input[type=checkbox]')];
+    // The startup switch is the first checkbox on the page (Library, Startup, Capture, ...).
+    const startup = checkboxes[0]!;
+    expect(startup.checked).toBe(false);
+    startup.checked = true;
+    startup.dispatchEvent(new Event('change', { bubbles: true }));
+    await settle();
+    button(target, 'Apply startup')!.click();
+    await settle();
+
+    expect(onApply.mock.calls[0]![0]).toEqual({ start_with_system: true });
   });
 
   it('sends the toggles alone when only a toggle changed', async () => {

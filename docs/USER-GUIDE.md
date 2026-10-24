@@ -183,6 +183,10 @@ is also:
 
 ## Your first minute
 
+**The window tells you this itself on the first run.** An empty library shows a three-step
+checklist — start recording, press the clip hotkey (the chord this process actually installed),
+find the clip in the grid — so nothing here has to be remembered from a manual.
+
 1. **Start the app.** It opens a window and puts an icon in the notification area. The window is
    a review pane; you open it when you want it.
 2. **Press "Start recording"** — in the window's recorder bar at the top, or **Start recording**
@@ -233,23 +237,28 @@ bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
 
 ### Starting with Windows
 
-`[app] start_with_system = true` in `config.toml` gives replayed an entry under
+**Settings → Startup → Start with Windows** gives replayed an entry under
 `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, so the tray icon and the hotkey are there
-after a reboot. It is **off by default**, and — like the hotkey chord — the settings panel does
-not edit it: the file is the only switch, because an autostart entry that disagreed with the
-file would be a second, invisible source of truth. The change is applied at startup, so it
-needs a restart.
+after a reboot. It is **off by default**, and the equivalent key is
+`[app] start_with_system = true` in `config.toml`.
+
+The file is still the switch: applying the checkbox asks Windows for the entry immediately and
+says what happened, and the next launch re-syncs the registry from the file either way. The entry
+is per-user (no elevation) and only this application's value is touched, so a Run entry you added
+by hand survives. Applying on a non-Windows build saves the setting and registers nothing, and
+the notice says so.
 
 ### Where the settings live
 
 Two places, and they are not the same thing:
 
-- the **Settings page** in the window — *Library*, *Capture*, *Automatic recording* and
-  *Game integrations*. It edits the clips directory, the frame rate, the resolution, the quality
-  preset, the monitor and window to capture, the microphone and the desktop-audio device, the
-  "also save the full session" switch, and the automatic-recording switch.
-- **`config.toml`** — everything the panel does not edit: the hotkey chords, the start-with-Windows
-  switch, the GSI port and the event rules.
+- the **Settings page** in the window — *Library*, *Startup*, *Capture*, *Encoder*,
+  *Automatic recording* and *Game integrations*. It edits the clips directory, the
+  start-with-Windows entry, the frame rate, the resolution, the quality preset, the monitor and
+  window to capture, the microphone and the desktop-audio device, the "also save the full session"
+  switch, the automatic-recording switch and the watched-games list.
+- **`config.toml`** — everything the panel does not edit: the hotkey chords, the GSI port and the
+  event rules.
 
 **The frame rate is yours to pick, and the panel tells you what the display can show.** The
 encoder section names the display being recorded and the rate that display runs at — *"Recording

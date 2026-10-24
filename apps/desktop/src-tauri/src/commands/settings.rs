@@ -1,6 +1,7 @@
 //! The settings the window shows and edits (`config.toml`).
 
 use super::*;
+use crate::background::AutostartOutcome;
 use crate::config::{EngineOptionsConfig, SettingEdit};
 use replayed_recorder::RecorderOptions;
 use serde::{Deserialize, Serialize};
@@ -40,6 +41,10 @@ pub struct SettingsDto {
     pub save_session: bool,
     /// `[games] auto_record`.
     pub auto_record: bool,
+    /// `[app] start_with_system`: the file's wish. Whether Windows really has an entry is the
+    /// registry's answer, reported when the setting is applied — the panel shows this value, not
+    /// a claim about the registry it has not read.
+    pub start_with_system: bool,
     /// `[encode] bitrate_kbps`.
     pub bitrate_kbps: u32,
     /// The quality preset that bitrate is (`low`, `balanced`, `high`) or `custom`.
@@ -128,6 +133,8 @@ pub struct SettingsUpdate {
     pub output_device: Option<String>,
     pub save_session: Option<bool>,
     pub auto_record: Option<bool>,
+    /// `[app] start_with_system`; the writer reports what Windows did with it.
+    pub start_with_system: Option<bool>,
     /// The whole `[[games.watch]]` list; absent leaves it alone.
     pub watch_games: Option<Vec<WatchGameDto>>,
     /// A preset name; sets `[encode] bitrate_kbps`.
@@ -151,6 +158,24 @@ pub struct UpdateSettingsOutcome {
     pub restart_required: bool,
     /// Names the changed engine keys when a restart is required, else null.
     pub restart_reason: Option<String>,
+    /// What happened to the start-with-Windows entry, when this update changed it.
+    ///
+    /// Filled in by [`apply_autostart_update`] after the file is written: the writer here has no
+    /// executable path and no `reg.exe`, and the settings file is the only switch either way.
+    /// A failure is reported here rather than as an error, because the setting *was* saved and
+    /// a failed registry write must not make the panel claim nothing happened.
+    pub autostart: Option<AutostartReport>,
+}
+
+/// What applying `[app] start_with_system` did.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AutostartReport {
+    /// True when Windows now agrees with the file. False when the file was written and the
+    /// registry was not changed (it is not Windows, the entry belongs to something else, or
+    /// `reg.exe` refused).
+    pub applied: bool,
+    /// The sentence to show: what was done, or why not.
+    pub detail: String,
 }
 
 /// The engine options a start is built with: the file's `[mic]` and `[games]`, not defaults.
@@ -184,6 +209,7 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
         output_device: effective.output_device,
         save_session: effective.save_session,
         auto_record: effective.auto_record,
+        start_with_system: effective.start_with_system,
         quality: crate::config::quality_for_bitrate(effective.bitrate_kbps).to_string(),
         bitrate_kbps: effective.bitrate_kbps,
         capture_monitor: effective.capture_monitor,
@@ -238,6 +264,9 @@ pub fn update_settings_file(
     }
     if let Some(auto) = update.auto_record {
         edits.push(SettingEdit::AutoRecord(auto));
+    }
+    if let Some(enabled) = update.start_with_system {
+        edits.push(SettingEdit::StartWithSystem(enabled));
     }
     if let Some(watch) = &update.watch_games {
         let mut games = Vec::with_capacity(watch.len());
@@ -314,7 +343,36 @@ pub fn update_settings_file(
         applied,
         restart_required,
         restart_reason,
+        // The caller that can reach `reg.exe` fills this in (see `apply_autostart_update`).
+        autostart: None,
     })
+}
+
+/// Apply `[app] start_with_system` after the file has recorded it, and say what happened.
+///
+/// The split is deliberate. [`update_settings_file`] has no executable path and must not run
+/// `reg.exe`; this function has both and does nothing else, so the "the file says one thing, the
+/// registry says another" case has one place to be reported from. `apply` is the boundary (the
+/// real `background::apply_autostart` in the window, a closure in tests).
+///
+/// A failure is a report, not an error: the setting is saved and takes effect at the next start
+/// even when the registry write failed (the shell re-syncs on every launch), so making the whole
+/// command fail would claim the file was not written.
+pub fn apply_autostart_update(
+    enabled: bool,
+    exe: &Path,
+    apply: impl FnOnce(bool, &Path) -> Result<AutostartOutcome, String>,
+) -> AutostartReport {
+    match apply(enabled, exe) {
+        Ok(outcome) => AutostartReport {
+            applied: !matches!(outcome, AutostartOutcome::NotApplicable(_)),
+            detail: outcome.describe(),
+        },
+        Err(err) => AutostartReport {
+            applied: false,
+            detail: err,
+        },
+    }
 }
 
 /// Resolve the clips directory a configuration names, and create it on disk.
@@ -411,6 +469,7 @@ mod tests {
                 "output_size",
                 "quality",
                 "save_session",
+                "start_with_system",
                 "watch_games"
             ]
         );
@@ -423,6 +482,10 @@ mod tests {
             applied: vec!["encode.fps".to_string()],
             restart_required: true,
             restart_reason: Some("a recording is running".to_string()),
+            autostart: Some(AutostartReport {
+                applied: false,
+                detail: "this build is not Windows".to_string(),
+            }),
         };
         let outcome_value = serde_json::to_value(&outcome).unwrap();
         let mut keys: Vec<&str> = outcome_value
@@ -434,7 +497,13 @@ mod tests {
         keys.sort();
         assert_eq!(
             keys,
-            ["applied", "restart_reason", "restart_required", "settings"]
+            [
+                "applied",
+                "autostart",
+                "restart_reason",
+                "restart_required",
+                "settings"
+            ]
         );
     }
 
@@ -601,6 +670,79 @@ mod tests {
         assert!(
             outcome.restart_reason.unwrap().contains("games.watch"),
             "the reason names the key"
+        );
+    }
+
+    #[test]
+    fn an_autostart_toggle_is_written_to_the_file_and_reported_separately() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[app]\nstart_with_system = false\n").unwrap();
+
+        let outcome = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                start_with_system: Some(true),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied, vec!["app.start_with_system"]);
+        assert!(outcome.settings.start_with_system);
+        assert_eq!(
+            outcome.autostart, None,
+            "writing the file touches no registry; that is `apply_autostart_update`"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("start_with_system = true"));
+    }
+
+    #[test]
+    fn applying_autostart_reports_what_windows_did() {
+        let mut seen = None;
+        let report = apply_autostart_update(true, Path::new("/opt/replayed"), |enabled, exe| {
+            seen = Some((enabled, exe.to_path_buf()));
+            Ok(AutostartOutcome::Enabled)
+        });
+        assert_eq!(seen, Some((true, PathBuf::from("/opt/replayed"))));
+        assert!(report.applied);
+        assert!(report.detail.contains("is set"), "{}", report.detail);
+
+        let removed = apply_autostart_update(false, Path::new("/opt/replayed"), |_, _| {
+            Ok(AutostartOutcome::Removed)
+        });
+        assert!(removed.applied);
+        assert!(removed.detail.contains("removed"), "{}", removed.detail);
+
+        let nothing_to_do = apply_autostart_update(true, Path::new("/opt/replayed"), |_, _| {
+            Ok(AutostartOutcome::Unchanged)
+        });
+        assert!(nothing_to_do.applied);
+    }
+
+    #[test]
+    fn a_failed_or_impossible_autostart_write_is_reported_not_raised() {
+        // The setting is saved either way, so the command must not fail: the next launch
+        // re-syncs the registry from the file.
+        let failed = apply_autostart_update(true, Path::new("/x"), |_, _| {
+            Err("could not write the Windows autostart entry: access denied".to_string())
+        });
+        assert!(!failed.applied);
+        assert!(failed.detail.contains("access denied"), "{}", failed.detail);
+
+        let not_this_os = apply_autostart_update(false, Path::new("/x"), |_, _| {
+            Ok(AutostartOutcome::NotApplicable(
+                "this build is not Windows".to_string(),
+            ))
+        });
+        assert!(!not_this_os.applied);
+        assert!(
+            not_this_os.detail.contains("not Windows"),
+            "{}",
+            not_this_os.detail
         );
     }
 

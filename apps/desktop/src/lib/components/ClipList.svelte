@@ -32,6 +32,8 @@
     combineIds?: number[];
     /** Tick or untick one clip for combining. */
     onToggleCombine?: (id: number) => void;
+    /** The clip hotkey in force, for the empty library's first-run checklist. */
+    hotkey?: string | null;
   }
 
   let {
@@ -47,6 +49,7 @@
     filtering = false,
     combineIds = [],
     onToggleCombine = () => {},
+    hotkey = null,
   }: Props = $props();
 
   /** Where the primary button went down on a row, until it is released or becomes a drag. */
@@ -140,12 +143,30 @@
     <p>No clips match the current search and filters.</p>
   </div>
 {:else if clips.length === 0}
-  <div class="empty-state">
+  <!-- The first run, and any empty library after it: the three steps, in the order they happen.
+       The chord is the one this process really installed, not the documented default. -->
+  <div class="empty-state first-run" data-region="first-run-checklist">
     <Icon name="clapperboard" size={40} />
-    <p>
-      No clips are indexed yet. Start recording above, then take one with
-      <strong>Save clip</strong> — or with the clip hotkey.
-    </p>
+    <div>
+      <h3>Nothing recorded yet</h3>
+      <ol>
+        <li>
+          <strong>Press Start recording</strong> in the bar above. The buffer fills in memory and
+          writes nothing until something is kept.
+        </li>
+        <li>
+          <strong>Play.</strong> Press <kbd>{hotkey ?? 'Ctrl+F8'}</kbd> — or
+          <strong>Save clip</strong> — and the last 30 seconds plus the next 5 are written.
+        </li>
+        <li>
+          <strong>Find it here.</strong> The clip is indexed and appears in this grid; the Storage
+          page names the folder it is in.
+        </li>
+      </ol>
+      {#if hotkey === null}
+        <p class="muted">The clip hotkey is not active in this window; the buttons above work.</p>
+      {/if}
+    </div>
   </div>
 {:else}
   <ul bind:this={list}>
@@ -280,6 +301,46 @@
 {/if}
 
 <style>
+  /* The first-run checklist: left-aligned prose and a numbered list, unlike the one-line
+     "nothing matches" state, because its content is instructions rather than a statement. */
+  .first-run {
+    align-items: flex-start;
+    text-align: left;
+  }
+
+  .first-run > div {
+    max-width: 56ch;
+  }
+
+  .first-run h3 {
+    margin: 0 0 var(--s-2);
+    font: var(--t-heading);
+    color: var(--text);
+  }
+
+  .first-run ol {
+    margin: 0;
+    padding-left: var(--s-5);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+    font: var(--t-small);
+    color: var(--text-muted);
+  }
+
+  .first-run strong {
+    color: var(--text);
+  }
+
+  .first-run kbd {
+    font: 400 12px/1.4 var(--font-mono);
+    padding: 1px 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface-2);
+    color: var(--text);
+  }
+
   ul {
     /* The grid scrolls inside the view: it takes what is left and no more. */
     flex: 1 1 auto;

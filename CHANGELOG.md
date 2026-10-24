@@ -16,6 +16,11 @@ what has and has not been *verified* on real hardware, read
 - **Export presets** — *Discord* (720p, small), *Vertical 9:16* (1080×1920, centre-cropped) and
   *GIF* (480px, 15fps, no audio). These are the one media path that re-encodes on purpose; the file
   lands beside the clip and is deliberately not added to the library.
+- ***Start with Windows*** is a checkbox in Settings → Startup. The file stays the switch; applying
+  asks Windows immediately and reports what the registry said, including on a build that has no
+  such mechanism.
+- **A first-run checklist** in an empty library: start recording, press the chord this process
+  actually installed, find the clip. No more remembering the manual.
 - ***Open the data folder*** on the Storage page: one button for the folder that holds the clips,
   sessions, index, log and `config.toml`, instead of copying a path out of a page. The guide said
   there was no such button, and now there is one.

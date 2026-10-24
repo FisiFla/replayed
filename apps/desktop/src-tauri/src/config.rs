@@ -548,6 +548,8 @@ pub enum SettingEdit {
     SaveSession(bool),
     /// `[games] auto_record`.
     AutoRecord(bool),
+    /// `[app] start_with_system`.
+    StartWithSystem(bool),
     /// `[[games.watch]]`: the whole list, replacing whatever the file had.
     ///
     /// The list is the feature (`[games] auto_record` watches these), so it is written as one
@@ -619,6 +621,7 @@ impl SettingEdit {
             SettingEdit::SaveSession(_) => "recorder.save_session",
             SettingEdit::AutoRecord(_) => "games.auto_record",
             SettingEdit::WatchGames(_) => "games.watch",
+            SettingEdit::StartWithSystem(_) => "app.start_with_system",
             SettingEdit::Quality(_) => "encode.bitrate_kbps",
             SettingEdit::CaptureMonitor(_) => "capture.monitor",
             SettingEdit::CaptureWindow(_) => "capture.window",
@@ -666,6 +669,12 @@ pub struct EffectiveSettings {
     /// (which is what the engine watches then, too). Names, executables and signals: the panel
     /// edits the list, so a display name is not enough.
     pub watch: Vec<WatchedGame>,
+    /// `[app] start_with_system`: whether this application should own a start-with-Windows entry.
+    ///
+    /// The file says what the user wants; the registry says what is. Reading them apart is the
+    /// panel's whole job here: the checkbox shows the file's value, and applying it reports what
+    /// Windows did (see `background::sync_autostart`).
+    pub start_with_system: bool,
     pub defaulted: Vec<&'static str>,
     pub config_exists: bool,
 }
@@ -695,7 +704,8 @@ fn mistyped(key: &'static str) -> CommandError {
                 | "games.auto_record"
                 | "recorder.save_session"
                 | "encode.adapt_fps"
-                | "encode.zero_copy" => "true/false value",
+                | "encode.zero_copy"
+                | "app.start_with_system" => "true/false value",
                 "games.watch" => "list of [[games.watch]] tables",
                 _ => "value of the shape this key takes",
             },
@@ -873,9 +883,10 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
         SettingEdit::ClipsDir(dir) => validate_clips_dir(dir),
         SettingEdit::Fps(fps) => validate_fps(*fps),
         SettingEdit::OutputSize(size) => validate_output_size(size),
-        SettingEdit::MicEnabled(_) | SettingEdit::AutoRecord(_) | SettingEdit::SaveSession(_) => {
-            Ok(())
-        }
+        SettingEdit::MicEnabled(_)
+        | SettingEdit::AutoRecord(_)
+        | SettingEdit::SaveSession(_)
+        | SettingEdit::StartWithSystem(_) => Ok(()),
         // The engine's own rule (a nameless entry can never match; one executable twice is one
         // game), so the file written here cannot be one a start refuses.
         SettingEdit::WatchGames(watch) => validate_watch_list(watch).map_err(|err| {
@@ -1172,6 +1183,16 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             false
         }
     };
+    let start_with_system =
+        match get_bool(&doc, "app", "start_with_system", "app.start_with_system")? {
+            Some(enabled) => enabled,
+            None => {
+                if config_exists {
+                    defaulted.push("app.start_with_system");
+                }
+                false
+            }
+        };
     let watch = read_watch(&doc)?;
 
     Ok(EffectiveSettings {
@@ -1187,6 +1208,7 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         capture_monitor,
         capture_window,
         watch,
+        start_with_system,
         defaulted,
         config_exists,
     })
@@ -1398,6 +1420,7 @@ pub(crate) fn write_settings_locked(
             SettingEdit::OutputDevice(_) => ("capture", "output_device", "capture"),
             SettingEdit::SaveSession(_) => ("recorder", "save_session", "recorder"),
             SettingEdit::AutoRecord(_) => ("games", "auto_record", "games"),
+            SettingEdit::StartWithSystem(_) => ("app", "start_with_system", "app"),
             // Handled above, before the table lookup: an array of tables has no single value.
             SettingEdit::WatchGames(_) => continue,
             SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
@@ -1434,6 +1457,7 @@ pub(crate) fn write_settings_locked(
             }
             SettingEdit::SaveSession(save) => toml_edit::value(*save),
             SettingEdit::AutoRecord(auto) => toml_edit::value(*auto),
+            SettingEdit::StartWithSystem(enabled) => toml_edit::value(*enabled),
             // Validated above, so the preset exists; the fallback is the balanced rate.
             SettingEdit::Quality(name) => {
                 toml_edit::value(preset_bitrate(name).unwrap_or(20_000) as i64)
@@ -2363,7 +2387,8 @@ mod tests {
              [mic]\nenabled = true\ndevice = \"\"\n\n\
              [recorder]\nsave_session = false\n\n\
              [games]\nauto_record = true\n\
-             [[games.watch]]\nname = \"Dota 2\"\nexe = \"dota2.exe\"\n",
+             [[games.watch]]\nname = \"Dota 2\"\nexe = \"dota2.exe\"\n\
+             [app]\nstart_with_system = false\n",
         )
         .unwrap();
         (dir, path)
@@ -2393,6 +2418,24 @@ mod tests {
     }
 
     #[test]
+    fn start_with_system_round_trips_through_the_writer() {
+        let (_dir, path) = settings_file();
+        assert!(!read_effective_settings(&path).unwrap().start_with_system);
+
+        write_settings(&path, &[SettingEdit::StartWithSystem(true)]).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("[app]"), "{text}");
+        assert!(text.contains("start_with_system = true"), "{text}");
+        assert!(
+            read_effective_settings(&path).unwrap().start_with_system,
+            "the file the writer produced is the file the reader sees"
+        );
+
+        write_settings(&path, &[SettingEdit::StartWithSystem(false)]).unwrap();
+        assert!(!read_effective_settings(&path).unwrap().start_with_system);
+    }
+
+    #[test]
     fn absent_keys_fall_back_to_the_example_and_are_named() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -2405,6 +2448,7 @@ mod tests {
         assert!(settings.defaulted.contains(&"encode.fps"));
         assert!(settings.defaulted.contains(&"mic.enabled"));
         assert!(settings.defaulted.contains(&"games.auto_record"));
+        assert!(settings.defaulted.contains(&"app.start_with_system"));
         assert!(!settings.defaulted.contains(&"storage.clips_dir"));
         assert_eq!(settings.watch, default_watch());
     }

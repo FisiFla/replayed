@@ -713,6 +713,7 @@
               onDragOut={(id) => osAction(() => source.dragClipOut(id), null)}
               {combineIds}
               onToggleCombine={toggleCombine}
+              hotkey={app?.hotkey.chord ?? null}
             />
           </div>
         </section>

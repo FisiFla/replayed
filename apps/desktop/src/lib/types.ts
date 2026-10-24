@@ -323,6 +323,11 @@ export interface SettingsDto {
   save_session: boolean;
   /** `[games] auto_record`. */
   auto_record: boolean;
+  /**
+   * `[app] start_with_system`: what the file asks for. Whether Windows really has an entry is
+   * the registry's answer, reported after an apply (`UpdateSettingsOutcome.autostart`).
+   */
+  start_with_system: boolean;
   /** `[encode] bitrate_kbps`. */
   bitrate_kbps: number;
   /** The preset that bitrate is (`low`, `balanced`, `high`) or `custom`. */
@@ -351,12 +356,22 @@ export interface SettingsUpdate {
   output_device?: string;
   save_session?: boolean;
   auto_record?: boolean;
+  /** `[app] start_with_system`: the writer then reports what Windows did with it. */
+  start_with_system?: boolean;
   /** The whole `[[games.watch]]` list; absent leaves it alone. */
   watch_games?: WatchGame[];
   /** A preset name (`low`, `balanced`, `high`); sets `[encode] bitrate_kbps`. */
   quality?: string;
   capture_monitor?: number;
   capture_window?: string;
+}
+
+/** What applying `[app] start_with_system` did, when an update changed it. */
+export interface AutostartReport {
+  /** True when Windows now agrees with the file. */
+  applied: boolean;
+  /** What was done, or why not — the sentence the notice shows. */
+  detail: string;
 }
 
 /** What writing settings did, and what it means for a running recorder. */
@@ -369,6 +384,11 @@ export interface UpdateSettingsOutcome {
   restart_required: boolean;
   /** Names the changed engine keys when a restart is required, else null. */
   restart_reason: string | null;
+  /**
+   * What happened to the start-with-Windows entry, when this update changed it. A failure here
+   * is a report, not an error: the setting was saved and the next launch re-syncs the registry.
+   */
+  autostart: AutostartReport | null;
 }
 /** What a clip trigger produced, as `clip_now` returns it. */
 export interface RecordedClip {

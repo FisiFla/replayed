@@ -1000,7 +1000,7 @@ fn update_settings(
     // `update_settings_and_prepare` creates the new clips directory before it writes anything, so
     // what is left here, committing it to the running shell and re-scoping the asset protocol, is
     // all that needs a window.
-    let (outcome, prepared) = commands::update_settings_and_prepare(
+    let (mut outcome, prepared) = commands::update_settings_and_prepare(
         &state.app_data_dir,
         &state.config_path(),
         &update,
@@ -1008,6 +1008,21 @@ fn update_settings(
     )?;
     if let Some(paths) = prepared {
         commit_clips_dir(&state, &app, paths, &outcome.settings.clips_dir)?;
+    }
+    // The file is written; now make Windows agree with it, and report what it said. Failing the
+    // whole command would claim the setting was not saved, and it was — the next launch re-syncs
+    // the registry anyway (see `background::sync_autostart`).
+    if let Some(enabled) = update.start_with_system {
+        outcome.autostart = Some(match std::env::current_exe() {
+            Ok(exe) => commands::apply_autostart_update(enabled, &exe, background::apply_autostart),
+            Err(err) => commands::AutostartReport {
+                applied: false,
+                detail: format!(
+                    "the setting is saved, but this application's own path could not be \
+                     resolved ({err}), so the start-with-Windows entry was left alone"
+                ),
+            },
+        });
     }
     Ok(outcome)
 }

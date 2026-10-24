@@ -109,6 +109,60 @@ describe('the clip grid', () => {
     expect(getStyle).not.toHaveBeenCalled();
   });
 
+  it('walks a first run through the three steps, with the chord this process installed', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(ClipList, {
+      target,
+      props: {
+        clips: [],
+        thumbnails: {},
+        selectedId: null,
+        onSelect: () => {},
+        onFavourite: () => {},
+        onDelete: () => {},
+        onCopy: () => {},
+        onReveal: () => {},
+        onDragOut: () => {},
+        hotkey: 'Ctrl+F9',
+      },
+    });
+    await tick();
+
+    const checklist = target.querySelector('[data-region="first-run-checklist"]');
+    expect(checklist).not.toBeNull();
+    expect(checklist!.querySelectorAll('ol li')).toHaveLength(3);
+    // The chord is the live one, not the documented default: a checklist that named a chord the
+    // process did not install would send the user to a key nothing answers.
+    expect(checklist!.querySelector('kbd')?.textContent).toBe('Ctrl+F9');
+    expect(target.textContent).not.toContain('not active');
+  });
+
+  it('says the hotkey is not active when nothing installed one', async () => {
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(ClipList, {
+      target,
+      props: {
+        clips: [],
+        thumbnails: {},
+        selectedId: null,
+        onSelect: () => {},
+        onFavourite: () => {},
+        onDelete: () => {},
+        onCopy: () => {},
+        onReveal: () => {},
+        onDragOut: () => {},
+        hotkey: null,
+      },
+    });
+    await tick();
+
+    const checklist = target.querySelector('[data-region="first-run-checklist"]');
+    expect(checklist!.querySelector('kbd')?.textContent).toBe('Ctrl+F8');
+    expect(checklist!.textContent).toContain('not active');
+  });
+
   it('ticks the clips the window selected for combining, and only those', async () => {
     // The tick has to be a real checkbox whose state comes from the window, not one kept inside
     // this component: the combine button lives in the header and reads the same list.

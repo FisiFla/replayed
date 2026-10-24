@@ -82,6 +82,7 @@
   let micEnabled = $state(false);
   let saveSession = $state(false);
   let autoRecord = $state(false);
+  let startWithSystem = $state(false);
   let quality = $state('balanced');
   let monitorText = $state('0');
   let windowTitle = $state('');
@@ -102,6 +103,7 @@
     micEnabled = settings.mic_enabled;
     saveSession = settings.save_session;
     autoRecord = settings.auto_record;
+    startWithSystem = settings.start_with_system;
     quality = settings.quality;
     monitorText = String(settings.capture_monitor);
     windowTitle = settings.capture_window;
@@ -172,6 +174,17 @@
    * Only the differences go to the backend (`automaticUpdate`), so re-applying an untouched
    * section writes nothing and reports nothing as saved.
    */
+  /**
+   * Apply the start-with-Windows switch.
+   *
+   * The file is the switch (the shell re-syncs the registry from it on every launch); applying
+   * also asks Windows now, and the notice reports what it said — including on a platform that
+   * has no such mechanism, where the checkbox still persists what the file should say.
+   */
+  function applyStartup() {
+    onApply({ start_with_system: startWithSystem });
+  }
+
   function applyAutomatic() {
     if (settings === null || watchProblem !== null) return;
     onApply(automaticUpdate(settings, { autoRecord, saveSession, watch: watchGames }));
@@ -209,6 +222,7 @@
   /** The sections the sub-nav jumps between; the ids are local to this panel. */
   const SECTIONS = [
     { id: 'settings-library', label: 'Library' },
+    { id: 'settings-startup', label: 'Startup' },
     { id: 'settings-capture', label: 'Capture' },
     { id: 'settings-encoder', label: 'Encoder' },
     { id: 'settings-automatic', label: 'Automatic recording' },
@@ -289,6 +303,28 @@
       </label>
       <p class="muted footnote">Empty resets to the default. Applies immediately to new clips.</p>
       <button type="button" onclick={applyLibrary} disabled={busy}>Apply library</button>
+    </div>
+
+    <div class="group" id="settings-startup">
+      <h3>Startup</h3>
+      <label class="check">
+        <input
+          type="checkbox"
+          checked={startWithSystem}
+          onchange={(event) => (startWithSystem = event.currentTarget.checked)}
+          disabled={busy}
+        />
+        <span>
+          Start with Windows
+          {#if isDefault('app.start_with_system')}<span class="muted">(default)</span>{/if}
+        </span>
+      </label>
+      <p class="muted footnote">
+        Writes a per-user entry under the Windows Run key — no elevation, and nothing else in
+        that key is touched. The file is the only switch: the next launch re-syncs the entry from
+        it either way. Off Windows the setting is saved and nothing is registered.
+      </p>
+      <button type="button" onclick={applyStartup} disabled={busy}>Apply startup</button>
     </div>
 
     <div class="group" id="settings-capture">
