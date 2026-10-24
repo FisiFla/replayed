@@ -8,7 +8,7 @@
    */
   import Icon from './Icon.svelte';
   import Timeline from './Timeline.svelte';
-  import { parseTagInput } from '../clips';
+  import { EXPORT_PRESETS, parseTagInput } from '../clips';
   import type { ClipView } from '../clips';
   import { formatDateTime } from '../time';
   import { fullRange, rangeLabel, rangeLengthLabel, validateRange } from '../trim';
@@ -24,9 +24,21 @@
     onTags: (tags: string[]) => void;
     onCopy: () => void;
     onReveal: () => void;
+    /** Re-encode this clip with an export preset (`discord`, `vertical`, `gif`). */
+    onExport: (preset: string) => void;
   }
 
-  let { clip, busy, onTrim, onFavourite, onRename, onTags, onCopy, onReveal }: Props = $props();
+  let {
+    clip,
+    busy,
+    onTrim,
+    onFavourite,
+    onRename,
+    onTags,
+    onCopy,
+    onReveal,
+    onExport,
+  }: Props = $props();
 
   // svelte-ignore state_referenced_locally — keyed on the clip id by App (see `range`).
   let titleDraft = $state(clip.title ?? '');
@@ -177,6 +189,30 @@
           It is written next to the original as
           <code>{clip.name.replace(/\.[^.]+$/, '')}.trim-START-END.&lt;ext&gt;</code>; the
           original is never modified.
+        </p>
+      </section>
+
+      <section class="panel trim">
+        <div class="trim-head">
+          <h2>Export</h2>
+          <div class="selection">
+            <span class="muted">a re-encode, written beside the clip</span>
+          </div>
+        </div>
+
+        <div class="actions">
+          {#each EXPORT_PRESETS as preset (preset.value)}
+            <button type="button" disabled={busy} onclick={() => onExport(preset.value)}>
+              {preset.label}
+            </button>
+          {/each}
+        </div>
+
+        <p class="lossless">
+          <strong>Re-encoded, on purpose.</strong> Unlike a trim, an export has to decode and
+          encode: that is how the frame gets smaller, vertical or animated. The file is written
+          next to the clip and is <em>not</em> added to the library — it is made to be uploaded,
+          not to be another copy under the storage cap. The original is never modified.
         </p>
       </section>
     </div>

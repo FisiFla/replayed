@@ -212,6 +212,22 @@ pub struct DeleteOutcome {
     pub thumbnails_removed: usize,
 }
 
+/// Where an export went, and what it is.
+///
+/// No clip id: an export is not in the library. It is a file beside the clip, and the window's job
+/// is to say where it landed and offer to reveal it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExportOutcome {
+    /// The preset that produced it, by its wire name (`discord`, `vertical`, `gif`).
+    pub preset: String,
+    /// The file written. Outside the index on purpose (see `commands::export_clip`).
+    pub path: String,
+    /// Bytes on disk.
+    pub size_bytes: u64,
+    /// The exported file's own probed length, which a re-encode may shift by a frame or two.
+    pub duration_ms: u64,
+}
+
 /// What removing the index rows whose files are gone did.
 ///
 /// Counts rather than ids: the window reports what happened and refreshes, and a list of ids it

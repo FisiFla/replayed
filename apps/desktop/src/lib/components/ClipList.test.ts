@@ -47,7 +47,10 @@ describe('the clip grid', () => {
     document.body.innerHTML = '';
   });
 
-  async function mountGrid(count: number): Promise<HTMLElement> {
+  async function mountGrid(
+    count: number,
+    extras: { combineIds?: number[]; onToggleCombine?: (id: number) => void } = {},
+  ): Promise<HTMLElement> {
     const target = document.createElement('div');
     document.body.appendChild(target);
     app = mount(ClipList, {
@@ -62,6 +65,7 @@ describe('the clip grid', () => {
         onCopy: () => {},
         onReveal: () => {},
         onDragOut: () => {},
+        ...extras,
       },
     });
     // The grid is measured in an effect, so the component has to be given a tick before
@@ -103,5 +107,23 @@ describe('the clip grid', () => {
     // Measuring the grid forces a synchronous layout, which is not something a key press
     // should do: the count is cached, and read again only when the window changes.
     expect(getStyle).not.toHaveBeenCalled();
+  });
+
+  it('ticks the clips the window selected for combining, and only those', async () => {
+    // The tick has to be a real checkbox whose state comes from the window, not one kept inside
+    // this component: the combine button lives in the header and reads the same list.
+    const target = await mountGrid(3, { combineIds: [2] });
+    const ticks = [...target.querySelectorAll<HTMLInputElement>('input.pick')];
+    expect(ticks).toHaveLength(3);
+    expect(ticks.map((tick) => tick.checked)).toEqual([false, true, false]);
+    expect(ticks[1]?.getAttribute('aria-label')).toContain('Select');
+  });
+
+  it('reports a tick by id, so the window owns the selection', async () => {
+    const onToggleCombine = vi.fn();
+    const target = await mountGrid(3, { onToggleCombine });
+    const ticks = [...target.querySelectorAll<HTMLInputElement>('input.pick')];
+    ticks[0]!.click();
+    expect(onToggleCombine).toHaveBeenCalledWith(1);
   });
 });

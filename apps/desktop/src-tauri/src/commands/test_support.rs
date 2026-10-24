@@ -177,9 +177,23 @@ impl Fixture {
 /// Encode `seconds` of `testsrc2` into `path` with ffmpeg, as a clip would be. `-g 10` at 10 fps
 /// puts a keyframe every second, so a stream-copy cut has keyframe structure to work with.
 pub(crate) fn write_test_video(bins: &FfmpegBinaries, path: &Path, seconds: u32) {
+    write_test_video_sized(bins, path, seconds, 320, 180);
+}
+
+/// The same, at an explicit frame size: the tests that need two clips whose stream layouts
+/// disagree (a combine must refuse them) cannot use the default size for both.
+pub(crate) fn write_test_video_sized(
+    bins: &FfmpegBinaries,
+    path: &Path,
+    seconds: u32,
+    width: u32,
+    height: u32,
+) {
     let mut cmd = replayed_media::sidecar_command(&bins.ffmpeg);
     cmd.args(["-v", "error", "-y", "-f", "lavfi", "-i"])
-        .arg(format!("testsrc2=size=320x180:rate=10:duration={seconds}"))
+        .arg(format!(
+            "testsrc2=size={width}x{height}:rate=10:duration={seconds}"
+        ))
         .args([
             "-c:v", "mpeg4", "-q:v", "5", "-g", "10", "-pix_fmt", "yuv420p",
         ])

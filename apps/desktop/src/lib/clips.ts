@@ -6,7 +6,7 @@
 
 import { formatBytes, formatDateTime, formatDuration } from './time';
 import { isClick } from './markers';
-import type { ClipDto, DeleteOutcome, PruneOutcome, TrimRange } from './types';
+import type { ClipDto, DeleteOutcome, ExportOutcome, PruneOutcome, TrimRange } from './types';
 
 /** One row of the clip list. */
 export interface ClipView {
@@ -196,6 +196,46 @@ export function describePrune(outcome: PruneOutcome): string {
     line += ` ${plural(outcome.failed, 'index entry')} could not be removed; the log names which.`;
   }
   return line;
+}
+
+/**
+ * The export presets this build offers, as the panel lists them and as `export_clip` names them.
+ *
+ * Kept in step with `replayed_media::export::ExportPreset` by hand, like the DTO interfaces: the
+ * wire names are the enum's `as_str` values, and `export_clip` refuses anything else.
+ */
+export const EXPORT_PRESETS = [
+  { value: 'discord', label: 'Discord (720p, small)' },
+  { value: 'vertical', label: 'Vertical 9:16 (1080×1920)' },
+  { value: 'gif', label: 'GIF (480px, 15fps)' },
+] as const;
+
+/**
+ * What combining clips did, in one sentence.
+ *
+ * The count is in the sentence because the button said it: "combine 3 clips" that then reported
+ * only a file name would leave the user counting cards.
+ */
+export function describeCombine(count: number, written: ClipDto): string {
+  return (
+    `Combined ${count} clips into ${basename(written.path)} — it is in the library now, ` +
+    `and the originals are untouched.`
+  );
+}
+
+/**
+ * What an export produced, and where it went.
+ *
+ * The path's file name and the size, not just "exported": the file is deliberately **not** in
+ * the library, so this notice is the only place the user learns where to find it.
+ */
+export function describeExport(outcome: ExportOutcome): string {
+  const preset =
+    EXPORT_PRESETS.find((option) => option.value === outcome.preset)?.label ?? outcome.preset;
+  return (
+    `Exported as ${preset}: ${basename(outcome.path)} (${formatBytes(outcome.size_bytes)}). ` +
+    'It is beside the clip, not in the library.'
+  );
 }
 
 /**

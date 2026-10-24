@@ -22,9 +22,11 @@
     busy: boolean;
     /** The user confirmed: remove the index rows whose files are gone. */
     onPruneMissing: () => void;
+    /** Show the data folder (clips, sessions, index, log, config) in the file manager. */
+    onOpenDataDir: () => void;
   }
 
-  let { stats, busy, onPruneMissing }: Props = $props();
+  let { stats, busy, onPruneMissing, onOpenDataDir }: Props = $props();
 
   /** The reconciliation is a two-step action, like a clip's delete. */
   let confirming = $state(false);
@@ -97,7 +99,10 @@
       </div>
       <div class="wide">
         <dt>Clips directory</dt>
-        <dd class="mono path">{stats.clips_dir}</dd>
+        <dd class="path-block">
+          <span class="mono path">{stats.clips_dir}</span>
+          <button type="button" disabled={busy} onclick={onOpenDataDir}>Open the data folder</button>
+        </dd>
       </div>
     </dl>
 
@@ -274,6 +279,17 @@
   .path {
     overflow-wrap: anywhere;
     font: 400 13px/1.5 var(--font-mono);
+  }
+
+  /* The directory's figure holds a button: a `<dd>` may contain flow content, a `<dl>` may not
+     contain a button of its own. */
+  .path-block {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--s-2);
+    font: var(--t-heading);
+    font-feature-settings: 'tnum';
   }
 
   /* An absolute path is one unbreakable token; full width keeps it on as few lines as possible. */

@@ -7,6 +7,7 @@
 pub use binaries::sidecar_command;
 pub mod binaries;
 pub mod edit;
+pub mod export;
 pub mod fragments;
 pub mod probe;
 

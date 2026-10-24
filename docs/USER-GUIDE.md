@@ -170,16 +170,14 @@ Everything is under one per-user folder:
 The clips directory can be moved: *Settings → Library → Clips directory*, or
 `[storage] clips_dir` in `config.toml`. The rest of the folder cannot be moved.
 
-**Opening it from the application.** There is no button that opens the data directory, and the
-guide will not pretend otherwise. What there is:
+**Opening it from the application.** The **Storage** page has an *Open the data folder* button
+next to the clips directory: it opens the folder that holds everything above in Explorer. There
+is also:
 
-- the **Storage** page shows the clips directory path, as text;
 - the **Health** page shows the log file's path, as text;
 - a clip's page has a **Show in folder** button that reveals that clip in Explorer;
 - the tray's **Open config file** reveals `config.toml` in Explorer — or opens the folder it
   belongs in, when there is no file yet.
-
-So: copy the path out of the Storage or Health page and paste it into Explorer.
 
 ---
 
@@ -195,6 +193,28 @@ So: copy the path out of the Storage or Health page and paste it into Explorer.
 4. **Press `Ctrl+F8`.** The clip is written to `clips\`, indexed, and appears in the Library.
 5. **Close the window whenever you like.** Closing it hides it; it does not quit and it does not
    end the recording. Quit from the tray menu.
+
+### Combining clips, and exporting one
+
+**Combine** two or more clips into one, losslessly. Tick the box on each card in the Library, then
+press *Combine N clips*; the result appears in the library as a new clip and the originals are
+untouched. It is the clips' own packets in order — nothing is re-encoded — which is why every clip
+in a combine must share one stream layout (same codec, frame size and audio-track count). Mixed
+clips are refused, naming both, rather than concatenated into a file with a truncated track: a
+stream copy cannot change the frame.
+
+**Export** a clip from its page. Three presets, each a labelled re-encode:
+
+| Preset | What it makes |
+|---|---|
+| Discord (720p, small) | H.264 + AAC fitted inside 1280×720, at a quality-based rate |
+| Vertical 9:16 | 1080×1920, cropped from the centre — the sides are lost |
+| GIF (480px, 15fps) | an animated GIF, no audio, 256 colours from the clip's own frames |
+
+An export decodes and encodes **on purpose**: that is the only way to change the frame, and it is
+the one media action here that is not a stream copy. The file is written beside the clip and is
+**not** added to the library — it is made to be uploaded, and indexing it would put a derived copy
+of the footage under the storage cap. The original is never modified.
 
 ### The hotkey
 

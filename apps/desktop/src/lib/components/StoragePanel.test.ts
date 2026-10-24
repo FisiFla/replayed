@@ -55,7 +55,10 @@ describe('the storage panel', () => {
   function render(value: StorageStats, onPruneMissing = () => {}) {
     const target = document.createElement('div');
     document.body.appendChild(target);
-    app = mount(StoragePanel, { target, props: { stats: value, busy: false, onPruneMissing } });
+    app = mount(StoragePanel, {
+      target,
+      props: { stats: value, busy: false, onPruneMissing, onOpenDataDir: () => {} },
+    });
     return target;
   }
 
@@ -112,12 +115,31 @@ describe('the storage panel', () => {
     expect(button(target, 'Remove from the library')).not.toBeNull();
   });
 
+  it('offers the data folder beside the clips directory', async () => {
+    const onOpenDataDir = vi.fn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(StoragePanel, {
+      target,
+      props: { stats: stats(), busy: false, onPruneMissing: () => {}, onOpenDataDir },
+    });
+    await settle();
+
+    button(target, 'Open the data folder')!.click();
+    expect(onOpenDataDir).toHaveBeenCalledTimes(1);
+  });
+
   it('holds the controls while a command is in flight', async () => {
     const target = document.createElement('div');
     document.body.appendChild(target);
     app = mount(StoragePanel, {
       target,
-      props: { stats: stats({ missing_count: 1 }), busy: true, onPruneMissing: () => {} },
+      props: {
+        stats: stats({ missing_count: 1 }),
+        busy: true,
+        onPruneMissing: () => {},
+        onOpenDataDir: () => {},
+      },
     });
     await settle();
 

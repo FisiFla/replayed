@@ -9,6 +9,16 @@ what has and has not been *verified* on real hardware, read
 ## [Unreleased]
 
 ### Added
+- **Combine clips, losslessly** — tick two or more cards in the Library and press *Combine*: the
+  result is their packets in order (`-c copy`), indexed as a new clip, originals untouched. Mixed
+  codecs, frame sizes or audio-track counts are refused by name rather than concatenated into a
+  file with a truncated track.
+- **Export presets** — *Discord* (720p, small), *Vertical 9:16* (1080×1920, centre-cropped) and
+  *GIF* (480px, 15fps, no audio). These are the one media path that re-encodes on purpose; the file
+  lands beside the clip and is deliberately not added to the library.
+- ***Open the data folder*** on the Storage page: one button for the folder that holds the clips,
+  sessions, index, log and `config.toml`, instead of copying a path out of a page. The guide said
+  there was no such button, and now there is one.
 - **The watch list is editable in the window** (*Settings → Automatic recording → Watched
   games*): add a game by executable name (a pasted path is reduced to its file name), give it a
   displayed name, choose process-name or Live Client Data API detection, and remove one with ×.

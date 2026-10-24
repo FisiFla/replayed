@@ -3338,3 +3338,80 @@ Nothing in this section needed a run, which is the point of doing it here. The r
 is open: publishing `v0.2.0`, installing it, publishing `v0.2.1` and proving the signed-minisign
 self-update end to end are actions on the release page and on a real machine, and they were not
 taken.
+## 42. Combining clips, and the labelled re-encodes (2026-10-24)
+
+### What was added
+Two things on the same panel, and the difference between them is the point:
+
+- **`edit::combine_lossless`** — whole clips concatenated with `-c copy`, through the same
+  `check_concat_layout` / `write_concat_list` / `concat_lossless_sized` pair the session
+  finaliser and the replay splicer use, so a fix to `-map 0` (the microphone track) lands in all
+  three. The shell's `combine_clips` refuses fewer than two distinct ids, a file that is gone, a
+  path outside the library (the index is user-writable), and — through the media layer — clips
+  that do not share one stream layout. The result is probed and indexed as a real clip, because
+  it is real footage; its game and tags are inherited only where every input agrees.
+- **`export::{ExportPreset, export}`** — three labelled re-encodes: Discord (h264/AAC fitted
+  inside 1280×720 at CRF 26), Vertical (centre-cropped 9:16, scaled to 1080×1920 at CRF 23), and
+  GIF (480px, 15fps, two-pass palette, no audio). The one media path in this tree that decodes
+  and encodes, in its own module so `edit`'s "never re-encode" contract stays checkable. The
+  shell's `export_clip` writes beside the clip and **does not index** the file: an export is an
+  artefact to upload, and a row for it would put a derived copy under the storage cap.
+
+In the window: a tick on each library card and a *Combine N clips* bar in the header; an *Export*
+section on a clip's page, with the one sentence that separates it from Trim ("re-encoded, on
+purpose").
+
+### Evidence
+Real ffmpeg, on the host: `crates/media/tests/exports.rs` (7 tests) proves two clips combine into
+one whose duration is their sum and whose codec and frame size are the sources' own; that the
+temporary concat list is removed; that mixed sizes are refused with both shapes named and no
+partial file; that one clip is refused; that each preset produces the frame it promises
+(1280×720 with audio, 1080×1920, a `gif` stream with no audio); and that a failed export leaves
+nothing behind. `crates/media/src/export.rs` adds 3 unit tests (wire names, the budget's floor and
+growth, and that no preset is a stream copy — the test that would catch a "preset" implemented
+with `-c copy`).
+
+The desktop crate (279 tests) adds 8 command-level tests: the combined clip is on disk, in the
+library, indexed once, ~2s for two 1s sources; fewer than two, a repeated id, a missing file and a
+layout mismatch are refused with the right code and no new row; an export lands beside the clip,
+is **not** indexed, keeps the original, writes a real GIF; an unknown preset is refused before
+ffmpeg runs; a missing file is refused.
+
+Frontend: `svelte-check` 0/0, `vitest` 335 (up from 330: three descriptor tests, two grid tests for
+the combine tick), the production build, and the screenshot harness's fake source grew
+`combineClips` / `exportClip` so the contract test stays true.
+
+### What is NOT verified
+Nothing here ran on Windows, and no real recording has been combined or exported: the fixtures are
+`testsrc2` clips, so the *quality* of a Discord export of real gameplay (its size against the
+"H.264 + AAC" claim) is a property of the encoder and the content, not something these tests
+measure. The vertical preset's centre crop was asserted at the frame size, not by looking at a
+picture.
+## 43. An open-data-folder button, and the ledger that said there was none (2026-10-24)
+
+The user guide used to say, in as many words, that there is no button that opens the data
+directory — every "where is everything" question ended in "copy the path out of the Storage page
+and paste it into Explorer". That is a sentence about the code, not about the user, so it is now
+false: the Storage page's clips-directory figure carries **Open the data folder**, and
+`open_data_dir` resolves it from the state the shell was opened with (`AppState::data_dir`), not
+from a guess at `%LOCALAPPDATA%` or from the clips directory's parent — a configured
+`storage.clips_dir` can be anywhere, so the parent of that is not the data folder.
+
+The reveal itself is the same `background::reveal_command` the tray's *Open config file* and a
+clip's *Show in folder* use: one place decides what "reveal this path" means per platform, and its
+tests already pin all three forms.
+
+### Evidence
+`cargo test` in the desktop crate (279) asserts the accessor returns the directory the shell was
+opened with; `StoragePanel.test.ts` asserts the button calls the handler; `ipc.test.ts` asserts the
+wire name is `open_data_dir` and that the Rust handler list and the frontend agree;
+`svelte-check` 0/0, `vitest` 336, the production build.
+
+One thing the test suite caught and this records: the button was first placed as a sibling of the
+`<dt>`/`<dd>` pair inside the `<dl>`, which axe rejects (`definition-list`: a `<dl>` may contain
+only terms and descriptions, not a button). It is inside the `<dd>` now, and the a11y run for the
+Storage view is what found it.
+
+### What is NOT verified
+The button has not been pressed in a real window on Windows; what it spawns (`explorer <folder>`)
+is the same command the tray item already uses, and that has been run on the box (§10).

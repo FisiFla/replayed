@@ -59,6 +59,22 @@ export interface StorageStats {
   warnings: string[];
 }
 
+/**
+ * Where an export went, and what it is.
+ *
+ * No clip id: an export is a file beside the clip, not a library entry. It is re-encoded on
+ * purpose — that is what makes it an export — so it is not managed by the storage policy.
+ */
+export interface ExportOutcome {
+  /** The preset that produced it, by its wire name: `discord`, `vertical` or `gif`. */
+  preset: string;
+  /** The file written, which the window offers to reveal. */
+  path: string;
+  size_bytes: number;
+  /** The exported file's own length; a re-encode may shift it by a frame or two. */
+  duration_ms: number;
+}
+
 /** Where a clip's cached thumbnail is. */
 export interface ThumbnailRef {
   clip_id: number;

@@ -28,6 +28,7 @@ import type {
   DeleteOutcome,
   DeleteSessionOutcome,
   ErrorCode,
+  ExportOutcome,
   GsiGame,
   GsiInstallOutcome,
   AudioDevices,
@@ -174,6 +175,22 @@ export interface ClipSource {
    * is never removed.
    */
   pruneMissing(): Promise<PruneOutcome>;
+  /**
+   * Combine whole clips into one, losslessly. At least two, each once; every one must be on disk
+   * and inside the library, and they must share a stream layout — mixed codecs or sizes are
+   * refused rather than concatenated into a file with a truncated track.
+   */
+  combineClips(ids: number[]): Promise<ClipDto>;
+  /**
+   * Re-encode a clip with an export preset into a new file beside it. Not added to the library:
+   * an export is an artefact to upload, not more footage under the storage cap.
+   */
+  exportClip(id: number, preset: string): Promise<ExportOutcome>;
+  /**
+   * Show the application's data directory in the system file manager — the folder holding the
+   * clips, the sessions, the index, the log and `config.toml`.
+   */
+  openDataDir(): Promise<void>;
   /**
    * Sessions: one recording, the file it was concatenated into, and the markers on its
    * timeline. Read-only apart from the favourite flag and deletion — the engine that writes
@@ -341,6 +358,9 @@ export const tauriIpc: ClipSource = {
   thumbnail: (id, atMs) => invoke<ThumbnailRef>('thumbnail', { id, at_ms: atMs }),
   deleteClip: (id) => invoke<DeleteOutcome>('delete_clip', { id }),
   pruneMissing: () => invoke<PruneOutcome>('prune_missing'),
+  combineClips: (ids) => invoke<ClipDto>('combine_clips', { ids }),
+  exportClip: (id, preset) => invoke<ExportOutcome>('export_clip', { id, preset }),
+  openDataDir: () => invoke<void>('open_data_dir'),
   listSessions: () => invoke<SessionDto[]>('list_sessions'),
   sessionDetail: (sessionId) => invoke<SessionDto>('session_detail', { session_id: sessionId }),
   sessionEvents: (sessionId) =>

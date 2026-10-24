@@ -25,8 +25,9 @@ use background::{
 };
 use commands::{
     AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, DiagnosticsReport,
-    EncoderSettings, EncoderStatus, ErrorCode, PruneOutcome, RecordedClipDto, RecorderHost,
-    RecordingStatusDto, SessionDto, SessionEventDto, StorageConfigView, StorageStats, ThumbnailRef,
+    EncoderSettings, EncoderStatus, ErrorCode, ExportOutcome, PruneOutcome, RecordedClipDto,
+    RecorderHost, RecordingStatusDto, SessionDto, SessionEventDto, StorageConfigView, StorageStats,
+    ThumbnailRef,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use replayed_media::FfmpegBinaries;
@@ -285,6 +286,15 @@ impl AppState {
         &self.log_path
     }
 
+    /// The application's data directory: the one holding `clips/`, `sessions/`, `thumbnails/`,
+    /// the index, the log and `config.toml`.
+    ///
+    /// Exposed for the window's "open the data folder" button, which is the answer to "where is
+    /// everything" that does not require copying a path out of a page.
+    pub fn data_dir(&self) -> &Path {
+        &self.app_data_dir
+    }
+
     /// The encoder the last recording ran: the live one while a recording is up, the remembered
     /// one after it has stopped.
     ///
@@ -433,6 +443,22 @@ fn prune_missing(state: State<'_, AppState>) -> Result<PruneOutcome, CommandErro
     state.with_deps(commands::prune_missing)
 }
 
+/// Combine whole clips into one file, losslessly.
+#[tauri::command(rename_all = "snake_case")]
+fn combine_clips(state: State<'_, AppState>, ids: Vec<i64>) -> Result<ClipDto, CommandError> {
+    state.with_deps(|deps| commands::combine_clips(deps, &ids))
+}
+
+/// Re-encode a clip with one of the export presets, into a new file beside it.
+#[tauri::command(rename_all = "snake_case")]
+fn export_clip(
+    state: State<'_, AppState>,
+    id: i64,
+    preset: String,
+) -> Result<ExportOutcome, CommandError> {
+    state.with_deps(|deps| commands::export_clip(deps, id, &preset))
+}
+
 /// Mark a clip as a favourite, or clear it.
 #[tauri::command(rename_all = "snake_case")]
 fn set_favourite(
@@ -479,6 +505,27 @@ fn copy_clip_to_clipboard(state: State<'_, AppState>, id: i64) -> Result<(), Com
 fn reveal_clip(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
     let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
     let (program, args) = background::reveal_command(&path, background::FileManager::current());
+    replayed_media::sidecar_command(&program)
+        .args(&args)
+        .spawn()
+        .map(drop)
+        .map_err(|err| {
+            CommandError::new(
+                commands::ErrorCode::Io,
+                format!("could not run {program}: {err}"),
+            )
+        })
+}
+
+/// Show the application's data directory in the system file manager.
+///
+/// The folder that holds the clips, the sessions, the thumbnails, the index, the log and
+/// `config.toml`: one button for "where is everything", instead of three paths printed on pages
+/// for the user to copy.
+#[tauri::command(rename_all = "snake_case")]
+fn open_data_dir(state: State<'_, AppState>) -> Result<(), CommandError> {
+    let dir = state.data_dir().to_path_buf();
+    let (program, args) = background::reveal_command(&dir, background::FileManager::current());
     replayed_media::sidecar_command(&program)
         .args(&args)
         .spawn()
@@ -1259,6 +1306,9 @@ pub fn run() {
             list_clips,
             storage_stats,
             prune_missing,
+            combine_clips,
+            export_clip,
+            open_data_dir,
             set_favourite,
             set_clip_title,
             set_clip_tags,
@@ -2068,6 +2118,10 @@ mod tests {
         );
         assert!(state.bins.is_some(), "ffmpeg is on PATH on this host");
         assert!(state.warnings.is_empty());
+
+        // The button's path: the folder the shell was opened with, not a guess at `%LOCALAPPDATA%`
+        // or at the clips directory's parent (a configured `clips_dir` can be anywhere).
+        assert_eq!(state.data_dir(), app_dir);
 
         // The wrappers' shared entry point works against the real state, with no runtime.
         let stats = state.with_deps(commands::storage_stats).unwrap();

@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
   basename,
+  describeCombine,
   describeDelete,
+  describeExport,
   describePrune,
   describeTrim,
   filterClips,
@@ -190,6 +192,41 @@ describe("describeTrim", () => {
     expect(describeTrim({ startMs: 1_000, endMs: 4_000 }, written)).toContain(
       "losslessly remuxed",
     );
+  });
+});
+
+describe("describeCombine", () => {
+  it("names the count, the new file and that the originals survive", () => {
+    const message = describeCombine(2, clip({ path: "/c/combine-1756000000000.mp4" }));
+    expect(message).toContain("Combined 2 clips");
+    expect(message).toContain("combine-1756000000000.mp4");
+    expect(message).toContain("in the library");
+    expect(message).toContain("originals are untouched");
+  });
+});
+
+describe("describeExport", () => {
+  it("names the preset, the file, its size and where it is not", () => {
+    const message = describeExport({
+      preset: "gif",
+      path: "/c/clip-1-gif.gif",
+      size_bytes: 1_048_576,
+      duration_ms: 1_000,
+    });
+    expect(message).toContain("GIF");
+    expect(message).toContain("clip-1-gif.gif");
+    expect(message).toContain("1.0 MiB");
+    expect(message).toContain("not in the library");
+  });
+
+  it("falls back to the wire name for a preset this build does not know", () => {
+    const message = describeExport({
+      preset: "ultrawide",
+      path: "/c/clip-1-ultrawide.mp4",
+      size_bytes: 1,
+      duration_ms: 1,
+    });
+    expect(message).toContain("ultrawide");
   });
 });
 

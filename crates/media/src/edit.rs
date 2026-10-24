@@ -340,6 +340,41 @@ pub fn concat_lossless_sized(
     expect_success(cmd, "concat", dst, copy_budget(total_bytes))
 }
 
+/// Concatenate whole clips into one, losslessly, refusing clips that do not share one layout.
+///
+/// This is [`trim_lossless`]'s sibling for more than one input: `-c copy`, so the result is the
+/// originals' own packets in order, not a re-encode. It is the same concat the replay splicer and
+/// the session recorder use ([`concat_lossless_sized`], [`check_concat_layout`]), so a fix to
+/// `-map 0` (a microphone track) lands in all three callers.
+///
+/// The layout check is what makes the result trustworthy rather than merely written: `-map 0`
+/// takes the first input's streams, and ffmpeg exits 0 while silently truncating a track when a
+/// later input disagrees ([`check_concat_layout`] has the measurement). Mixed codecs, sizes or
+/// audio-track counts are therefore a refusal naming the offending clip, never a file with a
+/// missing microphone or a frozen last clip.
+///
+/// The list is written beside the output and removed afterwards, as the session finaliser does,
+/// so a failed concat does not leave a stray `.txt` in the library.
+pub fn combine_lossless(bin: &FfmpegBinaries, sources: &[PathBuf], dst: &Path) -> Result<()> {
+    if sources.len() < 2 {
+        bail!(
+            "combining needs at least two clips; {} was given",
+            sources.len()
+        );
+    }
+    let layout = check_concat_layout(bin, sources)?;
+    let list = dst.with_extension("concat.txt");
+    let total_bytes = write_concat_list(sources, &list)?;
+    let concat = concat_lossless_sized(bin, &list, dst, total_bytes, layout.audio_count());
+    let _ = std::fs::remove_file(&list);
+    if let Err(err) = concat {
+        // A partial file is not a clip: it occupies the space the retry needs and no row names it.
+        let _ = std::fs::remove_file(dst);
+        return Err(err);
+    }
+    Ok(())
+}
+
 /// Write a concat list naming `segments` in order; returns their total size in bytes. The size
 /// is returned because this list is the authoritative statement of what will be read, and
 /// [`concat_lossless_sized`] needs it for the budget.

@@ -690,6 +690,44 @@ function installMockSource(fixture) {
         thumbnails_removed: removed ? 1 : 0,
       };
     },
+    // Combining and the export presets: the harness has no ffmpeg, so a combine answers the
+    // clip it would have produced (an in-memory row over the two source files) and an export
+    // answers a path that does not exist yet. Both are the shapes the window reads, which is
+    // what these screenshots are for; the media work is `crates/media`'s tests.
+    async combineClips(ids) {
+      const sources = ids.map((id) => find(id)).filter(Boolean);
+      if (sources.length < 2) {
+        throw { code: 'invalid_input', message: 'combining needs at least two different clips' };
+      }
+      const written = {
+        ...sources[0],
+        id: fixture.nextTrimId,
+        path: `${fixture.clipsDir}\\combine-${fixture.trimmedAtMs}.mp4`,
+        duration_ms: sources.reduce((sum, clip) => sum + clip.duration_ms, 0),
+        size_bytes: sources.reduce((sum, clip) => sum + clip.size_bytes, 0),
+        favourite: false,
+        title: null,
+        created_at_ms: fixture.trimmedAtMs,
+      };
+      fixture.nextTrimId += 1;
+      clips.unshift(written);
+      return { ...written };
+    },
+    async exportClip(id, preset) {
+      if (!['discord', 'vertical', 'gif'].includes(preset)) {
+        throw { code: 'invalid_input', message: `${preset} is not an export preset` };
+      }
+      const source = find(id);
+      if (!source) throw notFound(id);
+      const ext = preset === 'gif' ? 'gif' : 'mp4';
+      const stem = basename(source.path).replace(/\.[^.]+$/, '');
+      return {
+        preset,
+        path: `${fixture.clipsDir}\\${stem}-${preset}.${ext}`,
+        size_bytes: Math.round(source.size_bytes / 3),
+        duration_ms: source.duration_ms,
+      };
+    },
     async pruneMissing() {
       // The fixture's phantom rows are exactly the ones the storage panel was told about:
       // they are not in `clips`, which is the whole point of the `missingfiles` scenario (the
@@ -875,6 +913,10 @@ function installMockSource(fixture) {
           ? `a recording is running: ${engineChanged.join(', ')} takes effect when the next recording starts`
           : null,
       };
+    },
+    async openDataDir() {
+      // No file manager behind the harness; the command's real job is to spawn one.
+      return undefined;
     },
     async chooseClipsDir() {
       // The backend runs the native picker; there is no OS dialog behind this harness, so

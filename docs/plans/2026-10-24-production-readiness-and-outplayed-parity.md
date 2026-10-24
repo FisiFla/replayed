@@ -3,9 +3,12 @@
 Status: in progress. Written 2026-10-24 against `main` at `a8acaf9`. **Phases A and B are
 implemented**, step 8's probe fix is in, and Phase D's non-code items (stray file, CI compiler,
 non-goals, changelog) are done — ledgers §38–§41 record what the tests prove and what they do
-not. Phase C's Windows sweep, the release itself, and steps 10–12 are open. What has and has
-not been verified is recorded in [`docs/verification-status.md`](../verification-status.md);
-this plan does not upgrade any claim there.
+not. Step 11 (combine and the export presets) is implemented — ledger §42. Phase C's Windows
+sweep, the release itself, step 10 (screenshot) and the rest of step 12 (hotkey rebinding,
+autostart, first-run checklist) are open; step 12's open-data-folder button is in — ledger §43.
+What has and has not been verified is recorded in
+[`docs/verification-status.md`](../verification-status.md); this plan does not upgrade any claim
+there.
 
 ## Goal
 

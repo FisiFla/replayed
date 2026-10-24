@@ -23,7 +23,9 @@
   import StoragePanel from './lib/components/StoragePanel.svelte';
   import Toasts from './lib/components/Toasts.svelte';
   import {
+    describeCombine,
     describeDelete,
+    describeExport,
     describePrune,
     describeTrim,
     filterClips,
@@ -134,6 +136,9 @@
    */
   let refreshSeq = 0;
 
+  /** Clip ids ticked for combining, in the order they were ticked. */
+  let combineIds = $state<number[]>([]);
+
   /** Search text, game and tag filters over the library list. */
   let filter = $state<ClipFilter>(NO_FILTER);
   const visibleClips = $derived(filterClips(clips, filter));
@@ -156,6 +161,8 @@
       ]);
       if (token !== refreshSeq) return;
       clips = toClipViews(rows, source.assetUrl);
+      // A ticked clip that was deleted here or by a retention pass cannot be combined.
+      combineIds = combineIds.filter((id) => clips.some((clip) => clip.id === id));
       // A clip removed by the storage policy leaves its cached thumbnail behind; the map is
       // pruned against the clips that are still listed, so it cannot grow without bound.
       thumbnails = pruneThumbnails(thumbnails, clips.map((clip) => clip.id));
@@ -425,6 +432,55 @@
     }
   }
 
+  /** Tick or untick a clip for combining. */
+  function toggleCombine(id: number) {
+    combineIds = combineIds.includes(id)
+      ? combineIds.filter((other) => other !== id)
+      : [...combineIds, id];
+  }
+
+  /**
+   * Combine the ticked clips into one, losslessly.
+   *
+   * The backend refuses fewer than two, a file that is gone, and clips that do not share a stream
+   * layout; those refusals arrive as the banner rather than as a file nobody can play. On success
+   * the new clip is opened, which is the only thing the user has to see.
+   */
+  async function combineClips() {
+    if (combineIds.length < 2) return;
+    busy = true;
+    try {
+      const written = await source.combineClips(combineIds);
+      notice = describeCombine(combineIds.length, written);
+      combineIds = [];
+      await refresh();
+      view = openClip(written.id);
+      void loadThumbnails();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
+   * Re-encode a clip with an export preset.
+   *
+   * Holds the controls for as long as it takes: an export is the one media action here that is
+   * not a stream copy, so it runs for real time on a long clip.
+   */
+  async function exportClip(id: number, preset: string) {
+    busy = true;
+    try {
+      const outcome = await source.exportClip(id, preset);
+      notice = describeExport(outcome);
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function trimClip(id: number, range: TrimRange) {
     busy = true;
     try {
@@ -614,6 +670,24 @@
         <section class="library" data-region="library">
           <div class="view-head">
             <h2>Library</h2>
+            {#if combineIds.length > 0}
+              <span class="combine" data-region="combine-bar">
+                <button
+                  type="button"
+                  class="primary"
+                  disabled={busy || combineIds.length < 2}
+                  onclick={combineClips}
+                >
+                  Combine {combineIds.length} {combineIds.length === 1 ? 'clip' : 'clips'}
+                </button>
+                <button type="button" class="ghost" onclick={() => (combineIds = [])}>
+                  Clear
+                </button>
+                {#if combineIds.length === 1}
+                  <span class="muted">tick one more to combine</span>
+                {/if}
+              </span>
+            {/if}
             <span class="muted">
               {isFiltering(filter) ? `${visibleClips.length} of ${clips.length}` : clips.length} indexed
             </span>
@@ -637,6 +711,8 @@
                 osAction(() => source.copyClipToClipboard(id), 'Clip file copied to the clipboard.')}
               onReveal={(id) => osAction(() => source.revealClip(id), null)}
               onDragOut={(id) => osAction(() => source.dragClipOut(id), null)}
+              {combineIds}
+              onToggleCombine={toggleCombine}
             />
           </div>
         </section>
@@ -660,6 +736,7 @@
                 onCopy={() =>
                   osAction(() => source.copyClipToClipboard(clip.id), 'Clip file copied to the clipboard.')}
                 onReveal={() => osAction(() => source.revealClip(clip.id), null)}
+                onExport={(preset) => exportClip(clip.id, preset)}
               />
             {/key}
           {/if}
@@ -705,7 +782,12 @@
       {:else if view.kind === 'storage'}
         <section class="page" data-region="storage">
           {#if stats !== null}
-            <StoragePanel {stats} {busy} onPruneMissing={pruneMissing} />
+            <StoragePanel
+              {stats}
+              {busy}
+              onPruneMissing={pruneMissing}
+              onOpenDataDir={() => osAction(() => source.openDataDir(), null)}
+            />
           {/if}
         </section>
       {:else if view.kind === 'health'}

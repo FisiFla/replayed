@@ -28,6 +28,10 @@
     onDragOut: (id: number) => void;
     /** A filter is hiding clips, so an empty list is not "no clips". */
     filtering?: boolean;
+    /** Clip ids ticked for combining, in the order they were ticked. */
+    combineIds?: number[];
+    /** Tick or untick one clip for combining. */
+    onToggleCombine?: (id: number) => void;
   }
 
   let {
@@ -41,6 +45,8 @@
     onReveal,
     onDragOut,
     filtering = false,
+    combineIds = [],
+    onToggleCombine = () => {},
   }: Props = $props();
 
   /** Where the primary button went down on a row, until it is released or becomes a drag. */
@@ -182,6 +188,14 @@
         </button>
 
         <div class="actions">
+          <input
+            class="pick"
+            type="checkbox"
+            checked={combineIds.includes(clip.id)}
+            aria-label={`Select ${clip.displayName} to combine`}
+            title="Select to combine with another clip"
+            onchange={() => onToggleCombine(clip.id)}
+          />
           <button
             class="icon star"
             type="button"
@@ -413,6 +427,24 @@
     display: flex;
     justify-content: space-between;
     pointer-events: none;
+  }
+
+  /* The combine tick: same treatment as the icon buttons (fades in with the card, readable
+     against a thumbnail), but a checkbox rather than a glyph. */
+  .actions .pick {
+    pointer-events: auto;
+    width: 18px;
+    height: 18px;
+    margin: 6px;
+    accent-color: var(--accent);
+    opacity: 0;
+    transition: opacity var(--d-fast) var(--ease);
+  }
+
+  li:hover .pick,
+  .pick:checked,
+  .pick:focus-visible {
+    opacity: 1;
   }
 
   .actions button {

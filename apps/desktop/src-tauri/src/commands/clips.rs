@@ -2,6 +2,7 @@
 
 use super::*;
 use replayed_media::edit::{thumbnail as ffmpeg_thumbnail, trim_lossless};
+use replayed_media::export::ExportPreset;
 use replayed_media::probe::MediaInfo;
 use replayed_store::cleanup::{plan_cleanup, CleanupPolicy};
 use replayed_store::{Clip, NewClip, Store};
@@ -531,6 +532,193 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
     }
 
     Ok(outcome)
+}
+
+/// Combine whole clips into one file, losslessly: the concatenation of their own packets.
+///
+/// The refusal rules are the point, not the feature:
+///
+/// * **At least two, and each exactly once.** One clip is not a combine, and a repeated id would
+///   duplicate footage the user did not ask to duplicate.
+/// * **Every file must be on disk and inside the library.** The paths come from the index, a
+///   user-writable file, so the same guard `delete_clip` applies is applied here before anything
+///   is read: a row pointing outside the library must not get its file concatenated.
+/// * **One stream layout for all of them.** A stream copy cannot change size or codec; ffmpeg
+///   would concatenate disagreeing inputs and exit 0 with a truncated or unplayable result
+///   (`replayed_media::edit::check_concat_layout` has the measurement). Mixed clips are a refusal
+///   naming the offending one.
+///
+/// The output is a new clip in the library, indexed like any other: it is real footage with a
+/// real file, so the storage policy must see it. Its game and tags are inherited only where every
+/// input agrees (a combine of a Valorant ace and a CS2 round has no single game).
+pub fn combine_clips(deps: &Deps<'_>, ids: &[i64]) -> Result<ClipDto, CommandError> {
+    let mut ordered: Vec<i64> = Vec::with_capacity(ids.len());
+    for &id in ids {
+        if !ordered.contains(&id) {
+            ordered.push(id);
+        }
+    }
+    if ordered.len() < 2 {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "combining needs at least two different clips; {} was selected",
+                ordered.len()
+            ),
+        ));
+    }
+
+    let mut clips = Vec::with_capacity(ordered.len());
+    for id in &ordered {
+        let clip = find_clip(deps.store, *id)?;
+        if !clip.path.is_file() {
+            return Err(CommandError::new(
+                ErrorCode::Io,
+                format!(
+                    "clip #{id} is indexed at {} but that file is not on disk, so it cannot be \
+                     combined",
+                    clip.path.display()
+                ),
+            ));
+        }
+        if !is_inside_library(&clip.path, deps.paths) {
+            return Err(CommandError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "clip #{id} points outside the clips and application data directories ({}); \
+                     refusing to read it",
+                    clip.path.display()
+                ),
+            ));
+        }
+        clips.push(clip);
+    }
+
+    let paths: Vec<std::path::PathBuf> = clips.iter().map(|clip| clip.path.clone()).collect();
+    let dst = free_output_path(
+        deps.paths
+            .clips_dir
+            .join(format!("combine-{}.mp4", now_ms())),
+    )?;
+    let bins = deps.binaries()?;
+    replayed_media::edit::combine_lossless(bins, &paths, &dst).map_err(|e| {
+        CommandError::media(
+            &format!(
+                "combining clips {}",
+                ordered
+                    .iter()
+                    .map(|id| format!("#{id}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            e,
+        )
+    })?;
+
+    // The file exists from here on; a bookkeeping failure must not delete it (it is what the user
+    // asked for, and it is the only copy of the combined footage).
+    let label = format!(
+        "clips {}",
+        ordered
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    );
+    let total_ms: u64 = clips.iter().map(|clip| clip.duration_ms).sum();
+    let new = index_new_clip(deps, &label, 0, &clips[0].codec, &dst, 0, total_ms)?;
+
+    // Inherited only where every input agrees; `inherit_metadata` writes what it is given.
+    let game = clips
+        .iter()
+        .map(|clip| clip.game.clone())
+        .reduce(|a, b| if a == b { a } else { None })
+        .flatten();
+    let mut tags: Vec<String> = clips
+        .iter()
+        .flat_map(|clip| clip.tags.iter().cloned())
+        .collect();
+    tags.sort();
+    tags.dedup();
+    Ok(inherit_metadata(deps, new, game.as_deref(), &tags))
+}
+
+/// Re-encode clip `id` with `preset` into a new file beside it, and report where it went.
+///
+/// The one operation in this module that decodes and encodes on purpose — an export changes the
+/// pixels (a smaller frame, a vertical frame, a GIF), which no stream copy can do. The original is
+/// never modified and the export is **not** indexed: it is an artefact meant to be uploaded, and
+/// indexing it would put a derived copy of the footage under the storage policy's cap.
+pub fn export_clip(deps: &Deps<'_>, id: i64, preset: &str) -> Result<ExportOutcome, CommandError> {
+    let preset = ExportPreset::parse(preset).ok_or_else(|| {
+        CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "{preset:?} is not an export preset; this build offers {}",
+                ExportPreset::ALL
+                    .iter()
+                    .map(|preset| preset.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )
+    })?;
+    let clip = find_clip(deps.store, id)?;
+    if !clip.path.is_file() {
+        return Err(CommandError::new(
+            ErrorCode::Io,
+            format!(
+                "clip #{id} is indexed at {} but that file is not on disk, so there is nothing \
+                 to export",
+                clip.path.display()
+            ),
+        ));
+    }
+    if !is_inside_library(&clip.path, deps.paths) {
+        return Err(CommandError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "clip #{id} points outside the clips and application data directories ({}); \
+                 refusing to read it",
+                clip.path.display()
+            ),
+        ));
+    }
+
+    let stem = clip
+        .path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| format!("clip-{id}"));
+    let candidate =
+        deps.paths
+            .clips_dir
+            .join(format!("{stem}-{}.{}", preset.as_str(), preset.extension()));
+    let dst = free_output_path(candidate)?;
+    let bins = deps.binaries()?;
+    replayed_media::export::export(bins, &clip.path, &dst, preset, clip.duration_ms).map_err(
+        |e| CommandError::media(&format!("exporting clip #{id} as {}", preset.as_str()), e),
+    )?;
+
+    // Sized and probed from the file that was written: a re-encode may land a few frames either
+    // side of the source's length, and reporting the source's would be a guess.
+    let size_bytes = std::fs::metadata(&dst)
+        .map_err(|e| CommandError::io("sizing the export", &dst, e))?
+        .len();
+    let duration_ms = MediaInfo::probe(bins, &dst)
+        .map(|info| info.duration_ms)
+        .unwrap_or(clip.duration_ms);
+    tracing::info!(
+        "clip #{id} exported as {} to {}: {size_bytes} bytes, {duration_ms}ms",
+        preset.as_str(),
+        dst.display()
+    );
+    Ok(ExportOutcome {
+        preset: preset.as_str().to_string(),
+        path: dst.to_string_lossy().into_owned(),
+        size_bytes,
+        duration_ms,
+    })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1119,6 +1307,176 @@ mod tests {
             ErrorCode::ClipNotFound,
             "a no-op update must not look like success"
         );
+    }
+
+    // -- combine_clips and export_clip -----------------------------------------------------
+
+    #[test]
+    fn combining_two_clips_writes_one_lossless_clip_into_the_library() {
+        let f = Fixture::new();
+        let (a, _) = f.add_real_clip("a.mp4", 1);
+        let (b, _) = f.add_real_clip("b.mp4", 1);
+
+        let combined = combine_clips(&f.deps(), &[a, b]).expect("combine two clips");
+
+        let path = PathBuf::from(&combined.path);
+        assert!(path.is_file(), "the combined clip is on disk");
+        assert_eq!(
+            path.parent(),
+            Some(f.paths.clips_dir.as_path()),
+            "it lands in the library, not beside a source"
+        );
+        // A stream copy cannot change the shape: both sources are the same size and codec.
+        let info = MediaInfo::probe(&f.bins, &path).unwrap();
+        assert!(
+            info.duration_ms >= 1_900,
+            "two one-second clips make about two seconds, got {}ms",
+            info.duration_ms
+        );
+        assert_eq!(f.store.list_clips().unwrap().len(), 3);
+        assert_eq!(
+            f.store
+                .list_clips()
+                .unwrap()
+                .iter()
+                .filter(|c| c.id == combined.id)
+                .count(),
+            1,
+            "the new clip is indexed exactly once"
+        );
+    }
+
+    #[test]
+    fn combining_needs_two_different_clips() {
+        let f = Fixture::new();
+        let (id, _) = f.add_real_clip("a.mp4", 1);
+
+        let none = combine_clips(&f.deps(), &[]).unwrap_err();
+        assert_eq!(none.code, ErrorCode::InvalidInput);
+        assert!(none.message.contains("at least two"), "{}", none.message);
+
+        // The same id twice is one clip, not two: a repeat is a slip, not a request to duplicate
+        // the footage.
+        let same = combine_clips(&f.deps(), &[id, id]).unwrap_err();
+        assert_eq!(same.code, ErrorCode::InvalidInput);
+        assert!(same.message.contains("at least two"), "{}", same.message);
+        assert_eq!(f.store.list_clips().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn combining_a_clip_whose_file_is_gone_is_refused_and_indexes_nothing() {
+        let f = Fixture::new();
+        let (live, _) = f.add_real_clip("live.mp4", 1);
+        let dead = f.add_row("dead.mp4", 1_000, 1_000, 1_000);
+        std::fs::remove_file(f.paths.clips_dir.join("dead.mp4")).unwrap();
+
+        let err = combine_clips(&f.deps(), &[live, dead]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("dead.mp4"), "{}", err.message);
+        assert_eq!(f.store.list_clips().unwrap().len(), 2, "no row was added");
+    }
+
+    #[test]
+    fn combining_clips_of_different_sizes_is_a_media_error_naming_both() {
+        // The command maps the media layer's layout refusal onto its own vocabulary, so the
+        // window shows it in the banner like any other failure.
+        let f = Fixture::new();
+        let (small, _) = f.add_real_clip("small.mp4", 1);
+        write_test_video_sized(&f.bins, &f.paths.clips_dir.join("large.mp4"), 1, 640, 360);
+        let large_path = f.paths.clips_dir.join("large.mp4");
+        let large = f
+            .store
+            .insert_clip(&replayed_store::NewClip {
+                size_bytes: std::fs::metadata(&large_path).unwrap().len(),
+                path: large_path,
+                started_at_ms: 0,
+                duration_ms: 1_000,
+                codec: "mpeg4".into(),
+            })
+            .unwrap();
+
+        let err = combine_clips(&f.deps(), &[small, large]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Media);
+        assert!(
+            err.message.contains("320x180") && err.message.contains("640x360"),
+            "the refusal names both shapes: {}",
+            err.message
+        );
+        assert_eq!(f.store.list_clips().unwrap().len(), 2, "no row was added");
+    }
+
+    #[test]
+    fn exporting_a_clip_writes_a_file_beside_it_and_does_not_index_it() {
+        let f = Fixture::new();
+        let (id, source_path) = f.add_real_clip("clip.mp4", 1);
+        let rows_before = f.store.list_clips().unwrap().len();
+
+        let outcome = export_clip(&f.deps(), id, "discord").expect("export");
+
+        assert_eq!(outcome.preset, "discord");
+        let path = PathBuf::from(&outcome.path);
+        assert!(path.is_file(), "the export is on disk");
+        assert_eq!(
+            path.parent(),
+            source_path.parent(),
+            "an export is written beside the clip"
+        );
+        assert!(path.to_string_lossy().contains("-discord"), "{:?}", path);
+        assert!(outcome.size_bytes > 0);
+        assert!(outcome.duration_ms > 0);
+        assert_eq!(
+            f.store.list_clips().unwrap().len(),
+            rows_before,
+            "an export is not another entry in the library"
+        );
+        assert!(
+            source_path.is_file(),
+            "the original is never modified or replaced"
+        );
+    }
+
+    #[test]
+    fn the_gif_export_writes_a_gif() {
+        let f = Fixture::new();
+        let (id, _) = f.add_real_clip("clip.mp4", 1);
+
+        let outcome = export_clip(&f.deps(), id, "gif").expect("export a gif");
+
+        assert_eq!(outcome.preset, "gif");
+        assert!(outcome.path.ends_with(".gif"), "{}", outcome.path);
+        let info = MediaInfo::probe(&f.bins, &PathBuf::from(&outcome.path)).unwrap();
+        assert_eq!(info.video.as_ref().unwrap().codec, "gif");
+    }
+
+    #[test]
+    fn exporting_with_an_unknown_preset_is_refused_and_names_the_ones_that_exist() {
+        let f = Fixture::new();
+        let (id, source_path) = f.add_real_clip("clip.mp4", 1);
+
+        let err = export_clip(&f.deps(), id, "ultrawide").unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        for preset in ["discord", "vertical", "gif"] {
+            assert!(err.message.contains(preset), "{}", err.message);
+        }
+        // Nothing was written: the refusal happens before ffmpeg is spawned.
+        let siblings: Vec<_> = std::fs::read_dir(&f.paths.clips_dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path != &source_path)
+            .collect();
+        assert!(siblings.is_empty(), "{siblings:?}");
+    }
+
+    #[test]
+    fn exporting_a_clip_whose_file_is_gone_is_refused() {
+        let f = Fixture::new();
+        let id = f.add_row("gone.mp4", 1_000, 1_000, 1_000);
+        std::fs::remove_file(f.paths.clips_dir.join("gone.mp4")).unwrap();
+
+        let err = export_clip(&f.deps(), id, "discord").unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("not on disk"), "{}", err.message);
     }
 
     // -- storage_stats -------------------------------------------------------------------
