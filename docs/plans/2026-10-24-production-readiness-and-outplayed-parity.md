@@ -6,8 +6,7 @@ non-goals, changelog) are done — ledgers §38–§41 record what the tests pro
 not. Step 11 (combine and the export presets) is implemented — ledger §42. Phase C's Windows
 sweep, the release itself and step 10 (screenshot) are open; **step 12 is implemented** —
 hotkey rebinding (§45), autostart toggle, first-run checklist and the open-data-folder button
-(§43, §44).
-What has and has not been verified is recorded in
+(§43, §44). What has and has not been verified is recorded in
 [`docs/verification-status.md`](../verification-status.md); this plan does not upgrade any claim
 there.
 
