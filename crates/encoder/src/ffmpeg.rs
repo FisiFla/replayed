@@ -1676,12 +1676,29 @@ mod tests {
         );
     }
 
+    /// A stand-in child process, in the shell this platform has.
+    ///
+    /// These two tests used `sh`, which exists on the development host and not on Windows: on the
+    /// box both failed with "program not found" before reaching an assertion, and had done since
+    /// they were written. A test that cannot run is not a test, so the shell is chosen per
+    /// platform and the child's own script lives in the case below.
+    fn stand_in_script(windows: &str, unix: &str) -> std::process::Command {
+        if cfg!(windows) {
+            let mut cmd = std::process::Command::new("cmd");
+            cmd.args(["/C", windows]);
+            cmd
+        } else {
+            let mut cmd = std::process::Command::new("sh");
+            cmd.args(["-c", unix]);
+            cmd
+        }
+    }
+
     /// A child that exits on its own is not a child that was killed, and on Windows the two report
     /// the same number. A report that cannot tell them apart cannot say what happened.
     #[test]
     fn a_child_that_exits_is_not_reported_as_killed() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "exit 1"])
+        let mut child = stand_in_script("exit 1", "exit 1")
             .spawn()
             .expect("the stand-in starts");
         let end = wait_bounded(&mut child, std::time::Duration::from_secs(5));
@@ -1694,8 +1711,9 @@ mod tests {
 
     #[test]
     fn a_child_that_will_not_go_is_reported_as_killed() {
-        let mut child = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
+        // `ping` is the Windows sleep that needs no console and no extra program: one echo per
+        // second, thirty of them.
+        let mut child = stand_in_script("ping -n 31 127.0.0.1 >NUL", "sleep 30")
             .spawn()
             .expect("the stand-in starts");
         let end = wait_bounded(&mut child, std::time::Duration::from_millis(100));

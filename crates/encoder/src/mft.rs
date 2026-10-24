@@ -1443,33 +1443,30 @@ impl MftEncoder {
 
     /// A blob attribute of the encoder's own output type, if it has one.
     ///
-    /// Every type the encoder offers is asked, because which one carries the attribute is the
-    /// encoder's own business: the hardware encoders answer the enumeration with more than one
-    /// type, and the sequence header is not always on the first.
+    /// **The current type is asked first, then every offered one.** The sequence header is a
+    /// property of the type the encoder is *producing*, and Media Foundation's documentation puts
+    /// it on the output type the encoder sets; asking only the enumeration (`GetOutputAvailableType`)
+    /// asks the list this machine's NVENC driver answers with types that carry no header at all,
+    /// which is how the check below failed on the Windows box with the encoder working fine
+    /// around it. The enumeration remains as a fallback because which type carries the attribute is
+    /// the encoder's own business, and a driver that fills it in only on the offered types must
+    /// still be read.
     fn output_type_blob(&self, key: &windows::core::GUID) -> Option<Vec<u8>> {
+        // SAFETY: a read of this transform's own current output type; the type it returns is owned
+        // here and dropped with the loop's iteration.
+        if let Ok(media_type) = unsafe { self.transform.GetOutputCurrentType(0) } {
+            if let Some(blob) = blob_of(&media_type, key) {
+                return Some(blob);
+            }
+        }
         for index in 0..MAX_OFFERED_TYPES {
             // SAFETY: the transform's own enumeration; the type it returns is owned here.
             let Ok(media_type) = (unsafe { self.transform.GetOutputAvailableType(0, index) })
             else {
                 continue;
             };
-            // SAFETY: reading one attribute out of a type this function owns.
-            let Ok(size) = (unsafe { media_type.GetBlobSize(key) }) else {
-                continue;
-            };
-            if size == 0 {
-                continue;
-            }
-            let mut buffer = vec![0u8; size as usize];
-            let mut written = size;
-            // SAFETY: the buffer is exactly the size the attribute reported, and it outlives the
-            // call.
-            if unsafe { media_type.GetBlob(key, &mut buffer, Some(&mut written)) }.is_err() {
-                continue;
-            }
-            buffer.truncate(written as usize);
-            if !buffer.is_empty() {
-                return Some(buffer);
+            if let Some(blob) = blob_of(&media_type, key) {
+                return Some(blob);
             }
         }
         None
@@ -1510,6 +1507,26 @@ impl MftEncoder {
         // SAFETY: the encoder's own input stream, with a sample that outlives the call.
         unsafe { self.transform.ProcessInput(0, &sample, 0) }.context("IMFTransform::ProcessInput")
     }
+}
+
+/// A blob attribute of one media type, or `None` when it has none or cannot be read.
+///
+/// One function for both callers ([`MftEncoder::output_type_blob`]'s two paths), so the size-then-read
+/// dance — which is a `GetBlobSize` and a `GetBlob` that can disagree — exists once.
+fn blob_of(media_type: &IMFMediaType, key: &windows::core::GUID) -> Option<Vec<u8>> {
+    // SAFETY: reading one attribute out of a type the caller owns.
+    let size = unsafe { media_type.GetBlobSize(key) }.ok()?;
+    if size == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u8; size as usize];
+    let mut written = size;
+    // SAFETY: the buffer is exactly the size the attribute reported, and it outlives the call.
+    if unsafe { media_type.GetBlob(key, &mut buffer, Some(&mut written)) }.is_err() {
+        return None;
+    }
+    buffer.truncate(written as usize);
+    (!buffer.is_empty()).then_some(buffer)
 }
 
 impl Drop for MftEncoder {
