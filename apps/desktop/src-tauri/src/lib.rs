@@ -187,16 +187,21 @@ impl AppState {
             .iter()
             .filter(|session| replayed_store::prune::session_is_missing(session))
             .count();
+        let live_bytes: u64 = clips
+            .iter()
+            .filter(|clip| !replayed_store::prune::clip_is_missing(clip))
+            .map(|clip| clip.size_bytes)
+            .sum();
         tracing::info!(
             "clip index {} (schema v{}): {} clip(s) on disk ({} row(s) name a file that is gone), \
-             {} session(s) ({} row(s) name a file that is gone), {} bytes",
+             {} bytes on disk, {} session(s) ({} row(s) name a file that is gone)",
             paths.db_path.display(),
             store.schema_version().unwrap_or(-1),
             clips.len() - missing_clips,
             missing_clips,
+            live_bytes,
             sessions.len() - missing_sessions,
-            missing_sessions,
-            store.total_bytes().unwrap_or(0)
+            missing_sessions
         );
 
         // One record of the GSI cfgs this shell installed, shared with the recorder host:
