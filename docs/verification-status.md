@@ -3459,3 +3459,50 @@ true.
 The registry write has still never run on Windows — the checkbox has not been clicked on the box,
 and `reg.exe` is a boundary this host does not implement (the argv and the sync rules are tested,
 the effect is not). The checklist has been rendered in jsdom only, never in a real window.
+## 45. The clip hotkey can be rebound, and it is checked before it is saved (2026-10-24)
+
+### What made this non-trivial
+`RegisterHotKey` is system-wide and a registration belongs to the thread that made it, so the
+chord is registered **once, at startup**, on a dedicated thread, and owned until the process
+exits. A panel therefore cannot "apply now": it can only write the chord the next start will
+install. Two consequences shaped this:
+
+1. **A chord another application owns must be refused at save time.** Writing it would produce a
+   file that loads, a process that starts, and a key nothing answers — for ever, since the panel
+   would report it as saved. `hotkey::probe` registers the candidate on the calling thread with an
+   id of its own, releases it at once, and reports what `RegisterHotKey` said. It answers "free
+   as of this moment", not "free at the next launch", which is why the startup's own registration
+   and its failure message still exist and are still what a user sees when it goes wrong.
+2. **The panel must not promise immediate effect.** It shows the chord *in force* (from
+   `app_status.hotkey`, which is what the process really holds) beside the saved one, and the
+   notice says "…saved as Ctrl+F9; Ctrl+F8 stays in force until replayed restarts".
+
+`update_settings` probes before `update_settings_and_prepare` writes, so a taken chord is refused
+with nothing changed. The decision is `check_clip_hotkey` — pure, with the probe injected — so all
+four outcomes are tested on a host that cannot register anything: `AlreadyInForce` (probing our
+own chord would always fail, so it is skipped), `NotSupported` (not Windows: saved, not probed),
+`Free`, and `Taken` (the registration's own message, carried through).
+
+### A parser laxity this exposed
+The chord parser took the **first** alphanumeric character of a key token, so `"Ctrl+Hovercraft"`
+parsed as Ctrl+H, installed, and answered a key the user never named. Tolerable in a file someone
+writes by hand; a trap in a panel with a text field. `Hotkey::parse` now requires the key to be
+exactly one character or `F1`–`F24` and says so, with a test for both.
+
+### Evidence
+`replayed-events` 165 tests (+1: the multi-character key is refused; the same test pins that
+`Ctrl+K` and `ctrl+k` still parse and that a bare `Ctrl` keeps its "no main key" message).
+Desktop crate 287 (+4): the probe decision in all four outcomes, the note for a change with and
+without a chord in force, `[hotkeys] clip` written as the parser's own spelling (`alt+f9` →
+`Alt+F9`), an unparseable chord refused with nothing written, and the reader's default. Frontend
+346 (+5: three chord-helper tests, two panel tests), `svelte-check` 0/0, the production build.
+The Windows target compiles and lints the new probe (`cargo clippy -p replayed-events --target
+x86_64-pc-windows-msvc -D warnings`).
+
+### What is NOT verified
+`probe` has never run on Windows: what is tested is the decision around it, not `RegisterHotKey`
+itself. The panel has not been driven in a real window, and a rebind has not been tried against a
+chord another application holds. The live-rebind design — a listener thread that can unregister
+and register again on command — was deliberately **not** built: without a Windows host to run it,
+a message-loop refactor whose failure mode is a silently dead hotkey is the wrong risk to take
+for a convenience.

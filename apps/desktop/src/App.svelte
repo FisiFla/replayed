@@ -810,6 +810,7 @@
               {busy}
               onApply={updateSettings}
               onChooseClipsDir={() => source.chooseClipsDir()}
+              hotkeyInForce={app === null ? null : app.hotkey.installed ? app.hotkey.chord : null}
             />
           {/if}
         </section>

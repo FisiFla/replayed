@@ -21,11 +21,13 @@
   import {
     QUALITY_OPTIONS,
     automaticUpdate,
+    chordProblem,
     automaticWarning,
     captureUpdate,
     defaultWatchName,
     deviceOptions,
     monitorIndex,
+    normaliseChord,
     watchListProblem,
   } from '../settings';
   import EncoderPanel from './EncoderPanel.svelte';
@@ -50,6 +52,8 @@
     audioDevices?: AudioDevices;
     /** Re-read the device list, so a device plugged in after launch shows up. */
     onRefreshAudioDevices?: () => void;
+    /** The chord the running process really holds, or `null` when nothing is installed. */
+    hotkeyInForce?: string | null;
     /** CS2 / Dota 2 as Steam has them; empty until the first detection answers. */
     gsiTargets?: GsiTarget[];
     /** Write that game's Game State Integration cfg into its detected folder. */
@@ -64,6 +68,7 @@
     onChooseClipsDir,
     audioDevices = { inputs: [], outputs: [] },
     onRefreshAudioDevices = () => {},
+    hotkeyInForce = null,
     gsiTargets = [],
     onInstallGsi = () => {},
   }: Props = $props();
@@ -83,6 +88,7 @@
   let saveSession = $state(false);
   let autoRecord = $state(false);
   let startWithSystem = $state(false);
+  let clipHotkey = $state('');
   let quality = $state('balanced');
   let monitorText = $state('0');
   let windowTitle = $state('');
@@ -104,6 +110,7 @@
     saveSession = settings.save_session;
     autoRecord = settings.auto_record;
     startWithSystem = settings.start_with_system;
+    clipHotkey = settings.clip_hotkey;
     quality = settings.quality;
     monitorText = String(settings.capture_monitor);
     windowTitle = settings.capture_window;
@@ -123,6 +130,10 @@
   const watchProblem = $derived(watchListProblem(watchGames));
   /** Automatic recording on, nothing kept: the parity-tier half the user would otherwise miss. */
   const automaticNote = $derived(automaticWarning({ autoRecord, saveSession }));
+  /** What is wrong with the typed chord, or `null`. The backend parses it again on the way in. */
+  const hotkeyProblem = $derived(chordProblem(clipHotkey));
+  /** The chord this process holds, for "what is in force now" beside the draft. */
+  const hotkeyNow = $derived(hotkeyInForce === null ? 'nothing' : hotkeyInForce);
   const isDefault = $derived(
     (key: string) => settings?.defaulted.includes(key) ?? false,
   );
@@ -185,6 +196,18 @@
     onApply({ start_with_system: startWithSystem });
   }
 
+  /**
+   * Save the clip hotkey.
+   *
+   * The chord is registered once at startup and owned until the process exits, so this cannot
+   * make it live: the backend checks the chord is free (on Windows) before writing it, and the
+   * notice says which chord stays in force until a restart.
+   */
+  function applyHotkey() {
+    if (hotkeyProblem !== null) return;
+    onApply({ clip_hotkey: normaliseChord(clipHotkey) });
+  }
+
   function applyAutomatic() {
     if (settings === null || watchProblem !== null) return;
     onApply(automaticUpdate(settings, { autoRecord, saveSession, watch: watchGames }));
@@ -223,6 +246,7 @@
   const SECTIONS = [
     { id: 'settings-library', label: 'Library' },
     { id: 'settings-startup', label: 'Startup' },
+    { id: 'settings-hotkey', label: 'Clip hotkey' },
     { id: 'settings-capture', label: 'Capture' },
     { id: 'settings-encoder', label: 'Encoder' },
     { id: 'settings-automatic', label: 'Automatic recording' },
@@ -325,6 +349,34 @@
         it either way. Off Windows the setting is saved and nothing is registered.
       </p>
       <button type="button" onclick={applyStartup} disabled={busy}>Apply startup</button>
+    </div>
+
+    <div class="group" id="settings-hotkey">
+      <h3>Clip hotkey</h3>
+      <div class="row">
+        <label class="field">
+          <span>Chord {#if isDefault('hotkeys.clip')}<span class="muted">(default)</span>{/if}</span>
+          <input
+            type="text"
+            value={clipHotkey}
+            oninput={(event) => (clipHotkey = event.currentTarget.value)}
+            placeholder="Ctrl+F8"
+            aria-describedby="hotkey-now"
+            disabled={busy}
+          />
+        </label>
+      </div>
+      <p class="muted footnote" id="hotkey-now">
+        In force now: <kbd>{hotkeyNow}</kbd>. A saved chord is checked free before it is written —
+        another application, or another replayed, can hold it — and takes effect when replayed
+        restarts, because the chord is registered once at startup and owned until exit.
+      </p>
+      {#if hotkeyProblem !== null}
+        <p class="invalid">{hotkeyProblem}</p>
+      {/if}
+      <button type="button" onclick={applyHotkey} disabled={busy || hotkeyProblem !== null}>
+        Apply hotkey
+      </button>
     </div>
 
     <div class="group" id="settings-capture">
@@ -727,6 +779,15 @@
     margin: 0;
     accent-color: var(--accent);
     cursor: pointer;
+  }
+
+  kbd {
+    font: 400 12px/1.4 var(--font-mono);
+    padding: 1px 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-sm);
+    background: var(--surface-1);
+    color: var(--text);
   }
 
   .invalid {

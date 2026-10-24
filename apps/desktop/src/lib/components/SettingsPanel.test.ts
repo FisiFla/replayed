@@ -33,6 +33,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     output_device: '',
     save_session: false,
     auto_record: false,
+    clip_hotkey: 'Ctrl+F8',
     start_with_system: false,
     bitrate_kbps: 20_000,
     quality: 'balanced',
@@ -189,6 +190,44 @@ describe('the automatic-recording section', () => {
     expect(listed(target)).toEqual([]);
     expect(text(target)).toContain('cannot be empty');
     expect(applyAutomatic(target)!.disabled).toBe(true);
+  });
+
+  it('saves the clip hotkey in the spelling the backend stores, and names what is in force', async () => {
+    const onApply = vi.fn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(SettingsPanel, {
+      target,
+      props: {
+        settings: settings(),
+        recording: null,
+        busy: false,
+        onApply,
+        onChooseClipsDir: () => Promise.resolve(''),
+        hotkeyInForce: 'Ctrl+F8',
+      },
+    });
+    await settle();
+
+    expect(text(target)).toContain('In force now: Ctrl+F8');
+    field(target, 'Chord')!.value = ' shift+ctrl+q ';
+    field(target, 'Chord')!.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    button(target, 'Apply hotkey')!.click();
+    await settle();
+
+    expect(onApply.mock.calls[0]![0]).toEqual({ clip_hotkey: 'Ctrl+Shift+Q' });
+  });
+
+  it('refuses a chord the backend could not install, before sending it', async () => {
+    const { target, onApply } = await mountPanel(settings());
+    field(target, 'Chord')!.value = 'Ctrl+Hovercraft';
+    field(target, 'Chord')!.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+
+    expect(text(target)).toContain('is not a key');
+    expect(button(target, 'Apply hotkey')!.disabled).toBe(true);
+    expect(onApply).not.toHaveBeenCalled();
   });
 
   it('persists the start-with-Windows switch on its own Apply', async () => {

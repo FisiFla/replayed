@@ -16,6 +16,11 @@ what has and has not been *verified* on real hardware, read
 - **Export presets** — *Discord* (720p, small), *Vertical 9:16* (1080×1920, centre-cropped) and
   *GIF* (480px, 15fps, no audio). These are the one media path that re-encodes on purpose; the file
   lands beside the clip and is deliberately not added to the library.
+- **The clip hotkey can be rebound** in Settings → Clip hotkey. The chord is written to
+  `[hotkeys] clip`, checked free first (another application, or another replayed, may own it), and
+  takes effect when replayed restarts — the panel says which chord is in force meanwhile. The
+  parser no longer cuts a multi-character key down to its first letter (`Ctrl+Hovercraft` used to
+  become Ctrl+H).
 - ***Start with Windows*** is a checkbox in Settings → Startup. The file stays the switch; applying
   asks Windows immediately and reports what the registry said, including on a build that has no
   such mechanism.

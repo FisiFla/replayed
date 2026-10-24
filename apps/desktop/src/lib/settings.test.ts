@@ -8,12 +8,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   automaticUpdate,
+  chordProblem,
   automaticWarning,
   captureUpdate,
   defaultWatchName,
   describeSettingsUpdate,
   deviceOptions,
   monitorIndex,
+  normaliseChord,
   sameWatchList,
   watchListProblem,
 } from './settings';
@@ -27,6 +29,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     output_size: '',
     mic_enabled: false,
     auto_record: false,
+    clip_hotkey: 'Ctrl+F8',
     start_with_system: false,
     bitrate_kbps: 20000,
     quality: 'balanced',
@@ -50,6 +53,7 @@ function outcome(overrides: Partial<UpdateSettingsOutcome> = {}): UpdateSettings
     restart_required: false,
     restart_reason: null,
     autostart: null,
+    hotkey: null,
     ...overrides,
   };
 }
@@ -234,5 +238,27 @@ describe('the automatic-recording warning', () => {
   it('is silent when both are on, or when automatic recording is off', () => {
     expect(automaticWarning({ autoRecord: true, saveSession: true })).toBeNull();
     expect(automaticWarning({ autoRecord: false, saveSession: false })).toBeNull();
+  });
+});
+
+describe('a hotkey chord', () => {
+  it('accepts the shapes the backend parser accepts', () => {
+    for (const chord of ['Ctrl+F8', 'ctrl+f8', 'Alt+Shift+K', 'F12', 'Ctrl+5', 'Shift+Ctrl+Q']) {
+      expect(chordProblem(chord), chord).toBeNull();
+    }
+  });
+
+  it('names what is wrong with a chord it cannot take', () => {
+    expect(chordProblem('')).toContain('cannot be empty');
+    expect(chordProblem('Ctrl')).toContain('needs a keypress');
+    expect(chordProblem('Meta+K')).toContain('not a modifier');
+    expect(chordProblem('Ctrl+Hovercraft')).toContain('not a key');
+    expect(chordProblem('Ctrl+F25')).toContain('not a key');
+  });
+
+  it('writes the chord the way the backend stores it', () => {
+    expect(normaliseChord(' shift+ctrl+q ')).toBe('Ctrl+Shift+Q');
+    expect(normaliseChord('alt+f9')).toBe('Alt+F9');
+    expect(normaliseChord('F8')).toBe('F8');
   });
 });

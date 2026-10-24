@@ -996,6 +996,31 @@ fn update_settings(
             update.clips_dir = Some(picked);
         }
     }
+    // The clip hotkey is registered once, at startup. A change cannot take effect now, but a
+    // chord another application already owns must be refused *before* it is written: a saved
+    // chord that cannot install is a startup that reports a dead hotkey for ever after.
+    let installed_chord = state.hotkey().chord.clone();
+    let installed = state.hotkey().installed;
+    if let Some(chord) = update.clip_hotkey.clone() {
+        let check = commands::check_clip_hotkey(
+            &chord,
+            // Only a chord the process really holds is "in force"; a failed installation holds
+            // nothing, so the new value still has to be probed.
+            if installed {
+                Some(installed_chord.as_str())
+            } else {
+                None
+            },
+            replayed_events::hotkey::supported(),
+            replayed_events::hotkey::probe,
+        );
+        if let commands::HotkeyCheck::Taken(err) = check {
+            return Err(CommandError::new(
+                commands::ErrorCode::InvalidInput,
+                format!("the clip hotkey was not saved: {err}"),
+            ));
+        }
+    }
     let running = state.recorder().is_running()?;
     // `update_settings_and_prepare` creates the new clips directory before it writes anything, so
     // what is left here, committing it to the running shell and re-scoping the asset protocol, is
@@ -1012,6 +1037,12 @@ fn update_settings(
     // The file is written; now make Windows agree with it, and report what it said. Failing the
     // whole command would claim the setting was not saved, and it was — the next launch re-syncs
     // the registry anyway (see `background::sync_autostart`).
+    if update.clip_hotkey.is_some() {
+        outcome.hotkey = Some(commands::hotkey_change_note(
+            update.clip_hotkey.as_deref().unwrap_or_default(),
+            installed.then_some(installed_chord.as_str()),
+        ));
+    }
     if let Some(enabled) = update.start_with_system {
         outcome.autostart = Some(match std::env::current_exe() {
             Ok(exe) => commands::apply_autostart_update(enabled, &exe, background::apply_autostart),

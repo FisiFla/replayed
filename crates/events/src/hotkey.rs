@@ -109,14 +109,21 @@ fn parse_key(key: Option<&str>) -> Result<u32> {
         }
         anyhow::bail!("function key out of range: F{n}");
     }
-    let ch = key
-        .chars()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("empty key"))?;
+    // Exactly one character. Taking the first character of a longer token made a typo look like a
+    // working chord: `"Ctrl+Hovercraft"` parsed as Ctrl+H, installed, and answered a key the user
+    // never named. A rebinding panel turns that from a curiosity into a trap.
+    let mut chars = key.chars();
+    let ch = chars.next().ok_or_else(|| anyhow::anyhow!("empty key"))?;
+    if chars.next().is_some() {
+        anyhow::bail!(
+            "unsupported key: {key:?} — a chord's key is one character (\"K\", \"5\") or a \
+             function key (\"F8\")"
+        );
+    }
     if ch.is_ascii_alphanumeric() {
         return Ok(ch.to_ascii_uppercase() as u32); // VK_A..VK_Z / VK_0..VK_9
     }
-    anyhow::bail!("unsupported key: {key}")
+    anyhow::bail!("unsupported key: {key:?}")
 }
 
 /// Start listening for one chord. Returns a channel that yields once per press. A convenience
@@ -134,6 +141,61 @@ pub fn listen(hk: Hotkey) -> Result<Receiver<()>> {
             }
         })?;
     Ok(rx)
+}
+
+/// Ask whether the platform will let this process own `hk` right now, and give it back.
+///
+/// `RegisterHotKey` is system-wide, so a chord's availability is only knowable by asking to own
+/// it: a rebinding panel that wrote a chord without asking would produce a file that loads, a
+/// process that starts, and a key nothing answers. The probe registers and releases immediately,
+/// on the calling thread, with an id of its own (the listener thread's ids start at 1).
+///
+/// # What it does not promise
+///
+/// That the chord is free *later*. Another application can take it between the probe and the next
+/// launch, which is why the chord is still installed (and can still fail, loudly) at startup. The
+/// answer is "free as of this moment", which is exactly what a user choosing a chord needs.
+///
+/// Off Windows this returns an error rather than `Ok`: a caller that ignored [`supported`] would
+/// otherwise report a chord free on a machine where no chord can ever fire.
+#[cfg(windows)]
+pub fn probe(hk: Hotkey) -> Result<(), String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{
+        RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_SHIFT,
+    };
+    // Away from the ids `listen_all` uses (1..=n) and from any id an application picks by
+    // convention. Hotkey ids are per-thread, and this registration lasts microseconds.
+    const PROBE_ID: i32 = 0x4000;
+    let mut modifiers = HOT_KEY_MODIFIERS(0);
+    if hk.ctrl {
+        modifiers |= MOD_CONTROL;
+    }
+    if hk.alt {
+        modifiers |= MOD_ALT;
+    }
+    if hk.shift {
+        modifiers |= MOD_SHIFT;
+    }
+    // SAFETY: a registration on this thread, released by this thread below.
+    unsafe {
+        match RegisterHotKey(None, PROBE_ID, modifiers, hk.vk) {
+            Ok(()) => {
+                let _ = UnregisterHotKey(None, PROBE_ID);
+                Ok(())
+            }
+            Err(err) => Err(format!(
+                "{hk} is already held by another application (RegisterHotKey failed: {err}). \
+                 Another replayed counts too: the CLI and this app cannot both hold one chord. \
+                 Close the other application, or choose a different chord."
+            )),
+        }
+    }
+}
+
+/// Off Windows there is no registration to probe.
+#[cfg(not(windows))]
+pub fn probe(_hk: Hotkey) -> Result<(), String> {
+    Err("a global hotkey is a Windows feature, and this build has nothing to register".to_string())
 }
 
 /// Start listening for several chords. The channel yields the index (into `hks`) of the chord
@@ -249,6 +311,22 @@ mod tests {
                 vk: 0x77
             }
         );
+    }
+
+    #[test]
+    fn a_key_that_is_not_one_character_is_refused_rather_than_cut_down_to_one() {
+        // The bug this rules out: `"Ctrl+Hovercraft"` used to parse as Ctrl+H, so a typo became a
+        // working hotkey for a key the user never named.
+        let err = Hotkey::parse("Ctrl+Hovercraft").unwrap_err();
+        assert!(
+            format!("{err}").contains("one character"),
+            "the refusal says what a key is: {err}"
+        );
+        // One character is still a chord, in either case.
+        assert_eq!(Hotkey::parse("Ctrl+K").unwrap().vk, u32::from(b'K'));
+        assert_eq!(Hotkey::parse("ctrl+k").unwrap().vk, u32::from(b'K'));
+        // And a bare modifier is still the old, named error.
+        assert!(format!("{}", Hotkey::parse("Ctrl").unwrap_err()).contains("no main key"));
     }
 
     #[test]

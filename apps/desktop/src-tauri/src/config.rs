@@ -550,6 +550,9 @@ pub enum SettingEdit {
     AutoRecord(bool),
     /// `[app] start_with_system`.
     StartWithSystem(bool),
+    /// `[hotkeys] clip`: the chord, as the user typed it (normalised by `Hotkey`'s `Display` when
+    /// it is read back). Validated by the same parser the installer uses.
+    ClipHotkey(String),
     /// `[[games.watch]]`: the whole list, replacing whatever the file had.
     ///
     /// The list is the feature (`[games] auto_record` watches these), so it is written as one
@@ -622,6 +625,7 @@ impl SettingEdit {
             SettingEdit::AutoRecord(_) => "games.auto_record",
             SettingEdit::WatchGames(_) => "games.watch",
             SettingEdit::StartWithSystem(_) => "app.start_with_system",
+            SettingEdit::ClipHotkey(_) => "hotkeys.clip",
             SettingEdit::Quality(_) => "encode.bitrate_kbps",
             SettingEdit::CaptureMonitor(_) => "capture.monitor",
             SettingEdit::CaptureWindow(_) => "capture.window",
@@ -669,6 +673,10 @@ pub struct EffectiveSettings {
     /// (which is what the engine watches then, too). Names, executables and signals: the panel
     /// edits the list, so a display name is not enough.
     pub watch: Vec<WatchedGame>,
+    /// `[hotkeys] clip`: the chord the shell installs at startup, verbatim from the file (or the
+    /// documented default when it sets none). The panel edits it; the shell is the thing that has
+    /// to hold it, so a change takes effect at the next start.
+    pub clip_hotkey: String,
     /// `[app] start_with_system`: whether this application should own a start-with-Windows entry.
     ///
     /// The file says what the user wants; the registry says what is. Reading them apart is the
@@ -690,6 +698,7 @@ fn mistyped(key: &'static str) -> CommandError {
             section = key.split('.').next().unwrap_or("config"),
             what = match key {
                 "storage.clips_dir"
+                | "hotkeys.clip"
                 | "encode.output_size"
                 | "encode.vendor"
                 | "encode.codec"
@@ -915,6 +924,17 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
                 Ok(())
             }
         }
+        SettingEdit::ClipHotkey(chord) => replayed_events::hotkey::Hotkey::parse(chord)
+            .map(|_| ())
+            .map_err(|err| {
+                CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "hotkeys.clip is {chord:?}, which is not a chord this build can \
+                             install ({err}); it wants something like \"Ctrl+F8\""
+                    ),
+                )
+            }),
         SettingEdit::CaptureWindow(title) => {
             if title.contains(['\n', '\r']) {
                 Err(CommandError::new(
@@ -1193,6 +1213,15 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
                 false
             }
         };
+    let clip_hotkey = match get_str(&doc, "hotkeys", "clip", "hotkeys.clip")? {
+        Some(chord) => chord,
+        None => {
+            if config_exists {
+                defaulted.push("hotkeys.clip");
+            }
+            DEFAULT_CLIP_HOTKEY.to_string()
+        }
+    };
     let watch = read_watch(&doc)?;
 
     Ok(EffectiveSettings {
@@ -1208,6 +1237,7 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         capture_monitor,
         capture_window,
         watch,
+        clip_hotkey,
         start_with_system,
         defaulted,
         config_exists,
@@ -1421,6 +1451,7 @@ pub(crate) fn write_settings_locked(
             SettingEdit::SaveSession(_) => ("recorder", "save_session", "recorder"),
             SettingEdit::AutoRecord(_) => ("games", "auto_record", "games"),
             SettingEdit::StartWithSystem(_) => ("app", "start_with_system", "app"),
+            SettingEdit::ClipHotkey(_) => ("hotkeys", "clip", "hotkeys"),
             // Handled above, before the table lookup: an array of tables has no single value.
             SettingEdit::WatchGames(_) => continue,
             SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
@@ -1458,6 +1489,13 @@ pub(crate) fn write_settings_locked(
             SettingEdit::SaveSession(save) => toml_edit::value(*save),
             SettingEdit::AutoRecord(auto) => toml_edit::value(*auto),
             SettingEdit::StartWithSystem(enabled) => toml_edit::value(*enabled),
+            // The parser's own spelling: `ctrl+f8` in the file is stored as `Ctrl+F8`, so what the
+            // panel shows and what the installer will register are the same string.
+            SettingEdit::ClipHotkey(chord) => toml_edit::value(
+                replayed_events::hotkey::Hotkey::parse(chord)
+                    .map(|hk| hk.to_string())
+                    .unwrap_or_else(|_| chord.trim().to_string()),
+            ),
             // Validated above, so the preset exists; the fallback is the balanced rate.
             SettingEdit::Quality(name) => {
                 toml_edit::value(preset_bitrate(name).unwrap_or(20_000) as i64)
@@ -2388,6 +2426,7 @@ mod tests {
              [recorder]\nsave_session = false\n\n\
              [games]\nauto_record = true\n\
              [[games.watch]]\nname = \"Dota 2\"\nexe = \"dota2.exe\"\n\
+             [hotkeys]\nclip = \"Ctrl+F8\"\n\
              [app]\nstart_with_system = false\n",
         )
         .unwrap();
@@ -2404,6 +2443,7 @@ mod tests {
         assert_eq!(settings.output_size, "1280x720");
         assert!(settings.mic_enabled);
         assert!(settings.auto_record);
+        assert_eq!(settings.clip_hotkey, DEFAULT_CLIP_HOTKEY);
         assert_eq!(
             settings.watch,
             vec![WatchedGame {
@@ -2415,6 +2455,30 @@ mod tests {
         );
         assert!(settings.defaulted.is_empty(), "the file sets everything");
         assert!(settings.config_exists);
+    }
+
+    #[test]
+    fn the_clip_hotkey_is_read_from_the_file_and_defaulted_when_it_is_not_there() {
+        let (_dir, path) = settings_file();
+        assert_eq!(
+            read_effective_settings(&path).unwrap().clip_hotkey,
+            "Ctrl+F8"
+        );
+
+        // A file that sets it, in any case, is read verbatim; the writer is what normalises.
+        write_settings(&path, &[SettingEdit::ClipHotkey("alt+f9".into())]).unwrap();
+        assert_eq!(
+            read_effective_settings(&path).unwrap().clip_hotkey,
+            "Alt+F9"
+        );
+
+        // A file with no [hotkeys] at all falls back to the documented default and says so.
+        let dir = tempfile::tempdir().unwrap();
+        let bare = dir.path().join("config.toml");
+        std::fs::write(&bare, "[storage]\nclips_dir = \"\"\n").unwrap();
+        let settings = read_effective_settings(&bare).unwrap();
+        assert_eq!(settings.clip_hotkey, DEFAULT_CLIP_HOTKEY);
+        assert!(settings.defaulted.contains(&"hotkeys.clip"));
     }
 
     #[test]

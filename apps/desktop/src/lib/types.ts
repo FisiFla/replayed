@@ -324,6 +324,11 @@ export interface SettingsDto {
   /** `[games] auto_record`. */
   auto_record: boolean;
   /**
+   * `[hotkeys] clip`: the chord the shell installs at the next start. The chord *in force now* is
+   * `AppStatus.hotkey.chord` — a saved change cannot take effect until the process restarts.
+   */
+  clip_hotkey: string;
+  /**
    * `[app] start_with_system`: what the file asks for. Whether Windows really has an entry is
    * the registry's answer, reported after an apply (`UpdateSettingsOutcome.autostart`).
    */
@@ -358,6 +363,8 @@ export interface SettingsUpdate {
   auto_record?: boolean;
   /** `[app] start_with_system`: the writer then reports what Windows did with it. */
   start_with_system?: boolean;
+  /** `[hotkeys] clip`: checked free (on Windows) before it is written, installed next start. */
+  clip_hotkey?: string;
   /** The whole `[[games.watch]]` list; absent leaves it alone. */
   watch_games?: WatchGame[];
   /** A preset name (`low`, `balanced`, `high`); sets `[encode] bitrate_kbps`. */
@@ -389,6 +396,11 @@ export interface UpdateSettingsOutcome {
    * is a report, not an error: the setting was saved and the next launch re-syncs the registry.
    */
   autostart: AutostartReport | null;
+  /**
+   * What a saved clip-hotkey change means: which chord stays in force until a restart, because
+   * the chord is registered once at startup and owned until the process exits.
+   */
+  hotkey: string | null;
 }
 /** What a clip trigger produced, as `clip_now` returns it. */
 export interface RecordedClip {

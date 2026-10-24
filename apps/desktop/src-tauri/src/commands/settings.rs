@@ -41,6 +41,9 @@ pub struct SettingsDto {
     pub save_session: bool,
     /// `[games] auto_record`.
     pub auto_record: bool,
+    /// `[hotkeys] clip`: the chord the shell will install at the next start. The chord *in force
+    /// now* is the app status's, not this one — a saved chord takes effect at the next start.
+    pub clip_hotkey: String,
     /// `[app] start_with_system`: the file's wish. Whether Windows really has an entry is the
     /// registry's answer, reported when the setting is applied — the panel shows this value, not
     /// a claim about the registry it has not read.
@@ -135,6 +138,9 @@ pub struct SettingsUpdate {
     pub auto_record: Option<bool>,
     /// `[app] start_with_system`; the writer reports what Windows did with it.
     pub start_with_system: Option<bool>,
+    /// `[hotkeys] clip`; checked free (on Windows) before it is written, and installed at the
+    /// next start.
+    pub clip_hotkey: Option<String>,
     /// The whole `[[games.watch]]` list; absent leaves it alone.
     pub watch_games: Option<Vec<WatchGameDto>>,
     /// A preset name; sets `[encode] bitrate_kbps`.
@@ -165,6 +171,11 @@ pub struct UpdateSettingsOutcome {
     /// A failure is reported here rather than as an error, because the setting *was* saved and
     /// a failed registry write must not make the panel claim nothing happened.
     pub autostart: Option<AutostartReport>,
+    /// What a saved clip-hotkey change means, when this update changed it.
+    ///
+    /// The chord is installed once, at startup, and owned until the process exits, so a saved
+    /// change cannot take effect now: this says which chord stays in force until a restart.
+    pub hotkey: Option<String>,
 }
 
 /// What applying `[app] start_with_system` did.
@@ -209,6 +220,7 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
         output_device: effective.output_device,
         save_session: effective.save_session,
         auto_record: effective.auto_record,
+        clip_hotkey: effective.clip_hotkey,
         start_with_system: effective.start_with_system,
         quality: crate::config::quality_for_bitrate(effective.bitrate_kbps).to_string(),
         bitrate_kbps: effective.bitrate_kbps,
@@ -267,6 +279,9 @@ pub fn update_settings_file(
     }
     if let Some(enabled) = update.start_with_system {
         edits.push(SettingEdit::StartWithSystem(enabled));
+    }
+    if let Some(chord) = &update.clip_hotkey {
+        edits.push(SettingEdit::ClipHotkey(chord.clone()));
     }
     if let Some(watch) = &update.watch_games {
         let mut games = Vec::with_capacity(watch.len());
@@ -345,6 +360,9 @@ pub fn update_settings_file(
         restart_reason,
         // The caller that can reach `reg.exe` fills this in (see `apply_autostart_update`).
         autostart: None,
+        // And the caller that knows which chord is really installed fills this in
+        // (see `hotkey_change_note`): the file's previous value is not the same thing.
+        hotkey: None,
     })
 }
 
@@ -372,6 +390,79 @@ pub fn apply_autostart_update(
             applied: false,
             detail: err,
         },
+    }
+}
+
+/// What a requested clip-hotkey change needs before anything is written.
+///
+/// The chord is registered once at startup and owned until the process exits, so a panel cannot
+/// make a new one take effect immediately; what it can do is refuse a chord something else owns,
+/// before writing a file that would fail to install at the next start.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HotkeyCheck {
+    /// The requested chord is the one already in force: nothing to probe, nothing to register.
+    AlreadyInForce,
+    /// This build has no global hotkey (not Windows): the value is saved and nothing is probed.
+    NotSupported,
+    /// The chord is free as of right now.
+    Free,
+    /// Something owns it, and this is the sentence saying so.
+    Taken(String),
+}
+
+/// Decide whether a requested chord may be written.
+///
+/// `in_force` is the chord the running process actually holds (not the file's value: a hand edit
+/// can make them differ). `probe` is the platform boundary — the real
+/// [`replayed_events::hotkey::probe`] in the window, a closure in tests — so the decision is
+/// testable on any host.
+///
+/// A chord this build cannot parse is `Free` on purpose: the writer's own validation refuses it
+/// with a message about the chord's shape, and two refusals for one typo is one too many.
+pub fn check_clip_hotkey(
+    requested: &str,
+    in_force: Option<&str>,
+    supported: bool,
+    probe: impl FnOnce(replayed_events::hotkey::Hotkey) -> Result<(), String>,
+) -> HotkeyCheck {
+    let Ok(chord) = replayed_events::hotkey::Hotkey::parse(requested) else {
+        return HotkeyCheck::Free;
+    };
+    let normalised = chord.to_string();
+    if in_force == Some(normalised.as_str()) {
+        return HotkeyCheck::AlreadyInForce;
+    }
+    if !supported {
+        return HotkeyCheck::NotSupported;
+    }
+    match probe(chord) {
+        Ok(()) => HotkeyCheck::Free,
+        Err(err) => HotkeyCheck::Taken(err),
+    }
+}
+
+/// The sentence a saved clip-hotkey change produces.
+///
+/// `in_force` is the chord the running process holds, `None` when nothing is installed (a
+/// registration failure at startup, or a build without a global hotkey). The chord is saved
+/// either way — the file is the switch, and the next start reads it — so every branch says what
+/// is saved *and* what will answer a keypress until then.
+pub fn hotkey_change_note(requested: &str, in_force: Option<&str>) -> String {
+    let requested = replayed_events::hotkey::Hotkey::parse(requested)
+        .map(|chord| chord.to_string())
+        .unwrap_or_else(|_| requested.trim().to_string());
+    match in_force {
+        Some(current) if current == requested => {
+            format!("the clip hotkey {requested} is already in force")
+        }
+        Some(current) => format!(
+            "the clip hotkey is saved as {requested}; {current} stays in force until replayed \
+             restarts"
+        ),
+        None => format!(
+            "the clip hotkey is saved as {requested}; it is registered at the next start, when \
+             replayed can hold it"
+        ),
     }
 }
 
@@ -457,6 +548,7 @@ mod tests {
                 "bitrate_kbps",
                 "capture_monitor",
                 "capture_window",
+                "clip_hotkey",
                 "clips_dir",
                 "clips_dir_resolved",
                 "config_exists",
@@ -486,6 +578,7 @@ mod tests {
                 applied: false,
                 detail: "this build is not Windows".to_string(),
             }),
+            hotkey: Some("the clip hotkey is saved as Ctrl+F9".to_string()),
         };
         let outcome_value = serde_json::to_value(&outcome).unwrap();
         let mut keys: Vec<&str> = outcome_value
@@ -500,6 +593,7 @@ mod tests {
             [
                 "applied",
                 "autostart",
+                "hotkey",
                 "restart_reason",
                 "restart_required",
                 "settings"
@@ -698,6 +792,111 @@ mod tests {
         assert!(std::fs::read_to_string(&path)
             .unwrap()
             .contains("start_with_system = true"));
+    }
+
+    #[test]
+    fn a_clip_hotkey_change_is_probed_before_it_is_saved() {
+        use replayed_events::hotkey::Hotkey;
+
+        // Free: the probe runs and says so.
+        let mut probed = None;
+        assert_eq!(
+            check_clip_hotkey("Ctrl+F9", Some("Ctrl+F8"), true, |chord| {
+                probed = Some(chord);
+                Ok(())
+            }),
+            HotkeyCheck::Free
+        );
+        assert_eq!(probed, Some(Hotkey::parse("Ctrl+F9").unwrap()));
+
+        // Taken: the registration error is carried through verbatim, so the caller can name the
+        // chord and the likely owner.
+        let taken = check_clip_hotkey("Ctrl+F9", None, true, |_| {
+            Err("Ctrl+F9 is already held by another application".to_string())
+        });
+        assert!(matches!(&taken, HotkeyCheck::Taken(msg) if msg.contains("another application")));
+
+        // Already in force: nothing is probed (it would fail against our own registration).
+        let mut probed = false;
+        assert_eq!(
+            check_clip_hotkey("ctrl+f8", Some("Ctrl+F8"), true, |_| {
+                probed = true;
+                Ok(())
+            }),
+            HotkeyCheck::AlreadyInForce
+        );
+        assert!(!probed, "the chord this process holds cannot be probed");
+
+        // Not Windows: saved, not probed.
+        assert_eq!(
+            check_clip_hotkey("Ctrl+F9", None, false, |_| panic!("must not probe")),
+            HotkeyCheck::NotSupported
+        );
+
+        // Unparseable: the writer refuses it with its own message; this check stays out of it.
+        assert_eq!(
+            check_clip_hotkey("Ctrl", None, true, |_| panic!("must not probe")),
+            HotkeyCheck::Free
+        );
+    }
+
+    #[test]
+    fn the_hotkey_change_note_says_what_is_saved_and_what_is_in_force() {
+        assert_eq!(
+            hotkey_change_note("ctrl+f9", Some("Ctrl+F8")),
+            "the clip hotkey is saved as Ctrl+F9; Ctrl+F8 stays in force until replayed restarts"
+        );
+        assert_eq!(
+            hotkey_change_note("Ctrl+F8", Some("Ctrl+F8")),
+            "the clip hotkey Ctrl+F8 is already in force"
+        );
+        assert!(
+            hotkey_change_note("Ctrl+F9", None).contains("registered at the next start"),
+            "nothing installed: the note says when it will be"
+        );
+    }
+
+    #[test]
+    fn a_clip_hotkey_is_written_as_the_spelling_the_installer_will_register() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[hotkeys]\nclip = \"Ctrl+F8\"\n").unwrap();
+
+        let outcome = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                clip_hotkey: Some("alt+f9".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied, vec!["hotkeys.clip"]);
+        assert_eq!(outcome.settings.clip_hotkey, "Alt+F9");
+        assert!(
+            outcome.hotkey.is_none(),
+            "the caller with the state fills it in"
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("clip = \"Alt+F9\""));
+
+        // A chord this build cannot install is refused and nothing is written.
+        let before = std::fs::read_to_string(&path).unwrap();
+        let err = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                clip_hotkey: Some("Ctrl".into()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("hotkeys.clip"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
     }
 
     #[test]

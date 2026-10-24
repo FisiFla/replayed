@@ -222,9 +222,22 @@ of the footage under the storage cap. The original is never modified.
 
 ### The hotkey
 
-`Ctrl+F8` is the default, set by `[hotkeys] clip` in `config.toml`. You cannot rebind it from
-the Settings panel — the file is the only place it is set. The recorder bar always shows the
-chord in force and whether it is really installed.
+`Ctrl+F8` is the default. Rebind it in **Settings → Clip hotkey**: type a chord (`Ctrl+F8`,
+`Alt+Shift+K`, `F9`), press *Apply hotkey*, and it is written to `[hotkeys] clip` in
+`config.toml`.
+
+Two things the panel is honest about:
+
+- **A saved chord takes effect when replayed restarts.** `RegisterHotKey` is system-wide and the
+  chord is registered once, at startup, and owned until the process exits; the panel says which
+  chord is in force now beside the one you typed.
+- **It checks the chord is free before writing it.** Another application — or another replayed,
+  because the CLI and the app cannot both hold one chord — may already own it, and that is
+  refused with a message rather than saved into a file that could not install it. The check is
+  "free right now": anything can take the chord afterwards, which is why the startup's own
+  registration failure is still reported.
+
+The recorder bar always shows the chord in force and whether it is really installed.
 
 Two more chords exist and are **off unless you set them** in the same file:
 

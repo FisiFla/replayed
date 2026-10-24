@@ -431,6 +431,7 @@ const SETTINGS_FIXTURE = {
     mic_enabled: false,
     save_session: false,
     auto_record: false,
+    clip_hotkey: 'Ctrl+F8',
     start_with_system: false,
     watch_games: [
       { name: 'League of Legends', exe: 'League of Legends.exe', signal: 'live_client_api' },
@@ -871,7 +872,7 @@ function installMockSource(fixture) {
       }
       const before = { ...settings };
       const applied = [];
-      for (const [field, key] of [['clips_dir', 'storage.clips_dir'], ['fps', 'encode.fps'], ['output_size', 'encode.output_size'], ['mic_enabled', 'mic.enabled'], ['save_session', 'recorder.save_session'], ['auto_record', 'games.auto_record'], ['start_with_system', 'app.start_with_system'], ['watch_games', 'games.watch']]) {
+      for (const [field, key] of [['clips_dir', 'storage.clips_dir'], ['fps', 'encode.fps'], ['output_size', 'encode.output_size'], ['mic_enabled', 'mic.enabled'], ['save_session', 'recorder.save_session'], ['auto_record', 'games.auto_record'], ['start_with_system', 'app.start_with_system'], ['clip_hotkey', 'hotkeys.clip'], ['watch_games', 'games.watch']]) {
         if (update[field] !== undefined) {
           settings[field] = update[field];
           applied.push(key);
@@ -915,6 +916,10 @@ function installMockSource(fixture) {
           : null,
         // The harness is not Windows either: the file is saved and the registry is untouched,
         // which is exactly the sentence the real backend produces off Windows.
+        hotkey:
+          update.clip_hotkey === undefined
+            ? null
+            : `the clip hotkey is saved as ${update.clip_hotkey}; Ctrl+F8 stays in force until replayed restarts`,
         autostart:
           update.start_with_system === undefined
             ? null

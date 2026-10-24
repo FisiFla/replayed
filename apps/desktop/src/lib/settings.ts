@@ -24,7 +24,9 @@ export function describeSettingsUpdate(outcome: UpdateSettingsOutcome): string {
   // The registry is a second truth: the setting can be saved while Windows was not changed, and
   // the notice is the only place that says so.
   const autostart = outcome.autostart === null ? '' : ` ${outcome.autostart.detail}`;
-  return `${saved}${restart}${autostart}`.trim();
+  // The hotkey is the other second truth: the file is saved, the process still holds the old chord.
+  const hotkey = outcome.hotkey === null ? '' : ` ${outcome.hotkey}`;
+  return `${saved}${restart}${autostart}${hotkey}`.trim();
 }
 
 /** The quality presets, mirroring the backend table (`QUALITY_PRESETS` in config.rs). */
@@ -166,4 +168,52 @@ export function automaticWarning(draft: { autoRecord: boolean; saveSession: bool
     ? 'Automatic recording is on but “Also save the full session” is off: games without ' +
         'highlights are recorded into clips only, and the match itself is not kept.'
     : null;
+}
+
+/**
+ * What is wrong with a chord the user typed, or `null` when the backend's parser would take it.
+ *
+ * A courtesy check, not the authority: `hotkeys.clip` is validated by
+ * `replayed_events::hotkey::Hotkey::parse` on the way in, and this mirrors its vocabulary so a
+ * typo is answered before a round trip. The shape is modifiers in any order (Ctrl, Alt, Shift),
+ * then exactly one key: `F1`–`F24` or a single letter or digit.
+ */
+export function chordProblem(chord: string): string | null {
+  const text = chord.trim();
+  if (text === '') return 'A chord cannot be empty.';
+  const parts = text.split('+').map((part) => part.trim().toLowerCase());
+  const key = parts.pop() ?? '';
+  for (const modifier of parts) {
+    if (!['ctrl', 'alt', 'shift'].includes(modifier)) {
+      return `"${modifier}" is not a modifier: use Ctrl, Alt or Shift.`;
+    }
+  }
+  if (key === '' || (parts.length === 0 && ['ctrl', 'alt', 'shift'].includes(key))) {
+    // A bare modifier (`Ctrl`, `Ctrl+`) is a chord with no key: it would register nothing.
+    return 'A chord needs a keypress too, like Ctrl+F8.';
+  }
+  if (/^f([1-9]|1[0-9]|2[0-4])$/.test(key)) return null;
+  if (/^[a-z0-9]$/.test(key)) return null;
+  return `"${key}" is not a key: use one letter or digit, or F1 to F24.`;
+}
+
+/**
+ * The clipped chord, in the spelling the backend stores: modifiers title-cased in the order the
+ * parser prints them, then the key upper-cased.
+ *
+ * The panel shows what it will write, and the writer normalises anyway; doing it here too keeps
+ * the field from looking unchanged after an apply that did change it.
+ */
+export function normaliseChord(chord: string): string {
+  const parts = chord
+    .trim()
+    .split('+')
+    .map((part) => part.trim())
+    .filter((part) => part !== '');
+  const key = parts.pop() ?? '';
+  const modifiers = new Set(parts.map((part) => part.toLowerCase()));
+  const ordered = ['ctrl', 'alt', 'shift']
+    .filter((modifier) => modifiers.has(modifier))
+    .map((modifier) => modifier.charAt(0).toUpperCase() + modifier.slice(1));
+  return [...ordered, key.toUpperCase()].join('+');
 }
