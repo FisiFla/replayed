@@ -3796,3 +3796,39 @@ for a verification run).
 - The webview panic above is a *session* limit, not an app defect, and it is what an SSH-only run
   of the window would always see. The scheduled-task path is the one the repo's own
   `verify-in-interactive-session.ps1` uses for the same reason.
+## 51. Closing the window hides it; the tray and the hotkey are really there (2026-10-24)
+
+Two of Phase C's "a human has to watch" items turned out to be checkable without a human, with one
+window message and the app's own log.
+
+**Hide-on-close.** The app was started in the logged-on session (current build at `caf347c`), then
+its main window was sent `WM_CLOSE` — `CloseMainWindow()`, a standard window message to our own
+process, not synthesised input. Six seconds later: **one process still running**, and the log says
+
+```
+INFO replayed_desktop: the window is hidden: recording continues, and replayed stays in the tray.
+Quit from the tray menu (there is no other way out).
+```
+
+That is the behaviour the plan asks about: closing does not quit, and the tray is where quitting
+lives. (What a screenshot still cannot show is whether the tray *icon is visible* in the
+notification area and what its menu items look like — that stays in the human-watches column, with
+the 2026-09-26 screenshot session as the last observation.)
+
+**The hotkey installs on real Windows,** in the same run:
+`INFO replayed_desktop: the clip hotkey Ctrl+F8 is installed` — and the autostart sync's third
+branch was observed too, after the §50 run restored the config:
+`start_with_system = false: the start-with-Windows entry already matches [app] start_with_system`.
+
+**Both runs left the box as they found it:** the app is stopped, the scheduled tasks are deleted,
+the scripts are removed, and the config is the one that was there before (a backup was taken and
+restored, and the `Run` value is absent).
+
+### What Phase C still has left
+A real game with an integration — LoL, CS2 or Dota 2 — is the one item that needs the owner at the
+machine: it needs a game started, which this session will not do, and a match played. Everything
+else in the sweep that a program can judge has now been judged on the box: the suite, the desktop
+crate, `xtask verify`, a real 4K screenshot, autostart, hide-on-close, the hotkey installation, and
+the startup line against a real library (§47–§51). 4K120 remains unmeasurable here: the display the
+capture targets runs at ~60 Hz, so the picker cannot offer 120 and the live path cannot be measured
+at 120 on this machine (the probe's own ceiling at 4K is ~155 fps, §49).
