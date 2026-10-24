@@ -3557,3 +3557,84 @@ here is the pipeline *around* the capture, not a real screen's pixels. No screen
 taken on the box, the hotkey chord has not been pressed, and the window has not rendered a real
 PNG card. The schema upgrade was tested by rewinding a fresh database, not against a copy of a
 released v0.2.0 library.
+## 47. The Windows box ran it: suite, a real 4K screenshot, and `xtask verify` (2026-10-24)
+
+The box was reachable over SSH, with no game or anti-cheat process running, a logged-in desktop
+session, an RTX 3090 and ffmpeg 9.0.2 on `PATH`. The commits from this session were carried over
+as a `git bundle` (nothing was pushed), cloned to `C:\Users\Flavio\replayed-plan`, and run there.
+The existing `C:\Users\Flavio\replayed-src` checkout — which has an uncommitted change to
+`wgc.rs` — was not touched.
+
+### The workspace suite: exit 0, after three real findings
+`cargo test --workspace --features replayed-encoder/test-encoders` on Windows **failed at first**
+in `replayed-encoder`, in three tests that no macOS host could fail:
+
+1. `a_child_that_exits_is_not_reported_as_killed` and
+2. `a_child_that_will_not_go_is_reported_as_killed` spawn `sh -c …`. There is no `sh` on that
+   machine's `PATH`, so both died with "program not found" **before reaching an assertion**, and
+   had done since they were written. The shell is now chosen per platform (`cmd /C` on Windows,
+   with `ping` as the sleep), and both tests run and pass there.
+3. `the_encoder_publishes_a_sequence_header_a_raw_demuxer_can_read` failed with "the encoder's
+   output type carries no MF_MT_MPEG_SEQUENCE_HEADER attribute". The lookup asked only
+   `GetOutputAvailableType`; the sequence header is a property of the type the encoder is
+   *producing*, and on this NVENC driver only `GetOutputCurrentType` carries it. Asked there
+   first now (the enumeration stays as a fallback), and the test passes on the box.
+
+That fix is **confirmed on real hardware**: `cargo test -p replayed-encoder --lib` on the box is
+73 passed, 0 failed, and a second full workspace run is **EXIT=0** — every target, every crate
+(capture 83, encoder 73, events 164, media 44, recorder 119, store 88, cli 13/30/4, xtask 43).
+
+### A real 4K frame became a real PNG
+`crates/capture/tests/wgc_frame.rs` (new this session) was run from the **interactive session**
+through a one-shot `schtasks` task (an SSH shell is session 0 and has no desktop), and it passed:
+
+```
+captured 3840x2160 (33177600 bytes)
+PNG 3840x2160 written: 8031042 bytes
+test one_real_frame_is_captured_and_written_as_a_png ... ok
+```
+
+So the screenshot feature's Windows half is proven: WGC delivered a 33 MB BGRA frame of the real
+desktop, the frame was not one flat colour, and the PNG writer produced an 8.03 MB 3840x2160 PNG
+that ffprobe reads as `png`. What is still unproven for step 10 is only the *desktop's* half of the
+UI: the button and the hotkey have not been pressed on the box.
+
+### `xtask verify`: 27/28 passed, **one criterion failed**, and it is not noise
+Run through `scripts/verify-in-interactive-session.ps1` (the script's own scheduling failed first —
+see below), twice, `--seconds 20`, 4K capture, hardware encoder:
+
+| run | verdict | the failure |
+|---|---|---|
+| 1 | 27 passed, 1 failed, 2 not performed | steady-state CPU **5.22%** of one core vs a **< 5%** target |
+| 2 | 28 passed, 1 failed, 1 not performed | steady-state CPU **5.49%** of one core |
+
+Everything else that could run passed: capture started, the encoder sustained the rate
+(`dropped=3`, all during encoder startup), audio arrived, the clip was written, the timeline was
+correct, the throughput probe measured 156.4 fps on the hardware path at 3840x2160. The two
+_not performed_ checks are the silence detector (it needs a non-48 kHz converted endpoint, a
+machine-setup condition) and, in run 1 only, the stream-copy speed check (the extraction took
+4.0 s against 8.0 s of media, which is inconclusive rather than wrong).
+
+**So Phase C's `cargo xtask verify` clean is not met.** The criterion is missed by 0.22 and 0.49
+percentage points on two runs, so it is reproducible on this machine as it is configured now —
+against **3.1–4.0%** recorded in §15. Nothing in this session's changes plausibly causes it (the
+sampled process is the recorder at steady state, and none of the new work runs during a
+recording). What differs from §15 and is the first thing to look at: the machine now has two
+**virtual display adapters** (SudoMaker, Sunshine) alongside the 3090, the desktop is
+3840x2160 at 150%, and the harness ran at `configured=30` fps. Naming a cause without measuring
+one would be a guess; the honest state is "the criterion is missed and the cause is unknown".
+
+### The verify script had a bug of its own
+`verify-in-interactive-session.ps1` could not register its task on that machine at all:
+`Register-ScheduledTask : No mapping between account names and security IDs was done (0x80070534)`.
+It named the principal `"$env:USERDOMAIN\$env:USERNAME"`, and an SSH session on a workgroup
+machine reports `USERDOMAIN=WORKGROUP`, which does not resolve. The principal is named by **SID**
+now (`WindowsIdentity::GetCurrent().User.Value`), which needs no domain lookup. The runs above
+used the same one-shot `schtasks` pattern by hand, which is why they happened at all.
+
+### Still not run on the box
+The desktop shell's own `cargo test` (it needs `apps/desktop/dist`, which was shipped over, and
+node is not on that machine's `PATH` — the shell's crate was not built there this round); a real
+game session with an integration (LoL/CS2/Dota 2); the tray, hide-on-close and autostart as
+observed behaviour; the 72-hour soak; and 4K120 (the verify run's probe sustained 156 fps at
+60 fps configured, but the 120 fps question is about the live path, not the probe).

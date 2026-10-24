@@ -129,7 +129,13 @@ $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $workerArg
 # `Interactive` is the whole point: the task runs in the current user's desktop session,
 # so the capture backend has the desktop the human is looking at. An elevated run level is
 # not needed (and would be a second thing to get wrong), so it is explicitly `Limited`.
-$principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+#
+# The principal is named by **SID**, not by `DOMAIN\user`. An SSH session on a workgroup
+# machine reports `USERDOMAIN=WORKGROUP`, and `WORKGROUP\flavio` does not resolve: registering
+# the task then fails with "No mapping between account names and security IDs was done"
+# (0x80070534) before anything runs. The SID is what the account *is*; the scheduling service
+# resolves it without a domain lookup. Found by running this script on the box.
+$principal = New-ScheduledTaskPrincipal -UserId ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value -LogonType Interactive -RunLevel Limited
 $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -ExecutionTimeLimit (New-TimeSpan -Seconds ($WaitSeconds + 900))
 
