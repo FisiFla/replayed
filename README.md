@@ -99,6 +99,19 @@ test` proves none of the eight acceptance criteria.
 
 ---
 
+## What replayed will not do
+
+Outplayed has features this project will not copy, and saying so is part of the design: a
+promise to add them later would be a promise to break one of the principles above.
+
+| Not planned | Why |
+|---|---|
+| **Automatic highlights for the eight provider-only games** (Valorant, Rainbow Six Siege, Overwatch 2, Fortnite, Apex Legends and the rest of the list Outplayed covers through its own game provider) | Those titles publish no local event API. The only way Outplayed gets their kills and rounds is a third-party game-events provider, which is Overwolf-adjacent and closed. **Full sessions still work for every one of them**: the watcher starts the recording when the game starts, the whole match is saved when it stops, and clips are taken on the hotkey with timeline markers. That is the honest parity tier, not a stand-in for highlights. |
+| **Cloud upload, sharing, accounts, a profile** | Principle 1: zero cloud, zero logins. A clip leaves the machine when the user copies it somewhere and not before. |
+| **An effects editor** — transitions, filters, keyframes, speed ramps | Principle 5: trims are lossless stream copies and an export that re-encodes is not one. An effects editor is, by definition, a re-encoder. |
+| **A webcam overlay** | It would mean compositing a second capture source into every frame: a second capture path, a second encoder input, and a CPU or GPU composite the zero-copy path exists to avoid. |
+| **A software-encoder fallback in a release build** | `libx264` exists in this tree only behind the `test-encoders` feature, for CI and for a host with no GPU encoder. A release falls back to the configured rate with a named reason rather than to a CPU encoder that would cost the frame rate it is meant to protect. |
+
 ## Privacy
 
 What this app records, and where it goes. Nothing in it phones home.

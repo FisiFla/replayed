@@ -96,11 +96,11 @@
 #
 #   gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
 #
-# `dtolnay/rust-toolchain` is the awkward one: `stable` is a *branch*, not a version, and
-# the action installs whatever `stable` is on the day the job runs. Pinning the branch's
-# head pins the action's own code; the Rust version it installs stays whatever the
-# channel says. Pin `toolchain: 1.<x>.<y>` in the `with:` block instead if the exact
-# compiler ever has to be frozen.
+# `dtolnay/rust-toolchain` is the awkward one: the branch's head pins the action's own
+# code, but the Rust version it installs would be whatever `stable` is on the day the job
+# runs. Every setup below therefore names `toolchain: 1.99.1` in its `with:` block: a
+# failure is then reproducible against the compiler that produced it, and a release is
+# built by a known one. Bump it together with `Cargo.lock`.
 
 name: CI
 
@@ -136,6 +136,9 @@ jobs:
       - name: Set up the Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
         with:
+          # The exact compiler, not the `stable` branch's head: a release is reproducible only if
+          # the version that compiled it is named. Bump this and `Cargo.lock` together.
+          toolchain: 1.99.1
           # Add the cross-check target's std here; no MSVC linker is needed because
           # `cargo check` and `cargo clippy` both stop before linking.
           targets: x86_64-pc-windows-msvc
@@ -342,6 +345,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
+        with:
+          # The exact compiler, not the `stable` branch's head (see the note above).
+          toolchain: 1.99.1
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
@@ -449,6 +455,10 @@ jobs:
 
       - name: Set up the Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
+        with:
+          # The exact compiler, not the `stable` branch's head: a release is
+          # reproducible only if the version that compiled it is named.
+          toolchain: 1.99.1
 
       - name: Cache the Rust builds
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
@@ -582,6 +592,10 @@ jobs:
 
       - name: Set up the Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
+        with:
+          # The exact compiler, not the `stable` branch's head: a release is
+          # reproducible only if the version that compiled it is named.
+          toolchain: 1.99.1
 
       - name: Cache the Rust builds
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3

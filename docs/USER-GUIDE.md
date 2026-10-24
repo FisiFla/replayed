@@ -117,6 +117,19 @@ The setting is `game_audio`, and `"app"` is the default.
 
 ### What it does not do
 
+- **It does not clip the games that have no integration.** Valorant, Rainbow Six Siege,
+  Overwatch 2, Fortnite and Apex Legends have no local event API, and this app will not use a
+  third-party game-events provider to invent one. What they get instead is the honest tier:
+  the whole session recorded automatically and clips on the hotkey, with a marker for each one.
+  The three games that do clip themselves are listed under
+  [The games that are supported](#the-games-that-are-supported).
+- It does not upload, share or sync anything: no account, no cloud, no public profile. A clip
+  leaves the machine when you copy it somewhere.
+- It has no effects editor — no transitions, filters, speed ramps or keyframes. A trim is a
+  lossless cut, and an export that re-encodes is not one.
+- It does not add a webcam overlay.
+- It does not fall back to a software encoder in a release build: if the hardware encoder
+  cannot keep up, the app says so rather than silently switching to a slower path.
 - It does not record other applications' audio (by default — see above).
 - It does not send anything anywhere. The only network traffic is to your own machine: a
   read-only poll of `127.0.0.1:2999` for League, and a listener bound to `127.0.0.1` for Valve's

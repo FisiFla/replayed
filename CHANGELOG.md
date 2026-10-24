@@ -9,6 +9,17 @@ what has and has not been *verified* on real hardware, read
 ## [Unreleased]
 
 ### Added
+- **The watch list is editable in the window** (*Settings → Automatic recording → Watched
+  games*): add a game by executable name (a pasted path is reduced to its file name), give it a
+  displayed name, choose process-name or Live Client Data API detection, and remove one with ×.
+  The list is written to `[[games.watch]]` through `toml_edit`, so every other key and comment
+  in `config.toml` survives; an emptied list is refused because the engine reads no list as the
+  six default titles. Each entry is validated by the engine's own rule (a blank executable, or
+  the same executable twice, is refused) plus one the panel adds: an executable that does not
+  end in `.exe` can never match a running game.
+- **A session says which kind of recording it is**: "Valorant — full session" beside the replay
+  buffer's "Valorant". The game name was already on the row; the mode is what a user could not
+  see.
 - **The display's refresh rate, and the framerate the user picks** (`capture_displays`): the
   encoder panel now says which display is being recorded and the rate that display runs at
   ("Recording display 0 — 3840×2160 at 120 Hz"), and offers that rate in the framerate list
@@ -23,6 +34,16 @@ what has and has not been *verified* on real hardware, read
   it is how a measurement came to capture the wrong display and report a frame rate for it.
 
 ### Changed
+- **Automatic recording is one section, and it says what each tier does.** The two switches
+  (`[games] auto_record` and `[recorder] save_session`) were three groups apart with nothing
+  connecting them, so turning on "record watched games automatically" and getting only hotkey
+  clips was an easy mistake. The panel now holds both, states that League of Legends, CS2 and
+  Dota 2 clip themselves while every other watched game is kept as a full session plus hotkey
+  clips, and warns when automatic recording is on with session saving off.
+- **The storage policy plans retention over files that are on disk, not rows that claim to be.**
+  A row whose file was deleted in Explorer still counted its recorded bytes, so a full-looking
+  library could evict a live clip to pay for empty space. Plan order is oldest-first, so the
+  live clip evicted was the *older* one and the phantom stayed.
 - **The capture backend waits for a frame instead of knocking for one**: the frame pool's
   `FrameArrived` event is registered, and the consumer waits on a condition variable the
   handler raises. The backend had been spending **79% of the recording's wall clock** asleep
@@ -42,6 +63,20 @@ what has and has not been *verified* on real hardware, read
   share of every second unattributed.
 
 ### Fixed
+- **A clip or session deleted outside the app left a phantom, and the storage panel offered no
+  way to remove it.** The library and the storage figures already hid such a row, but it stayed
+  in the index for ever: the sessions list had no existence filter at all, retention planned
+  over it, and nothing pruned it. Now the sessions list hides it, retention ignores it, the
+  storage panel counts both libraries' phantoms and offers a two-step *Remove from the library*
+  that deletes the rows (with their tags and events) and nothing on disk. It refuses when the
+  clips directory cannot be read, and leaves a row alone when the directory its file lived in is
+  unreachable — an offline share looks exactly like a library whose files were all deleted.
+  A session that is still recording is never touched.
+- **The throughput probe feeds a texture per frame, and reports what the encoder said.** It
+  re-submitted one zero-filled texture and told the encoder a one-frame-per-second timeline
+  (a whole second between frames while the sample duration said `1/fps`), two differences from
+  the recording that #79 is about; and on failure it now reports whether the transform is
+  accepting input, whether a sample is ready, and how many times it renegotiated.
 - **The warning that blamed you for the encoder's rate** ("the encoder cannot sustain the
   {}fps it was told: only {:.1} frames per second **are reaching it**") reported the rate the
   encoder *did* sustain as evidence it could not sustain it, and advised lowering

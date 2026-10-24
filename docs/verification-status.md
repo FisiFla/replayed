@@ -3310,3 +3310,31 @@ run can say: `cargo test -p replayed-encoder --test ...` for
 `the_hardware_encoders_rate_is_measured_the_same_way_on_every_run` (which measures 4K three times
 and asserts the spread) has still never run on the box, and the probe has not been re-run there.
 The measurement step of the plan's Phase C remains open, as do the 4K120 question and the soak.
+## 41. Release hygiene, and the non-goals stated (2026-10-24)
+
+Small items from the plan's Phase D that need no Windows and no release:
+
+- **The stray `created2.json` is gone.** A 28-byte `[65,66,67,68,69,70,71]` left in the
+  repository root by an experiment; it was never referenced. It was untracked and git-ignored,
+  which is why it survived — nothing here can say which experiment made it.
+- **CI names its compiler.** Every `dtolnay/rust-toolchain` setup in `ci.yml` and
+  `release.yml` now passes `toolchain: 1.99.1`, so a failure is reproducible against the
+  compiler that produced it and a release tag is built by a named one. The action's SHA pin
+  never covered this: it pins the action's code, not the Rust version the action installs. A
+  repository-level `rust-toolchain.toml` was deliberately **not** added: it would force every
+  contributor's rustup to download that exact toolchain, which is the maintainer's call rather
+  than a side effect of this change. The plan's step 9 can be read as closed for the CI half
+  and open for that one.
+- **The non-goals are written down** in `README.md` ("What replayed will not do") and in
+  `docs/USER-GUIDE.md` ("What it does not do"): highlights for the eight provider-only games
+  (full sessions do work), upload/accounts, an effects editor, a webcam overlay, and a
+  software-encoder fallback in a release build. Each with the reason, so the list reads as a
+  decision rather than an absence.
+- **`CHANGELOG.md`** carries the three changes above (the stale index and its reconciliation,
+  the automatic-recording section and the watch list, the probe).
+
+### What is NOT verified
+Nothing in this section needed a run, which is the point of doing it here. The rest of Phase D
+is open: publishing `v0.2.0`, installing it, publishing `v0.2.1` and proving the signed-minisign
+self-update end to end are actions on the release page and on a real machine, and they were not
+taken.

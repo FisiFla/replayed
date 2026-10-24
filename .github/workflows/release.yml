@@ -66,10 +66,9 @@
 #
 #   gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
 #
-# `dtolnay/rust-toolchain` is the awkward one, as in CI: `stable` is a *branch*, not a
-# version, and the action installs whatever `stable` is on the day the job runs. Pinning the
-# branch's head pins the action's own code; the Rust version it installs stays whatever the
-# channel says.
+# `dtolnay/rust-toolchain` is the awkward one, as in CI: the branch's head pins the action's
+# own code, not the compiler. The setup below names `toolchain: 1.99.1` in its `with:` block,
+# so a release tag is built by the compiler named here — the same one CI tests against.
 #
 # The release itself is published with the GitHub CLI, which is preinstalled on the hosted
 # runner. That is deliberate: a third-party release action would be one more dependency to
@@ -161,6 +160,10 @@ jobs:
 
       - name: Set up the Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
+        with:
+          # The exact compiler, not the `stable` branch's head: a release is reproducible only if
+          # the version that compiled it is named. Bump this and `Cargo.lock` together.
+          toolchain: 1.99.1
 
       - name: Cache the Rust builds
         uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
