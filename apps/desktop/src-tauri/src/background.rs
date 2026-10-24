@@ -1168,11 +1168,29 @@ mod tests {
         }
     }
 
+    /// Whether this process can judge a real `RegisterHotKey` at all.
+    ///
+    /// It needs an interactive desktop. A hosted CI runner has one; an SSH shell on Windows has
+    /// session 0's window station, where the registration fails and the failure says nothing
+    /// about the code. `SESSIONNAME` is the cheap tell: a session with a desktop sets it
+    /// (`Console`, `RDP-Tcp#7`), and an SSH or service session leaves it unset. Measured on the
+    /// box: over SSH it is empty and the test failed; run through a scheduled task in the
+    /// logged-on session it is set and the test passed.
+    fn can_judge_a_hotkey(functional: bool) -> bool {
+        !functional || std::env::var("SESSIONNAME").is_ok_and(|name| !name.trim().is_empty())
+    }
+
     #[test]
     fn the_hotkey_status_is_honest_about_what_this_build_can_do() {
         // On the development host there is no global hotkey to install, and the status says so, with
         // the chord it would have used and something to do instead. It is the only shape this suite
         // can produce: registering a real chord needs Windows.
+        if !can_judge_a_hotkey(hotkey::supported()) {
+            eprintln!(
+                "skipping: this process is in a session with no interactive desktop (SESSIONNAME                  is unset, so it is an SSH or service session), and RegisterHotKey fails there for                  a reason that says nothing about the code. Run it from a logged-on desktop                  session to judge it."
+            );
+            return;
+        }
         let (hotkey, presses) = install_hotkey("ctrl+f8", &[]);
 
         assert_eq!(
