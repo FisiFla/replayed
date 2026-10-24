@@ -270,6 +270,23 @@ export interface AudioDevices {
   outputs: AudioDevice[];
 }
 
+/**
+ * One `[[games.watch]]` entry: a title the watcher looks for.
+ *
+ * `exe` is the identity — the watcher compares executable file names, case-insensitively, and
+ * nothing else — so two entries with the same executable are one game and the backend refuses the
+ * list. `signal` says how the title is detected: by process name, or through the Live Client Data
+ * API that only Riot titles publish.
+ */
+export interface WatchGame {
+  /** Human name shown in the panel and the tray: "Rainbow Six Siege". */
+  name: string;
+  /** Executable file name compared against the process list: `RainbowSix.exe`. */
+  exe: string;
+  /** `"process"` or `"live_client_api"`. */
+  signal: string;
+}
+
 /** The settings the window shows, as `get_settings` returns them. */
 export interface SettingsDto {
   /** `[storage] clips_dir`, verbatim — empty means the default. */
@@ -298,8 +315,8 @@ export interface SettingsDto {
   capture_monitor: number;
   /** `[capture] window` — a window title to record instead of a monitor; empty is the monitor. */
   capture_window: string;
-  /** Display names from `[[games.watch]]`, or the default titles. */
-  watch_titles: string[];
+  /** `[[games.watch]]`: the titles watched, or the default list when the file names none. */
+  watch_games: WatchGame[];
   /** Keys that fell back to the example because the file does not set them. */
   defaulted: string[];
   /** False when no file exists and every value is the example's. */
@@ -318,6 +335,8 @@ export interface SettingsUpdate {
   output_device?: string;
   save_session?: boolean;
   auto_record?: boolean;
+  /** The whole `[[games.watch]]` list; absent leaves it alone. */
+  watch_games?: WatchGame[];
   /** A preset name (`low`, `balanced`, `high`); sets `[encode] bitrate_kbps`. */
   quality?: string;
   capture_monitor?: number;

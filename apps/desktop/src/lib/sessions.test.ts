@@ -39,13 +39,27 @@ function dto(overrides: Partial<SessionDto> = {}): SessionDto {
 
 describe('naming a session', () => {
   it('uses the detected game', () => {
-    expect(sessionTitle({ game: 'Dota 2' })).toBe('Dota 2');
+    expect(sessionTitle({ game: 'Dota 2', mode: 'buffer' })).toBe('Dota 2');
+  });
+
+  it('says when the session is the whole match', () => {
+    // The parity tier's payoff: an auto-recorded match reads as a match, not as the game name
+    // it shares with the buffer run that produced the clips.
+    expect(sessionTitle({ game: 'Valorant', mode: 'session' })).toBe('Valorant — full session');
+    expect(sessionTitle({ game: null, mode: 'session' })).toBe(
+      `${UNNAMED_SESSION} — full session`,
+    );
+  });
+
+  it('does not guess at a mode this build does not know', () => {
+    // A row written by a newer build: shown as the game alone rather than mislabelled.
+    expect(sessionTitle({ game: 'Dota 2', mode: 'something_new' })).toBe('Dota 2');
   });
 
   it('names a session nobody detected rather than leaving it blank', () => {
-    expect(sessionTitle({ game: null })).toBe(UNNAMED_SESSION);
+    expect(sessionTitle({ game: null, mode: 'buffer' })).toBe(UNNAMED_SESSION);
     // A game string of spaces is not a name: a row must never render as an empty row.
-    expect(sessionTitle({ game: '   ' })).toBe(UNNAMED_SESSION);
+    expect(sessionTitle({ game: '   ', mode: 'buffer' })).toBe(UNNAMED_SESSION);
   });
 });
 

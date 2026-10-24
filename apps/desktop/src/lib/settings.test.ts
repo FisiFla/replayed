@@ -6,7 +6,17 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { captureUpdate, describeSettingsUpdate, deviceOptions, monitorIndex } from './settings';
+import {
+  automaticUpdate,
+  automaticWarning,
+  captureUpdate,
+  defaultWatchName,
+  describeSettingsUpdate,
+  deviceOptions,
+  monitorIndex,
+  sameWatchList,
+  watchListProblem,
+} from './settings';
 import type { SettingsDto, UpdateSettingsOutcome } from './types';
 
 function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
@@ -24,7 +34,7 @@ function settings(overrides: Partial<SettingsDto> = {}): SettingsDto {
     mic_device: '',
     output_device: '',
     save_session: false,
-    watch_titles: ['League of Legends'],
+    watch_games: [{ name: 'League of Legends', exe: 'League of Legends.exe', signal: 'live_client_api' }],
     defaulted: [],
     config_exists: true,
     config_path: 'C:\\Users\\player\\replayed\\config.toml',
@@ -118,5 +128,89 @@ describe('the capture drafts', () => {
     expect(monitorIndex('-1')).toBeNull();
     expect(monitorIndex('1.5')).toBeNull();
     expect(monitorIndex('')).toBeNull();
+  });
+});
+
+/** A watch entry, with the panel's own defaults. */
+function watch(name: string, exe: string, signal = 'process') {
+  return { name, exe, signal };
+}
+
+describe('the watch list', () => {
+  it('names a new entry from the executable when the user gives no name', () => {
+    expect(defaultWatchName('RainbowSix.exe')).toBe('RainbowSix');
+    expect(defaultWatchName('  C:\\Games\\VALORANT-Win64-Shipping.exe ')).toBe(
+      'VALORANT-Win64-Shipping',
+    );
+    // A file name with no extension is its own name; nothing is invented.
+    expect(defaultWatchName('something')).toBe('something');
+  });
+
+  it('accepts a list the recorder would accept', () => {
+    expect(watchListProblem([watch('R6', 'RainbowSix.exe'), watch('Valorant', 'x.exe')])).toBeNull();
+  });
+
+  it('refuses an empty list, because empty means the defaults come back', () => {
+    const problem = watchListProblem([]);
+    expect(problem).toContain('cannot be empty');
+    expect(problem).toContain('default');
+  });
+
+  it('refuses an entry whose executable cannot match a running game', () => {
+    expect(watchListProblem([watch('R6', '   ')])).toContain('no executable name');
+    expect(watchListProblem([watch('R6', 'RainbowSix')])).toContain('does not end in .exe');
+  });
+
+  it('refuses the same executable twice, case-insensitively', () => {
+    const problem = watchListProblem([watch('Dota 2', 'dota2.exe'), watch('Dota 2 again', 'DOTA2.EXE')]);
+    expect(problem).toContain('watched twice');
+  });
+
+  it('compares two lists entry for entry, in order', () => {
+    const a = [watch('R6', 'RainbowSix.exe')];
+    expect(sameWatchList(a, [watch('R6', 'RainbowSix.exe')])).toBe(true);
+    expect(sameWatchList(a, [watch('R6', 'RainbowSix.exe', 'live_client_api')])).toBe(false);
+    expect(sameWatchList(a, [watch('R6', 'RainbowSix.exe'), watch('X', 'x.exe')])).toBe(false);
+  });
+});
+
+describe('applying the automatic-recording section', () => {
+  const draft = {
+    autoRecord: false,
+    saveSession: false,
+    watch: [watch('League of Legends', 'League of Legends.exe', 'live_client_api')],
+  };
+
+  it('sends nothing when nothing changed', () => {
+    expect(automaticUpdate(settings(), draft)).toEqual({});
+  });
+
+  it('sends only the toggle that changed, not the whole section', () => {
+    expect(automaticUpdate(settings(), { ...draft, autoRecord: true })).toEqual({
+      auto_record: true,
+    });
+    expect(automaticUpdate(settings(), { ...draft, saveSession: true })).toEqual({
+      save_session: true,
+    });
+  });
+
+  it('sends the whole list when an entry changed, because the backend replaces it', () => {
+    const next = [...draft.watch, watch('R6', 'RainbowSix.exe')];
+    expect(automaticUpdate(settings(), { ...draft, watch: next })).toEqual({
+      watch_games: next,
+    });
+  });
+});
+
+describe('the automatic-recording warning', () => {
+  it('says what is lost when auto-record is on and nothing is saved', () => {
+    const warning = automaticWarning({ autoRecord: true, saveSession: false });
+    expect(warning).toContain('clips only');
+    expect(warning).toContain('match itself is not kept');
+  });
+
+  it('is silent when both are on, or when automatic recording is off', () => {
+    expect(automaticWarning({ autoRecord: true, saveSession: true })).toBeNull();
+    expect(automaticWarning({ autoRecord: false, saveSession: false })).toBeNull();
   });
 });

@@ -6,7 +6,14 @@
  * (`restart_reason` names the keys); this only decides the saved-vs-nothing part.
  */
 
-import type { AudioDevice, SettingsDto, SettingsUpdate, UpdateSettingsOutcome } from './types';
+import { basename } from './clips';
+import type {
+  AudioDevice,
+  SettingsDto,
+  SettingsUpdate,
+  UpdateSettingsOutcome,
+  WatchGame,
+} from './types';
 
 export function describeSettingsUpdate(outcome: UpdateSettingsOutcome): string {
   const saved =
@@ -72,4 +79,87 @@ export function deviceOptions(
     options.push({ value: selected, label: 'Saved device (not connected)' });
   }
   return options;
+}
+
+/**
+ * The name a new watch entry gets when the user gives none: the executable without its `.exe`.
+ *
+ * `RainbowSix.exe` becomes "RainbowSix" — a label, not a claim about the game. The panel offers an
+ * editable name field beside it, because the label is what the user reads in the tray.
+ */
+export function defaultWatchName(exe: string): string {
+  const file = basename(exe.trim());
+  return file.replace(/\.exe$/i, '');
+}
+
+/**
+ * What is wrong with a watch list, or `null` when the recorder would accept it.
+ *
+ * These are the engine's own rules (`validate_watch_list`) plus the one a panel can add without
+ * lying: an entry whose executable does not end in `.exe` can never match a process image, so
+ * accepting it would watch nothing while looking like it watched something. An empty list is
+ * refused here rather than written, because the backend expresses "no entries" by removing the
+ * key — which means the default titles — and a Remove button that silently brought six games back
+ * would be a bug the user cannot see.
+ */
+export function watchListProblem(games: WatchGame[]): string | null {
+  if (games.length === 0) {
+    return 'The list cannot be empty: with no entries the default titles are watched.';
+  }
+  const seen: string[] = [];
+  for (const game of games) {
+    const exe = basename(game.exe.trim());
+    if (exe === '') return `${game.name.trim() || 'An entry'} has no executable name to watch for.`;
+    if (!/\.exe$/i.test(exe)) {
+      return `${exe} does not end in .exe, so no running game can match it.`;
+    }
+    const key = exe.toLowerCase();
+    if (seen.includes(key)) return `${exe} is watched twice.`;
+    seen.push(key);
+  }
+  return null;
+}
+
+/** Whether two lists are the same entries in the same order, as the panel would write them. */
+export function sameWatchList(a: WatchGame[], b: WatchGame[]): boolean {
+  return (
+    a.length === b.length &&
+    a.every(
+      (game, i) =>
+        game.name === b[i]!.name && game.exe === b[i]!.exe && game.signal === b[i]!.signal,
+    )
+  );
+}
+
+/**
+ * The "Automatic recording" update: only what differs from what is saved.
+ *
+ * The two toggles and the watch list are one feature — auto-record watches this list — so they are
+ * applied together and the section says so. Sending only the differences keeps a re-apply from
+ * rewriting keys the user did not touch and from reporting them as saved.
+ */
+export function automaticUpdate(
+  saved: SettingsDto,
+  draft: { autoRecord: boolean; saveSession: boolean; watch: WatchGame[] },
+): SettingsUpdate {
+  const update: SettingsUpdate = {};
+  if (draft.autoRecord !== saved.auto_record) update.auto_record = draft.autoRecord;
+  if (draft.saveSession !== saved.save_session) update.save_session = draft.saveSession;
+  if (!sameWatchList(draft.watch, saved.watch_games)) update.watch_games = draft.watch;
+  return update;
+}
+
+/**
+ * The sentence that matters when automatic recording is on but nothing is being kept.
+ *
+ * Auto-record on its own only starts the replay buffer: a game with no highlights integration is
+ * then recorded into hotkey clips, and the match itself is never saved. The plan's parity tier is
+ * "full session + clips", so the panel says which half is off instead of leaving it to be found
+ * out after a match.
+ */
+export function automaticWarning(draft: { autoRecord: boolean; saveSession: boolean }): string | null {
+  return draft.autoRecord && !draft.saveSession
+    ? 'Automatic recording is on but “Also save the full session” is off: games without ' +
+        'highlights are recorded into clips only, and the match itself is not kept.'
+    : null;
 }

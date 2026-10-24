@@ -1,8 +1,8 @@
 # Production readiness and Outplayed parity plan
 
-Status: in progress. Written 2026-10-24 against `main` at `a8acaf9`. **Phase A is
-implemented** (ledger §38 records what its tests prove and what they do not); Phases B–F are
-open. What has and has not been verified is recorded in
+Status: in progress. Written 2026-10-24 against `main` at `a8acaf9`. **Phases A and B are
+implemented** (ledger §38 and §39 record what their tests prove and what they do not); Phases
+C–F are open. What has and has not been verified is recorded in
 [`docs/verification-status.md`](../verification-status.md); this plan does not upgrade any claim
 there.
 
@@ -43,7 +43,7 @@ Order: correctness → parity you asked for → Windows proof → unsigned relea
 2. Retention/cleanup plan over live files only; `Store` prune API + `prune_missing` command; Storage page "N entries point at missing files — Remove from library" (confirm; refuse when `clips_dir` unreachable).
 3. Same existence filter for sessions; startup log reports live vs missing. Verify Clips-tab locked-file case; fix only if reproduced.
 
-### Phase B — Auto full-session as a first-class feature
+### Phase B — Auto full-session as a first-class feature (implemented; ledger §39)
 
 4. Settings: one *Automatic recording* section explaining the two tiers in plain words ("Games with highlights: CS2, Dota 2, League. Every other watched game: full session automatically, clips by hotkey"), with `auto_record` + `save_session` together and a warning if auto-record is on but session saving is off.
 5. Watch-list editor in the panel (add/remove `[[games.watch]]` entries by exe name, writing `config.toml`); optional per-game `save_session` override only if the global toggle proves too coarse.

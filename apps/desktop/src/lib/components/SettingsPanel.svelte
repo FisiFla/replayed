@@ -16,8 +16,18 @@
     RecordingStatus,
     SettingsDto,
     SettingsUpdate,
+    WatchGame,
   } from '../types';
-  import { QUALITY_OPTIONS, captureUpdate, deviceOptions, monitorIndex } from '../settings';
+  import {
+    QUALITY_OPTIONS,
+    automaticUpdate,
+    automaticWarning,
+    captureUpdate,
+    defaultWatchName,
+    deviceOptions,
+    monitorIndex,
+    watchListProblem,
+  } from '../settings';
   import EncoderPanel from './EncoderPanel.svelte';
   import UpdaterPanel from './UpdaterPanel.svelte';
 
@@ -77,6 +87,12 @@
   let windowTitle = $state('');
   let micDevice = $state('');
   let outputDevice = $state('');
+  /** The watch list draft: the entries the panel would write. */
+  let watchGames = $state<WatchGame[]>([]);
+  /** The add-an-entry fields; cleared after each add. */
+  let newExe = $state('');
+  let newName = $state('');
+  let newSignal = $state('process');
 
   $effect(() => {
     if (settings === null) return;
@@ -91,6 +107,7 @@
     windowTitle = settings.capture_window;
     micDevice = settings.mic_device;
     outputDevice = settings.output_device;
+    watchGames = settings.watch_games.map((game) => ({ ...game }));
   });
 
   const micOptions = $derived(deviceOptions(audioDevices.inputs, micDevice));
@@ -100,6 +117,10 @@
   const fpsValid = $derived(fps !== null && fps >= 1 && fps <= 240);
   const monitor = $derived(monitorIndex(monitorText));
   const recordingNow = $derived(recording !== null && recording.running);
+  /** The watch list's own validity, stated as the sentence to fix (or `null`). */
+  const watchProblem = $derived(watchListProblem(watchGames));
+  /** Automatic recording on, nothing kept: the parity-tier half the user would otherwise miss. */
+  const automaticNote = $derived(automaticWarning({ autoRecord, saveSession }));
   const isDefault = $derived(
     (key: string) => settings?.defaulted.includes(key) ?? false,
   );
@@ -135,7 +156,6 @@
       fps,
       output_size: outputSize,
       mic_enabled: micEnabled,
-      save_session: saveSession,
       ...captureUpdate(settings, {
         quality,
         monitor,
@@ -146,8 +166,44 @@
     });
   }
 
+  /**
+   * Apply the automatic-recording section: the two toggles and the watch list, as one feature.
+   *
+   * Only the differences go to the backend (`automaticUpdate`), so re-applying an untouched
+   * section writes nothing and reports nothing as saved.
+   */
   function applyAutomatic() {
-    onApply({ auto_record: autoRecord });
+    if (settings === null || watchProblem !== null) return;
+    onApply(automaticUpdate(settings, { autoRecord, saveSession, watch: watchGames }));
+  }
+
+  /**
+   * Add the typed game to the draft list.
+   *
+   * The executable is the identity, so it is reduced to its file name (a pasted full path is
+   * accepted) and the name falls back to the executable's stem when the field is empty. The
+   * signal defaults to the process list; only a Riot title that publishes the Live Client Data
+   * API is detectable the other way.
+   */
+  function addWatchGame() {
+    const exeText = newExe.trim();
+    if (exeText === '') return;
+    const file = exeText.split(/[\\/]/).pop() ?? exeText;
+    watchGames = [
+      ...watchGames,
+      {
+        name: newName.trim() === '' ? defaultWatchName(file) : newName.trim(),
+        exe: file,
+        signal: newSignal,
+      },
+    ];
+    newExe = '';
+    newName = '';
+    newSignal = 'process';
+  }
+
+  function removeWatchGame(index: number) {
+    watchGames = watchGames.filter((_, i) => i !== index);
   }
 
   /** The sections the sub-nav jumps between; the ids are local to this panel. */
@@ -352,6 +408,35 @@
         game's own audio is captured from the game itself, whichever device it plays on. A chosen
         device that is unplugged at start refuses the recording.
       </p>
+      {#if recordingNow}
+        <p class="muted footnote">Takes effect on the next recording.</p>
+      {/if}
+      <button type="button" onclick={applyCapture} disabled={busy || !fpsValid || monitor === null}>
+        Apply capture
+      </button>
+    </div>
+
+    <EncoderPanel />
+
+    <div class="group" id="settings-automatic">
+      <h3>Automatic recording</h3>
+      <!-- One feature, two tiers. The paragraph is the whole mental model: which games clip
+           themselves, which ones get the session, and that both use the same single encode. -->
+      <p class="muted">
+        <strong>Games with highlights</strong> (League of Legends, CS2, Dota 2) get a clip
+        automatically for each kill, round and win. <strong>Every other watched game</strong> gets
+        its whole session recorded automatically, and clips on the clip hotkey — a Fortnite or R6
+        match is one file when you quit the game. Nothing is injected or read from a game.
+      </p>
+      <label class="check">
+        <input
+          type="checkbox"
+          checked={autoRecord}
+          onchange={(event) => (autoRecord = event.currentTarget.checked)}
+          disabled={busy}
+        />
+        <span>Record watched games automatically {#if isDefault('games.auto_record')}<span class="muted">(default)</span>{/if}</span>
+      </label>
       <label class="check">
         <input
           type="checkbox"
@@ -366,32 +451,81 @@
         from the same encode. Needs disk space; if the disk cannot keep up, the session file ends
         early and clips are unaffected.
       </p>
+      {#if automaticNote !== null}
+        <p class="warn-note">{automaticNote}</p>
+      {/if}
+
+      <h4>Watched games</h4>
+      <p class="muted footnote">
+        Matched by executable file name only — the same snapshot Task Manager takes, with nothing
+        opened, read or injected. The executable identifies the game, so each may appear once.
+      </p>
+      <ul class="watch">
+        {#each watchGames as game, index (game.exe)}
+          <li>
+            <span class="watch-name">{game.name}</span>
+            <span class="mono muted">{game.exe}</span>
+            {#if game.signal === 'live_client_api'}
+              <span class="badge" title="Detected through Riot's Live Client Data API">Live Client API</span>
+            {/if}
+            <button
+              type="button"
+              class="icon"
+              aria-label={`Stop watching ${game.name}`}
+              title="Remove this game from the watch list"
+              onclick={() => removeWatchGame(index)}
+              disabled={busy}
+            >
+              ×
+            </button>
+          </li>
+        {/each}
+      </ul>
+      <div class="row">
+        <label class="field">
+          <span>Executable</span>
+          <input
+            type="text"
+            value={newExe}
+            oninput={(event) => (newExe = event.currentTarget.value)}
+            placeholder="RainbowSix.exe"
+            disabled={busy}
+          />
+        </label>
+        <label class="field">
+          <span>Name <span class="muted">(optional)</span></span>
+          <input
+            type="text"
+            value={newName}
+            oninput={(event) => (newName = event.currentTarget.value)}
+            placeholder="Rainbow Six Siege"
+            disabled={busy}
+          />
+        </label>
+        <label class="field">
+          <span>Detected by</span>
+          <select
+            value={newSignal}
+            onchange={(event) => (newSignal = event.currentTarget.value)}
+            disabled={busy}
+          >
+            <option value="process">Process name</option>
+            <option value="live_client_api">Live Client Data API</option>
+          </select>
+        </label>
+        <button type="button" onclick={addWatchGame} disabled={busy || newExe.trim() === ''}>
+          Add game
+        </button>
+      </div>
+      {#if watchProblem !== null}
+        <p class="invalid">{watchProblem}</p>
+      {/if}
       {#if recordingNow}
         <p class="muted footnote">Takes effect on the next recording.</p>
       {/if}
-      <button type="button" onclick={applyCapture} disabled={busy || !fpsValid || monitor === null}>
-        Apply capture
+      <button type="button" onclick={applyAutomatic} disabled={busy || watchProblem !== null}>
+        Apply automatic recording
       </button>
-    </div>
-
-    <EncoderPanel />
-
-    <div class="group" id="settings-automatic">
-      <h3>Automatic recording</h3>
-      <label class="check">
-        <input
-          type="checkbox"
-          checked={autoRecord}
-          onchange={(event) => (autoRecord = event.currentTarget.checked)}
-          disabled={busy}
-        />
-        <span>Record watched games automatically {#if isDefault('games.auto_record')}<span class="muted">(default)</span>{/if}</span>
-      </label>
-      <p class="muted footnote">Watched: {settings.watch_titles.join(', ')}</p>
-      {#if recordingNow}
-        <p class="muted footnote">Takes effect on the next recording.</p>
-      {/if}
-      <button type="button" onclick={applyAutomatic} disabled={busy}>Apply automatic</button>
     </div>
 
     <div class="group" id="settings-games">
@@ -562,6 +696,83 @@
   .invalid {
     color: var(--warn);
     font: var(--t-small);
+  }
+
+  /* Automatic recording on, nothing kept: the half of the feature that is off, stated in the
+     place the user turns the other half on. */
+  .warn-note {
+    margin: 0;
+    padding: var(--s-2) var(--s-3);
+    border: 1px solid var(--warn);
+    border-radius: var(--r-sm);
+    background: rgba(251, 191, 36, 0.07);
+    color: var(--text);
+    font: var(--t-small);
+  }
+
+  h4 {
+    margin: 0;
+    font: var(--t-small);
+    font-weight: 600;
+    color: var(--text);
+  }
+
+  /* The watch list: one row per watched game, the executable beside its name. */
+  .watch {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  .watch li {
+    display: flex;
+    align-items: center;
+    gap: var(--s-2);
+    padding: 4px 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: var(--surface-1);
+    min-width: 0;
+  }
+
+  .watch-name {
+    font: var(--t-small);
+    color: var(--text);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .watch .mono {
+    font: 400 12px/1.4 var(--font-mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .watch .badge {
+    flex: none;
+    padding: 1px 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--r-full);
+    color: var(--text-muted);
+    font: var(--t-small);
+    letter-spacing: 0.02em;
+  }
+
+  .watch button {
+    margin-left: auto;
+    flex: none;
+    font-size: 16px;
+    line-height: 1;
+  }
+
+  .watch button:hover:not(:disabled) {
+    color: var(--danger-soft);
+    border-color: var(--danger);
   }
 
   .footnote {

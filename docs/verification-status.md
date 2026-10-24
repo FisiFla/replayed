@@ -3219,3 +3219,47 @@ Nothing here ran on Windows, and no real library was reconciled. Specifically:
   real directory.
 - The reachability guard is tested by removing the clips directory outright. A real network
   mount that goes offline (stale handles, ESTALE) was not exercised.
+## 39. Auto full-session becomes a feature instead of two buried toggles (2026-10-24)
+
+### What was wrong with it
+The engine could already do the thing asked for. `[games] auto_record` was the watcher and
+`[recorder] save_session` was the "keep the whole match" switch, and they lived in two different
+Settings groups with no sentence connecting them. A user could turn auto-record on — the switch
+that sounds like "record my games" — and get hotkey clips only, because the second switch, the
+one that keeps the match, was three groups away and off. The watch list was `config.toml` only,
+so adding a title meant editing a file the window does not show.
+
+### What changed
+- **One section, two tiers.** *Settings → Automatic recording* now holds both switches, states
+  which games clip themselves (League, CS2, Dota 2) and what every other watched game gets
+  (whole session + hotkey clips), and shows a warning when auto-record is on with session saving
+  off — the exact combination that records a match into nothing.
+- **The watch list is editable in the panel.** Add by executable name (a pasted path is reduced
+  to its file name), optional display name, detection by process name or the Live Client Data
+  API; remove with ×. *Apply automatic recording* writes `[[games.watch]]` through `toml_edit`,
+  so every other key and every comment in `config.toml` survives. The list is validated with the
+  engine's own rule (`validate_watch_list`) and one panel rule: an executable that does not end
+  in `.exe` can never match a process image, so it is refused rather than saved as a watch that
+  watches nothing. An empty list is refused too, because the engine reads no list as the six
+  defaults — a Remove button that brought six games back silently would be a defect.
+- **Session titles say which kind of recording they are**: "Valorant — full session" beside the
+  buffer run's "Valorant". The game name was already on the row (the supervisor passes it), so
+  this is the display half of the parity item.
+
+### Evidence
+Host, all green: `cargo fmt --all --check` both workspaces; workspace clippy `-D warnings`; the
+desktop crate's clippy; the desktop `cargo test` (271, up from 264); the `replayed-events` tests
+(164, for `Signal::parse`); `svelte-check` 0/0; `vitest` 330 (up from 309); the production build.
+New tests pin the parts a screenshot cannot: the JSON contract for `watch_games`, a watch list
+written and read back entry for entry with the comment intact, an empty list removing the key so
+the defaults apply, a duplicate or executable-less list refused with the file left
+byte-identical, the update reporting `games.watch` as a restart key, and the panel's add /
+remove / refuse-empty / warning behaviour in jsdom.
+
+### What is NOT verified
+- Nothing here ran on Windows, and the watcher itself is still unverified on Windows (the
+  ledger's open item, unchanged by this work). The plan's Phase C step is what would close it.
+- The panel's watch editor was driven in jsdom and in the screenshot harness's fake source; no
+  one has added a game in a real window and watched a real title start recording.
+- No real game has been auto-recorded through the new section, so "Fortnite in, one session out"
+  is still a claim about code rather than a measurement.

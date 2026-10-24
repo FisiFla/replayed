@@ -216,7 +216,7 @@ Two places, and they are not the same thing:
   preset, the monitor and window to capture, the microphone and the desktop-audio device, the
   "also save the full session" switch, and the automatic-recording switch.
 - **`config.toml`** — everything the panel does not edit: the hotkey chords, the start-with-Windows
-  switch, the watch list, the GSI port and the event rules.
+  switch, the GSI port and the event rules.
 
 **The frame rate is yours to pick, and the panel tells you what the display can show.** The
 encoder section names the display being recorded and the rate that display runs at — *"Recording
@@ -291,8 +291,13 @@ cannot forge the other game's events.
 
 ### Adding a game to the watch list
 
-The watch list is **configuration only**. The Settings panel shows which titles are watched;
-it does not edit them. In `config.toml`:
+**Settings → Automatic recording → Watched games.** Type the executable name (`RainbowSix.exe`),
+optionally a name to show in the tray, and press *Add game*; *Apply automatic recording* writes
+the list to `config.toml`. Removing a game is the × beside it. The list cannot be emptied: with
+no entries the six default titles are watched, so the panel refuses to write an empty list
+rather than bring them back without saying so.
+
+The same list by hand, for a config file you are editing yourself:
 
 ```toml
 [[games.watch]]
@@ -303,7 +308,8 @@ signal = "process"            # or "live_client_api"
 
 `exe` is compared to the process's image name exactly, case-insensitively — never by
 substring, so `notcs2.exe` and `cs2.exe.bak` do not match `cs2.exe`. `signal` is `process` for
-every title except League, which Riot publishes a local game-state API for.
+every title except League, which Riot publishes a local game-state API for. Two entries with the
+same executable are one game, and both the panel and a start refuse the list.
 
 **Adding a title gives you detection and that game's own audio. It does not give the title any
 game events.** A game with no integration is the hotkey and nothing else.
@@ -322,6 +328,15 @@ Turn it on in *Settings → Automatic recording*, or with `games.auto_record = t
 With it on, replayed starts a recording when a watched game starts and stops it when the game
 stops. A change has to be seen by two consecutive polls before it is believed, so one
 flickering process list cannot start or end a recording.
+
+There are two tiers, and the panel says which one is active:
+
+- **Games with highlights** (League of Legends, CS2, Dota 2) write a clip automatically for each
+  kill, round and win. `[recorder] save_session` decides whether the match itself is also kept.
+- **Every other watched game** — Fortnite, Apex, Rainbow Six — has no game events, so the match
+  is kept by *Also save the full session*: one `session-<timestamp>.mp4` from the game starting
+  to it stopping, plus clips on the hotkey. With that switch off you get the clips only, and the
+  panel warns you in the section when automatic recording is on and nothing is being kept.
 
 ---
 

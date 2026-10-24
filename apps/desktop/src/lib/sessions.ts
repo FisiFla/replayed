@@ -42,9 +42,22 @@ export interface SessionView {
 /** What a session is called when no game was detected. */
 export const UNNAMED_SESSION = 'Manual recording';
 
-export function sessionTitle(session: Pick<SessionView, 'game'>): string {
+/**
+ * What a session is called on screen: the game, and which kind of recording it is.
+ *
+ * The mode is the difference a user cannot otherwise see. A buffer run (`mode: "buffer"`) is the
+ * ring of a whole recording, kept because the games in it produced clips; a full session
+ * (`mode: "session"`) is the match itself, concatenated into one file. Both used to read as the
+ * game name alone, which is why an auto-recorded Valorant match looked like a bare timestamp
+ * beside a manual one.
+ *
+ * The suffix is only added when the mode is known — a row written by a newer build reports a mode
+ * this one does not switch on, and it is shown as the game alone rather than guessed at.
+ */
+export function sessionTitle(session: Pick<SessionView, 'game' | 'mode'>): string {
   const game = session.game?.trim();
-  return game !== undefined && game.length > 0 ? game : UNNAMED_SESSION;
+  const name = game !== undefined && game.length > 0 ? game : UNNAMED_SESSION;
+  return session.mode === 'session' ? `${name} — full session` : name;
 }
 
 /**

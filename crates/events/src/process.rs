@@ -155,6 +155,22 @@ pub enum Signal {
     LiveClientApi,
 }
 
+impl Signal {
+    /// The signal a configuration file names, or `None` for anything else.
+    ///
+    /// The strings are the serde names (`process`, `live_client_api`), so a hand-written
+    /// `[[games.watch]]` entry and a serialised one mean the same thing. Used by a reader that has
+    /// to parse the file itself rather than through serde (the desktop shell's settings panel,
+    /// which edits the list in place and must not reformat the rest of the file).
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "process" => Some(Signal::Process),
+            "live_client_api" => Some(Signal::LiveClientApi),
+            _ => None,
+        }
+    }
+}
+
 /// One poll's answer about one watched game.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Presence {

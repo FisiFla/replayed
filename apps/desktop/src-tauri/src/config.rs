@@ -34,7 +34,9 @@
 //! rather than mirrored by hand; that is a bigger change than this module has needed.
 
 use crate::commands::{CommandError, EncoderSettings, ErrorCode};
-use replayed_events::process::{default_watch, GamesSection};
+use replayed_events::process::{
+    default_watch, validate_watch_list, GamesSection, Signal, WatchedGame,
+};
 use replayed_recorder::config::{
     BufferSection, CaptureSection, EncodeSection, MicSection, RecorderSection, StorageSection,
 };
@@ -546,6 +548,14 @@ pub enum SettingEdit {
     SaveSession(bool),
     /// `[games] auto_record`.
     AutoRecord(bool),
+    /// `[[games.watch]]`: the whole list, replacing whatever the file had.
+    ///
+    /// The list is the feature (`[games] auto_record` watches these), so it is written as one
+    /// value rather than per-entry edits: a rename and a removal are one atomic change, and an
+    /// entry is never half-written. An empty list is accepted and means "the default titles",
+    /// because that is what an absent list means to the engine — the panel removes entries down
+    /// to it rather than pretending the game list can be emptied.
+    WatchGames(Vec<WatchedGame>),
     /// A quality preset ([`QUALITY_PRESETS`]), written as `[encode] bitrate_kbps`.
     Quality(String),
     /// `[capture] monitor`.
@@ -608,6 +618,7 @@ impl SettingEdit {
             SettingEdit::OutputDevice(_) => "capture.output_device",
             SettingEdit::SaveSession(_) => "recorder.save_session",
             SettingEdit::AutoRecord(_) => "games.auto_record",
+            SettingEdit::WatchGames(_) => "games.watch",
             SettingEdit::Quality(_) => "encode.bitrate_kbps",
             SettingEdit::CaptureMonitor(_) => "capture.monitor",
             SettingEdit::CaptureWindow(_) => "capture.window",
@@ -651,9 +662,10 @@ pub struct EffectiveSettings {
     pub capture_monitor: usize,
     /// `[capture] window`; empty captures the monitor.
     pub capture_window: String,
-    /// Display names from the file's `[[games.watch]]`, or the default watch list when the file
-    /// names none (which is what the engine watches then, too).
-    pub watch_titles: Vec<String>,
+    /// The file's `[[games.watch]]` list, or the default watch list when the file names none
+    /// (which is what the engine watches then, too). Names, executables and signals: the panel
+    /// edits the list, so a display name is not enough.
+    pub watch: Vec<WatchedGame>,
     pub defaulted: Vec<&'static str>,
     pub config_exists: bool,
 }
@@ -864,6 +876,14 @@ fn validate_edit(edit: &SettingEdit) -> Result<(), CommandError> {
         SettingEdit::MicEnabled(_) | SettingEdit::AutoRecord(_) | SettingEdit::SaveSession(_) => {
             Ok(())
         }
+        // The engine's own rule (a nameless entry can never match; one executable twice is one
+        // game), so the file written here cannot be one a start refuses.
+        SettingEdit::WatchGames(watch) => validate_watch_list(watch).map_err(|err| {
+            CommandError::new(
+                ErrorCode::InvalidInput,
+                format!("games.watch was not changed: {err:#}"),
+            )
+        }),
         SettingEdit::Quality(name) => preset_bitrate(name).map(|_| ()).ok_or_else(|| {
             CommandError::new(
                 ErrorCode::InvalidInput,
@@ -1152,7 +1172,7 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
             false
         }
     };
-    let watch_titles = read_watch_titles(&doc)?;
+    let watch = read_watch(&doc)?;
 
     Ok(EffectiveSettings {
         clips_dir,
@@ -1166,20 +1186,24 @@ pub fn read_effective_settings(path: &Path) -> Result<EffectiveSettings, Command
         bitrate_kbps,
         capture_monitor,
         capture_window,
-        watch_titles,
+        watch,
         defaulted,
         config_exists,
     })
 }
 
-/// Display names from `[[games.watch]]`, or the default watch list when the file names none
-/// (an absent list deserialises to the default, not to nothing), as the engine does.
-fn read_watch_titles(doc: &toml_edit::DocumentMut) -> Result<Vec<String>, CommandError> {
+/// The `[[games.watch]]` list, or the default watch list when the file names none (an absent
+/// list deserialises to the default, not to nothing), as the engine does.
+///
+/// `signal` is optional and defaults to `process`, the engine's own default. A writer that leaves
+/// it out therefore means "detect by process name", which is what every title without a local
+/// API needs; League's `live_client_api` has to be written explicitly, as the example does.
+fn read_watch(doc: &toml_edit::DocumentMut) -> Result<Vec<WatchedGame>, CommandError> {
     let Some(games) = table(doc, "games") else {
-        return Ok(default_watch().iter().map(|w| w.name.clone()).collect());
+        return Ok(default_watch());
     };
     let Some(watch) = games.get("watch") else {
-        return Ok(default_watch().iter().map(|w| w.name.clone()).collect());
+        return Ok(default_watch());
     };
     // `[[games.watch]]` is an array of tables, which `as_array` does not see; a `watch = "..."`
     // string is a mistype either way.
@@ -1189,11 +1213,24 @@ fn read_watch_titles(doc: &toml_edit::DocumentMut) -> Result<Vec<String>, Comman
     tables
         .iter()
         .map(|entry| {
-            entry
+            let name = entry
                 .get("name")
                 .and_then(toml_edit::Item::as_str)
                 .map(str::to_string)
-                .ok_or_else(|| mistyped("games.watch"))
+                .ok_or_else(|| mistyped("games.watch"))?;
+            let exe = entry
+                .get("exe")
+                .and_then(toml_edit::Item::as_str)
+                .map(str::to_string)
+                .ok_or_else(|| mistyped("games.watch"))?;
+            let signal = match entry.get("signal") {
+                None => Signal::Process,
+                Some(item) => {
+                    let text = item.as_str().ok_or_else(|| mistyped("games.watch"))?;
+                    Signal::parse(text).ok_or_else(|| mistyped("games.watch"))?
+                }
+            };
+            Ok(WatchedGame { name, exe, signal })
         })
         .collect()
 }
@@ -1243,6 +1280,51 @@ pub fn write_settings(path: &Path, edits: &[SettingEdit]) -> Result<(), CommandE
 /// The caller holds the lock so that a read, a write and the read back that follows them are
 /// one sequence: the settings panel reports what changed by reading the file twice, and the
 /// two reads must bracket the write.
+/// Write `[[games.watch]]` as an array of tables, or remove the key when the list is empty.
+///
+/// A removed key is what the engine reads as the default titles, so "empty" is expressed the way
+/// the configuration already expresses it. Everything else in the file is left alone: this is the
+/// panel editing a list, not rewriting the configuration.
+fn write_watch_games(
+    doc: &mut toml_edit::DocumentMut,
+    watch: &[WatchedGame],
+) -> Result<(), CommandError> {
+    match doc.get_mut("games") {
+        None => {
+            doc["games"] = toml_edit::table();
+        }
+        Some(item) if item.is_table() => {}
+        Some(_) => {
+            return Err(CommandError::new(
+                ErrorCode::InvalidInput,
+                "the config file's [games] is not a table, so nothing was written",
+            ))
+        }
+    }
+    let games = doc["games"]
+        .as_table_mut()
+        .expect("the [games] table was just ensured");
+    if watch.is_empty() {
+        games.remove("watch");
+        return Ok(());
+    }
+    let mut tables = toml_edit::ArrayOfTables::new();
+    for game in watch {
+        let mut table = toml_edit::Table::new();
+        table["name"] = toml_edit::value(game.name.clone());
+        table["exe"] = toml_edit::value(game.exe.clone());
+        // Written even when it is the default, so a file states what it means: a reader that does
+        // not know the default (a person) sees the signal rather than having to infer it.
+        table["signal"] = toml_edit::value(match game.signal {
+            Signal::Process => "process",
+            Signal::LiveClientApi => "live_client_api",
+        });
+        tables.push(table);
+    }
+    games["watch"] = toml_edit::Item::ArrayOfTables(tables);
+    Ok(())
+}
+
 pub(crate) fn write_settings_locked(
     path: &Path,
     edits: &[SettingEdit],
@@ -1301,6 +1383,12 @@ pub(crate) fn write_settings_locked(
             }
             continue;
         }
+        // An array of tables is whole subtables, not a value, so it cannot use the
+        // `doc[table][key] = value` path below.
+        if let SettingEdit::WatchGames(watch) = edit {
+            write_watch_games(&mut doc, watch)?;
+            continue;
+        }
         let (table_key, value_key, section) = match edit {
             SettingEdit::ClipsDir(_) => ("storage", "clips_dir", "storage"),
             SettingEdit::Fps(_) => ("encode", "fps", "encode"),
@@ -1310,6 +1398,8 @@ pub(crate) fn write_settings_locked(
             SettingEdit::OutputDevice(_) => ("capture", "output_device", "capture"),
             SettingEdit::SaveSession(_) => ("recorder", "save_session", "recorder"),
             SettingEdit::AutoRecord(_) => ("games", "auto_record", "games"),
+            // Handled above, before the table lookup: an array of tables has no single value.
+            SettingEdit::WatchGames(_) => continue,
             SettingEdit::Quality(_) => ("encode", "bitrate_kbps", "encode"),
             SettingEdit::CaptureMonitor(_) => ("capture", "monitor", "capture"),
             SettingEdit::CaptureWindow(_) => ("capture", "window", "capture"),
@@ -1357,6 +1447,8 @@ pub(crate) fn write_settings_locked(
             SettingEdit::EncodeZeroCopy(Some(on)) => toml_edit::value(*on),
             // The `None` case was handled above and never reaches here.
             SettingEdit::EncodeZeroCopy(None) => continue,
+            // Handled above, before the table lookup: an array of tables has no single value.
+            SettingEdit::WatchGames(_) => continue,
             SettingEdit::EncodeRateControl(mode) => toml_edit::value(mode.clone()),
             SettingEdit::EncodePreset(preset) => toml_edit::value(preset.clone()),
             SettingEdit::AudioBitrate(kbps) => toml_edit::value(*kbps as i64),
@@ -2287,7 +2379,15 @@ mod tests {
         assert_eq!(settings.output_size, "1280x720");
         assert!(settings.mic_enabled);
         assert!(settings.auto_record);
-        assert_eq!(settings.watch_titles, vec!["Dota 2"]);
+        assert_eq!(
+            settings.watch,
+            vec![WatchedGame {
+                name: "Dota 2".into(),
+                exe: "dota2.exe".into(),
+                signal: Signal::Process,
+            }],
+            "the file's one entry is read with its executable and signal"
+        );
         assert!(settings.defaulted.is_empty(), "the file sets everything");
         assert!(settings.config_exists);
     }
@@ -2306,13 +2406,7 @@ mod tests {
         assert!(settings.defaulted.contains(&"mic.enabled"));
         assert!(settings.defaulted.contains(&"games.auto_record"));
         assert!(!settings.defaulted.contains(&"storage.clips_dir"));
-        assert_eq!(
-            settings.watch_titles,
-            default_watch()
-                .iter()
-                .map(|w| w.name.clone())
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(settings.watch, default_watch());
     }
 
     #[test]
@@ -2576,6 +2670,103 @@ mod tests {
         let settings = read_effective_settings(&path).unwrap();
         assert_eq!(settings.fps, 60);
         assert!(!settings.auto_record);
+    }
+
+    #[test]
+    fn a_watch_list_is_written_as_tables_and_reads_back_entry_for_entry() {
+        let (_dir, path) = settings_file();
+        let watch = vec![
+            WatchedGame {
+                name: "Rainbow Six Siege".into(),
+                exe: "RainbowSix.exe".into(),
+                signal: Signal::Process,
+            },
+            WatchedGame {
+                name: "League of Legends".into(),
+                exe: "League of Legends.exe".into(),
+                signal: Signal::LiveClientApi,
+            },
+        ];
+
+        write_settings(&path, &[SettingEdit::WatchGames(watch.clone())]).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# a comment the writer must keep"), "{text}");
+        // Both entries, each as its own table, and the signal stated rather than implied.
+        assert_eq!(text.matches("[[games.watch]]").count(), 2, "{text}");
+        assert!(text.contains("exe = \"RainbowSix.exe\""), "{text}");
+        assert!(text.contains("signal = \"live_client_api\""), "{text}");
+        assert_eq!(read_effective_settings(&path).unwrap().watch, watch);
+    }
+
+    #[test]
+    fn an_empty_watch_list_removes_the_key_so_the_defaults_apply() {
+        // The engine reads an absent list as the default titles, so "no entries" is expressed the
+        // way the configuration already expresses it rather than as an empty array the engine
+        // would have to special-case.
+        let (_dir, path) = settings_file();
+        write_settings(&path, &[SettingEdit::WatchGames(Vec::new())]).unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("games.watch"), "{text}");
+        assert_eq!(
+            read_effective_settings(&path).unwrap().watch,
+            default_watch()
+        );
+    }
+
+    #[test]
+    fn a_watch_list_the_engine_would_refuse_is_not_written() {
+        let (_dir, path) = settings_file();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let duplicate = vec![
+            WatchedGame::by_process("Dota 2", "dota2.exe"),
+            WatchedGame::by_process("Dota 2 again", "DOTA2.EXE"),
+        ];
+        let err = write_settings(&path, &[SettingEdit::WatchGames(duplicate)]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(
+            err.message.to_lowercase().contains("dota2.exe"),
+            "the duplicate is named, case-insensitively as the matcher compares it: {}",
+            err.message
+        );
+
+        // An entry with no executable can never match, so a title the user believes is watched is
+        // not; the engine refuses it and so does the panel.
+        let no_executable = vec![WatchedGame::by_process("Dota 2", "")];
+        let err = write_settings(&path, &[SettingEdit::WatchGames(no_executable)]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            before,
+            "a refused write leaves the file byte-identical"
+        );
+    }
+
+    #[test]
+    fn a_watch_entry_missing_its_executable_or_naming_an_unknown_signal_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[storage]\nclips_dir = \"\"\n[[games.watch]]\nname = \"Valorant\"\n",
+        )
+        .unwrap();
+        let err = read_effective_settings(&path).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("games.watch"), "got: {}", err.message);
+
+        std::fs::write(
+            &path,
+            "[storage]\nclips_dir = \"\"\n[[games.watch]]\nname = \"Valorant\"\n\
+             exe = \"VALORANT-Win64-Shipping.exe\"\nsignal = \"by magic\"\n",
+        )
+        .unwrap();
+        let err = read_effective_settings(&path).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("games.watch"), "got: {}", err.message);
     }
 
     #[test]

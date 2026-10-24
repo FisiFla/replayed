@@ -48,9 +48,10 @@ pub struct SettingsDto {
     pub capture_monitor: usize,
     /// `[capture] window` — a window title to capture instead; empty captures the monitor.
     pub capture_window: String,
-    /// Display names from `[[games.watch]]`, or the default titles when the file names none (what
-    /// the engine watches then, too).
-    pub watch_titles: Vec<String>,
+    /// `[[games.watch]]`: the titles the watcher looks for, or the default list when the file
+    /// names none (what the engine watches then, too). Names, executables and signals, because
+    /// the panel edits this list.
+    pub watch_games: Vec<WatchGameDto>,
     /// Keys that fell back to the example because the file does not set them, e.g. `"encode.fps"`;
     /// the panel says so rather than presenting defaults as configured.
     pub defaulted: Vec<String>,
@@ -58,6 +59,62 @@ pub struct SettingsDto {
     pub config_exists: bool,
     /// The file that was read.
     pub config_path: String,
+}
+
+/// One `[[games.watch]]` entry, as the panel edits it.
+///
+/// `exe` is the identity: the watcher compares executable names case-insensitively, so the same
+/// executable twice is one game and the store of the list refuses it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WatchGameDto {
+    /// Human name shown in the tray and the panel: "Rainbow Six Siege".
+    pub name: String,
+    /// Executable file name compared against the process list: `RainbowSix.exe`.
+    pub exe: String,
+    /// `"process"` or `"live_client_api"`: how the title is detected. Riot titles that publish
+    /// the Live Client Data API are the only ones that can use the second.
+    pub signal: String,
+}
+
+impl From<&replayed_events::process::WatchedGame> for WatchGameDto {
+    fn from(game: &replayed_events::process::WatchedGame) -> Self {
+        Self {
+            name: game.name.clone(),
+            exe: game.exe.clone(),
+            signal: signal_name(game.signal).to_string(),
+        }
+    }
+}
+
+/// The serde name of a [`Signal`](replayed_events::process::Signal), which is also the string a
+/// config file writes.
+fn signal_name(signal: replayed_events::process::Signal) -> &'static str {
+    match signal {
+        replayed_events::process::Signal::Process => "process",
+        replayed_events::process::Signal::LiveClientApi => "live_client_api",
+    }
+}
+
+impl TryFrom<&WatchGameDto> for replayed_events::process::WatchedGame {
+    type Error = CommandError;
+
+    fn try_from(game: &WatchGameDto) -> Result<Self, CommandError> {
+        let signal =
+            replayed_events::process::Signal::parse(game.signal.trim()).ok_or_else(|| {
+                CommandError::new(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "{} has signal {:?}, but it must be \"process\" or \"live_client_api\"",
+                        game.name, game.signal
+                    ),
+                )
+            })?;
+        Ok(Self {
+            name: game.name.trim().to_string(),
+            exe: game.exe.trim().to_string(),
+            signal,
+        })
+    }
 }
 
 /// A partial settings update from the window: every field optional, absent fields left alone.
@@ -71,6 +128,8 @@ pub struct SettingsUpdate {
     pub output_device: Option<String>,
     pub save_session: Option<bool>,
     pub auto_record: Option<bool>,
+    /// The whole `[[games.watch]]` list; absent leaves it alone.
+    pub watch_games: Option<Vec<WatchGameDto>>,
     /// A preset name; sets `[encode] bitrate_kbps`.
     pub quality: Option<String>,
     pub capture_monitor: Option<usize>,
@@ -129,7 +188,7 @@ pub fn read_settings(app_data_dir: &Path, config_path: &Path) -> Result<Settings
         bitrate_kbps: effective.bitrate_kbps,
         capture_monitor: effective.capture_monitor,
         capture_window: effective.capture_window,
-        watch_titles: effective.watch_titles,
+        watch_games: effective.watch.iter().map(WatchGameDto::from).collect(),
         defaulted: effective.defaulted.iter().map(|s| s.to_string()).collect(),
         config_exists: effective.config_exists,
         config_path: config_path.to_string_lossy().into_owned(),
@@ -180,6 +239,13 @@ pub fn update_settings_file(
     if let Some(auto) = update.auto_record {
         edits.push(SettingEdit::AutoRecord(auto));
     }
+    if let Some(watch) = &update.watch_games {
+        let mut games = Vec::with_capacity(watch.len());
+        for game in watch {
+            games.push(replayed_events::process::WatchedGame::try_from(game)?);
+        }
+        edits.push(SettingEdit::WatchGames(games));
+    }
     if let Some(quality) = &update.quality {
         edits.push(SettingEdit::Quality(quality.clone()));
     }
@@ -219,6 +285,12 @@ pub fn update_settings_file(
     }
     if update.auto_record.is_some() && after.auto_record != before.auto_record {
         engine_changed.push("games.auto_record");
+    }
+    // `before` is the file's own shape (`WatchedGame`), `after` the panel's (`WatchGameDto`): the
+    // comparison is between what the file said and what it says now, so one side is mapped.
+    let before_watch: Vec<WatchGameDto> = before.watch.iter().map(WatchGameDto::from).collect();
+    if update.watch_games.is_some() && after.watch_games != before_watch {
+        engine_changed.push("games.watch");
     }
     if update.quality.is_some() && after.bitrate_kbps != before.bitrate_kbps {
         engine_changed.push("encode.bitrate_kbps");
@@ -339,7 +411,7 @@ mod tests {
                 "output_size",
                 "quality",
                 "save_session",
-                "watch_titles"
+                "watch_games"
             ]
         );
         assert!(!dto.config_exists, "no file: everything is the example's");
@@ -439,6 +511,97 @@ mod tests {
         )
         .unwrap();
         assert!(!again.restart_required);
+    }
+
+    #[test]
+    fn a_watch_list_round_trips_through_the_update_and_the_file() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[games]\nauto_record = true\n").unwrap();
+
+        let watch = vec![
+            WatchGameDto {
+                name: "Rainbow Six Siege".into(),
+                exe: "RainbowSix.exe".into(),
+                signal: "process".into(),
+            },
+            WatchGameDto {
+                name: "League of Legends".into(),
+                exe: "League of Legends.exe".into(),
+                signal: "live_client_api".into(),
+            },
+        ];
+        let outcome = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                watch_games: Some(watch.clone()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.applied, vec!["games.watch"]);
+        assert_eq!(outcome.settings.watch_games, watch);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("[[games.watch]]").count(), 2, "{text}");
+        // A fresh read agrees with the file, which is what the panel renders.
+        assert_eq!(read_settings(dir.path(), &path).unwrap().watch_games, watch);
+    }
+
+    #[test]
+    fn a_watch_list_with_an_unknown_signal_is_refused_and_nothing_is_written() {
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[games]\nauto_record = true\n").unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                watch_games: Some(vec![WatchGameDto {
+                    name: "Valorant".into(),
+                    exe: "VALORANT-Win64-Shipping.exe".into(),
+                    signal: "telepathy".into(),
+                }]),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(err.message.contains("live_client_api"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+    }
+
+    #[test]
+    fn a_changed_watch_list_names_the_restart_a_running_recording_needs() {
+        // The watcher is built per start, so a list edited during a recording takes effect next
+        // time; the outcome says so rather than letting the panel imply it is already watching.
+        let (dir, path) = settings_case();
+        std::fs::write(&path, "[games]\nauto_record = true\n").unwrap();
+
+        let outcome = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                watch_games: Some(vec![WatchGameDto {
+                    name: "Rainbow Six Siege".into(),
+                    exe: "RainbowSix.exe".into(),
+                    signal: "process".into(),
+                }]),
+                ..Default::default()
+            },
+            true,
+        )
+        .unwrap();
+
+        assert!(outcome.restart_required);
+        assert!(
+            outcome.restart_reason.unwrap().contains("games.watch"),
+            "the reason names the key"
+        );
     }
 
     #[test]

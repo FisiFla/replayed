@@ -429,8 +429,13 @@ const SETTINGS_FIXTURE = {
     fps: 30,
     output_size: '',
     mic_enabled: false,
+    save_session: false,
     auto_record: false,
-    watch_titles: ['League of Legends', 'Counter-Strike 2', 'Dota 2'],
+    watch_games: [
+      { name: 'League of Legends', exe: 'League of Legends.exe', signal: 'live_client_api' },
+      { name: 'Counter-Strike 2', exe: 'cs2.exe', signal: 'process' },
+      { name: 'Dota 2', exe: 'dota2.exe', signal: 'process' },
+    ],
     defaulted: ['encode.output_size'],
     config_exists: true,
   },
@@ -580,7 +585,11 @@ function installMockSource(fixture) {
     output_size: '',
     mic_enabled: false,
     auto_record: false,
-    watch_titles: ['League of Legends', 'Counter-Strike 2', 'Dota 2'],
+    watch_games: [
+      { name: 'League of Legends', exe: 'League of Legends.exe', signal: 'live_client_api' },
+      { name: 'Counter-Strike 2', exe: 'cs2.exe', signal: 'process' },
+      { name: 'Dota 2', exe: 'dota2.exe', signal: 'process' },
+    ],
     defaulted: [],
     config_exists: true,
     config_path: 'C:\\Users\\player\\replayed\\config.toml',
@@ -809,7 +818,11 @@ function installMockSource(fixture) {
       };
     },
     async getSettings() {
-      return { ...settings, watch_titles: [...settings.watch_titles], defaulted: [...settings.defaulted] };
+      return {
+        ...settings,
+        watch_games: settings.watch_games.map((game) => ({ ...game })),
+        defaulted: [...settings.defaulted],
+      };
     },
     async updateSettings(update) {
       // Mirror the backend's contract: validation first (a rejection writes nothing),
@@ -819,7 +832,7 @@ function installMockSource(fixture) {
       }
       const before = { ...settings };
       const applied = [];
-      for (const [field, key] of [['clips_dir', 'storage.clips_dir'], ['fps', 'encode.fps'], ['output_size', 'encode.output_size'], ['mic_enabled', 'mic.enabled'], ['auto_record', 'games.auto_record']]) {
+      for (const [field, key] of [['clips_dir', 'storage.clips_dir'], ['fps', 'encode.fps'], ['output_size', 'encode.output_size'], ['mic_enabled', 'mic.enabled'], ['save_session', 'recorder.save_session'], ['auto_record', 'games.auto_record'], ['watch_games', 'games.watch']]) {
         if (update[field] !== undefined) {
           settings[field] = update[field];
           applied.push(key);
@@ -840,6 +853,15 @@ function installMockSource(fixture) {
       }
       if (update.auto_record !== undefined && settings.auto_record !== before.auto_record) {
         engineChanged.push('games.auto_record');
+      }
+      if (update.save_session !== undefined && settings.save_session !== before.save_session) {
+        engineChanged.push('recorder.save_session');
+      }
+      if (update.watch_games !== undefined) {
+        // Compared by value, as the backend does: the panel sends the list only when it differs.
+        const a = JSON.stringify(update.watch_games);
+        const b = JSON.stringify(before.watch_games);
+        if (a !== b) engineChanged.push('games.watch');
       }
       const restartRequired = recording.running && engineChanged.length > 0;
       // The idle mock has no engine restart to wait for: the next start would arm what
