@@ -3766,3 +3766,33 @@ real game being played, which is still open.
 - **#93 was opened** for the CPU criterion: the four failing runs, the offered-frame-rate analysis,
   the envelope that replaced the fixed target, and the open question of whether an envelope is the
   right long-term shape.
+## 50. `start_with_system` writes and removes a real registry value (2026-10-24)
+
+Phase C's autostart item was "`start_with_system` registry write/removal", listed in the ledger's
+"never run anywhere" column since the switch was written. It has now run, on the box, against the
+current build (`cargo build` of `apps/desktop/src-tauri` at `caf347c`, run from a scheduled task in
+the logged-on session — over SSH the app cannot create a webview: `WebView2 … Invalid window
+handle`, because session 0 has no desktop).
+
+| `[app] start_with_system` | what the registry said afterwards |
+|---|---|
+| `true` | `HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run` → `replayed    REG_SZ    "C:\Users\Flavio\replayed-plan\apps\desktop\src-tauri\target\debug\replayed-desktop.exe"` |
+| `false` | `ERROR: The system was unable to find the specified registry key or value.` |
+
+Written on start with the executable path quoted, removed on the next start when the file says
+false, per-user, value name `replayed` only. The installed `config.toml` was backed up first and
+restored afterwards, the app process was stopped after each phase, and the Run key is absent again
+now — the box is as it was. **The only thing still unverified about autostart is the Windows side
+of *being started at logon*** (that is the OS's job, and it needs a reboot nobody is going to do
+for a verification run).
+
+### Two things the run showed by accident
+- The startup line from this session's Phase A work ran on a real library:
+  `clip index …\replayed.db (schema v6): 0 clip(s) on disk (11 row(s) name a file that is gone),
+  0 bytes on disk, 0 session(s) …`. The box's library has 11 rows pointing at `H:\Replayed`, and
+  the `H:` drive is not mounted — so those rows are exactly the case the prune guard refuses to
+  touch (a file that is missing because its volume is absent is not a file the user deleted). The
+  schema is v6 and the migration ran on a real, populated v5 file.
+- The webview panic above is a *session* limit, not an app defect, and it is what an SSH-only run
+  of the window would always see. The scheduled-task path is the one the repo's own
+  `verify-in-interactive-session.ps1` uses for the same reason.

@@ -18,9 +18,11 @@ verification harness — one criterion fails there.** Written 2026-10-24 against
   animating desktop and now scales with the frames the screen offers (issue #93, ledger §48).
   `#79` is closed as not reproducible (§49).
 - **Still open in Phase C:** a real-game session with an integration (LoL / CS2 / Dota 2), the
-  tray / hide-on-close / autostart as *observed* behaviour, and 4K120 on the live path. The
-  **72-hour soak is dropped by the owner's decision** (§48) — it is a measurement that will not be
-  made, not one that was failed.
+  tray and hide-on-close as *observed* behaviour, and 4K120 on the live path. **`start_with_system`
+  is verified** — the Run value is written with the quoted executable path and removed again on
+  the next start, on the box, with the config restored afterwards (§50). The **72-hour soak is
+  dropped by the owner's decision** (§48) — it is a measurement that will not be made, not one
+  that was failed.
 - **Open:** step 9's release (publish v0.2.0, install, v0.2.1, self-update proof) and Phase E's
   signing — both need credentials and a release page, not a host.
 - Phase F is deferred until after 1.0 by the plan's own ordering.
