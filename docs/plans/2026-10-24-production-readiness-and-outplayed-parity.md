@@ -1,12 +1,17 @@
 # Production readiness and Outplayed parity plan
 
-Status: in progress. Written 2026-10-24 against `main` at `a8acaf9`. **Phases A and B are
-implemented**, step 8's probe fix is in, and Phase D's non-code items (stray file, CI compiler,
-non-goals, changelog) are done — ledgers §38–§41 record what the tests prove and what they do
-not. Step 11 (combine and the export presets) is implemented — ledger §42. Phase C's Windows
-sweep and the release itself are open. **Steps 10, 11 and 12 are implemented** — the
-screenshot hotkey and the `kind` column (§46), combine and the export presets (§42), hotkey
-rebinding, autostart, the first-run checklist and the open-data-folder button (§43–§45). What has and has not been verified is recorded in
+Status: **every code step is implemented; the computer-facing ones are not run.** Written
+2026-10-24 against `main` at `a8acaf9`.
+
+- Phase A (§38), Phase B (§39), and Phase D's steps 10–13 (§42–§46) are implemented and tested
+  on the development host.
+- Step 8's probe fix is in (§40); its Windows verification is not.
+- **Open, and not for a host without Windows:** Phase C's manual sweep (the box, real games,
+  `xtask verify`, 4K120, the 72-hour soak, #79 closed on evidence), step 9's release (publish
+  v0.2.0, install, v0.2.1, self-update proof), Phase E's signing.
+- Phase F is deferred until after 1.0 by the plan's own ordering.
+
+What has and has not been verified is recorded in
 [`docs/verification-status.md`](../verification-status.md); this plan does not upgrade any claim
 there.
 
@@ -58,7 +63,7 @@ Order: correctness → parity you asked for → Windows proof → unsigned relea
 7. By hand on the Windows box: auto full-session with a non-integrated game (R6 under BattlEye conditions already used); one LoL bot game + one CS2 round; hidden-window `Ctrl+F8`; CLI+app hotkey collision; every tray item; `start_with_system` registry write/removal.
 8. Fix #79 (per-frame texture in MFT probe; run its Windows-only test on Windows). Diagnose MFT at 4K120; measure zero-copy 120 fps or cap the picker. `cargo xtask verify` clean; watch 3 clips with audio; start 72-hour soak. Document the ≈1.8–2× bitrate overshoot honestly in USER-GUIDE.
 
-### Phase D — Unsigned release + remaining parity (docs and hygiene done — ledger §41; the release itself and steps 10–12 are open)
+### Phase D — Unsigned release + remaining parity (steps 10–13 implemented — §42–§46; the release itself is open)
 
 9. Publish unsigned `v0.2.0`; install; publish `v0.2.1`; prove signed-minisign self-update end to end (ledger §27). Delete stray `created2.json`; pin exact Rust toolchain. Release notes keep the SmartScreen warning front and centre.
 10. Screenshot hotkey (single WGC frame → PNG in library).
