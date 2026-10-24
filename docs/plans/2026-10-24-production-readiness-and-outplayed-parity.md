@@ -1,8 +1,9 @@
 # Production readiness and Outplayed parity plan
 
-Status: **every code step is implemented, and the Windows box has run the suite and the
-verification harness — one criterion fails there.** Written 2026-10-24 against `main` at
-`a8acaf9`.
+Status: **every code step is implemented and, where a machine can judge it, verified on the
+Windows box — `cargo xtask verify` passes there (29 checks, 0 failed), the UI is seen, and the
+release is prepared at `0.2.1` but not published.** Written 2026-10-24 against `main` at
+`a8acaf9`; the tree it describes is `0.2.1`.
 
 - Phase A (§38), Phase B (§39), and Phase D's steps 10–13 (§42–§46) are implemented and tested
   on the development host — and the workspace suite, the screenshot frame and `xtask verify`
