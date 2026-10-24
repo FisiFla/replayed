@@ -220,3 +220,53 @@ fn an_export_that_cannot_be_made_leaves_no_partial_file() {
     assert!(format!("{err:#}").contains("discord"), "{err:#}");
     assert!(!out.exists(), "a failed export leaves no file behind");
 }
+
+/// A frame as the capture delivers it: BGRA, top-down, `width * height * 4` bytes.
+fn bgra_frame(width: u32, height: u32, seed: u8) -> Vec<u8> {
+    let mut data = Vec::with_capacity((width * height * 4) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            data.extend_from_slice(&[seed, (x % 256) as u8, (y % 256) as u8, 0xff]);
+        }
+    }
+    data
+}
+
+#[test]
+fn a_captured_frame_is_written_as_a_png_of_its_own_size() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let (width, height) = (64, 48);
+    let frame = bgra_frame(width, height, 0x30);
+    let out = dir.path().join("screenshot.png");
+
+    edit::screenshot_png(&bin, width, height, &frame, &out).expect("write the png");
+
+    let info = MediaInfo::probe(&bin, &out).unwrap();
+    let video = info
+        .video
+        .as_ref()
+        .expect("a PNG is a video stream to ffprobe");
+    assert_eq!((video.width, video.height), (width, height));
+    assert_eq!(video.codec, "png");
+    assert!(info.audio.is_none(), "a still image has no audio");
+    // Lossless: the format has no quality knob, which is why a scoreboard's text survives it.
+    let size = std::fs::metadata(&out).unwrap().len();
+    assert!(size > 0, "the file is not empty");
+}
+
+#[test]
+fn a_frame_that_is_not_the_size_it_claims_is_refused_rather_than_truncated() {
+    // ffmpeg would read a short buffer as a truncated image and exit 0; the check is the media
+    // layer's, and it happens before anything is spawned.
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let out = dir.path().join("short.png");
+
+    let err = edit::screenshot_png(&bin, 64, 48, &[0u8; 16], &out).unwrap_err();
+    assert!(format!("{err:#}").contains("truncated"), "{err:#}");
+    assert!(!out.exists());
+
+    let err = edit::screenshot_png(&bin, 0, 0, &[], &out).unwrap_err();
+    assert!(format!("{err:#}").contains("non-empty"), "{err:#}");
+}

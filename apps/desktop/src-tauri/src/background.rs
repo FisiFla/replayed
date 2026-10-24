@@ -173,6 +173,8 @@ pub enum HotkeyAction {
     Clip,
     ToggleRecording,
     Bookmark,
+    /// Save one frame of the capture target as a PNG in the library.
+    Screenshot,
 }
 
 impl HotkeyAction {
@@ -181,6 +183,7 @@ impl HotkeyAction {
             HotkeyAction::Clip => "clip",
             HotkeyAction::ToggleRecording => "toggle_recording",
             HotkeyAction::Bookmark => "bookmark",
+            HotkeyAction::Screenshot => "screenshot",
         }
     }
 }

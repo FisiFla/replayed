@@ -20,8 +20,9 @@ use std::time::Duration;
 /// The schema this build writes. Each version adds columns in place without reading, copying or
 /// losing a row (see [`Store::migrate`]): v2 the session columns, v3 the media-clock anchor of a
 /// session's event timeline, v4 the media length that timeline is plotted against, v5 the clip
-/// library's title, game and tags.
-const SCHEMA_VERSION: i32 = 5;
+/// library's title, game and tags, v6 the kind of artefact a clip row names (a video or a
+/// screenshot).
+const SCHEMA_VERSION: i32 = 6;
 
 /// The mode of a session the ring buffer opened: the row groups the clips and events of one
 /// buffer run, and there is no concatenated session file.
@@ -137,6 +138,23 @@ const V5_CLIP_COLUMNS: [(&str, &str); 2] = [
     ("game", "ALTER TABLE clips ADD COLUMN game TEXT"),
 ];
 
+/// The v6 column: what the row is. A screenshot is an artefact the user keeps, tags and protects
+/// exactly like a clip, so it lives in the same table rather than in a second list the storage
+/// policy would not see and the library would have to merge by hand.
+///
+/// A default of `'clip'` is the only claim a v5 row supports: before this column existed there was
+/// no way to make a screenshot, so every row is a video.
+const V6_CLIP_COLUMNS: [(&str, &str); 1] = [(
+    "kind",
+    "ALTER TABLE clips ADD COLUMN kind TEXT NOT NULL DEFAULT 'clip'",
+)];
+
+/// A row that names a recorded video: the ordinary clip or session extract.
+pub const CLIP_KIND_CLIP: &str = "clip";
+
+/// A row that names a still image written by the screenshot hotkey.
+pub const CLIP_KIND_SCREENSHOT: &str = "screenshot";
+
 /// The v5 tag table: one row per (clip, tag). Tags are normalized by [`normalize_tag`] before
 /// they are written, so the primary key makes a tag set a set.
 const V5_TAGS_DDL: &str = r#"
@@ -195,6 +213,12 @@ pub struct NewClip {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clip {
     pub id: i64,
+    /// [`CLIP_KIND_CLIP`] or [`CLIP_KIND_SCREENSHOT`], stored as text.
+    ///
+    /// Text rather than an enum, for the reason [`Session::mode`] is: a row written by a newer
+    /// build must be readable here, and a kind this build does not know is better rendered
+    /// cautiously than refused. [`Clip::is_screenshot`] is the only test a caller needs.
+    pub kind: String,
     pub path: PathBuf,
     /// The clip's first frame on the encoder's media timeline, in ms: the ledger's clock, not wall
     /// clock (see the CLI's `index_clip`). Not comparable across captures; it restarts with the scratch directory.
@@ -215,6 +239,23 @@ pub struct Clip {
     pub game: Option<String>,
     /// User tags (schema v5), normalized and sorted.
     pub tags: Vec<String>,
+}
+
+impl Clip {
+    /// Whether this row names a still image rather than a video: no duration, no player, no trim,
+    /// and the file itself is its own thumbnail.
+    pub fn is_screenshot(&self) -> bool {
+        self.kind == CLIP_KIND_SCREENSHOT
+    }
+}
+
+/// A screenshot to index: the file is already written, and its size is what the storage policy
+/// needs. There is no duration, no codec to probe and no media timeline to place it on — a still
+/// image has none of those, which is the whole reason it is a different [`Clip::kind`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewScreenshot {
+    pub path: PathBuf,
+    pub size_bytes: u64,
 }
 
 /// A row to write into `events`.
@@ -402,6 +443,9 @@ impl Store {
         if current < 5 {
             self.upgrade_to_v5()?;
         }
+        if current < 6 {
+            self.upgrade_to_v6()?;
+        }
         self.conn
             .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         Ok(())
@@ -496,6 +540,18 @@ impl Store {
         Ok(())
     }
 
+    /// v5 -> v6: `clips` gains the kind of artefact the row names. Idempotent like the others.
+    fn upgrade_to_v6(&self) -> Result<()> {
+        let tx = self.conn.unchecked_transaction()?;
+        for (column, ddl) in &V6_CLIP_COLUMNS {
+            if !column_exists(&tx, "clips", column)? {
+                tx.execute_batch(ddl)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Add whichever of `columns` the `sessions` table does not already have.
     ///
     /// Idempotent twice over: the version check in [`Store::migrate`] normally skips it, and each
@@ -536,15 +592,35 @@ impl Store {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// Index a screenshot: a still image in the clips directory, with no duration and no timeline.
+    ///
+    /// `codec` is `"png"` rather than a guess: the column is what a reader shows beside a clip, and
+    /// naming the real format is cheaper than having every surface special-case an empty string.
+    pub fn insert_screenshot(&self, shot: &NewScreenshot) -> Result<i64> {
+        let path = shot.path.to_string_lossy();
+        self.conn.execute(
+            "INSERT INTO clips (path, started_at, duration_ms, size_bytes, codec, created_at, kind)
+             VALUES (?1, 0, 0, ?2, 'png', ?3, ?4)",
+            params![
+                path,
+                to_i64(shot.size_bytes),
+                now_ms(),
+                CLIP_KIND_SCREENSHOT
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
     pub fn list_clips(&self) -> Result<Vec<Clip>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, path, started_at, duration_ms, size_bytes, codec, favourite, created_at,
-                    title, game
+                    title, game, kind
              FROM clips ORDER BY started_at DESC",
         )?;
         let rows = stmt.query_map([], |r| {
             Ok(Clip {
                 id: r.get(0)?,
+                kind: r.get(10)?,
                 path: PathBuf::from(r.get::<_, String>(1)?),
                 started_at_ms: to_u64(r.get::<_, i64>(2)?),
                 duration_ms: to_u64(r.get::<_, i64>(3)?),
@@ -2324,12 +2400,70 @@ mod tests {
     }
 
     #[test]
+    fn a_screenshot_is_indexed_as_a_clip_row_with_no_duration_and_its_own_kind() {
+        // The design choice this pins: one table for both, because a screenshot is kept, tagged and
+        // protected from the storage policy exactly like a clip, and the library is one list.
+        let store = Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+
+        let id = store
+            .insert_screenshot(&NewScreenshot {
+                path: "/clips/screenshot-1.png".into(),
+                size_bytes: 40_000,
+            })
+            .unwrap();
+
+        let clips = store.list_clips().unwrap();
+        assert_eq!(clips.len(), 1);
+        let shot = &clips[0];
+        assert_eq!(shot.id, id);
+        assert_eq!(shot.kind, CLIP_KIND_SCREENSHOT);
+        assert!(shot.is_screenshot());
+        assert_eq!(shot.duration_ms, 0, "a still image has no length");
+        assert_eq!(shot.codec, "png");
+        assert_eq!(shot.size_bytes, 40_000);
+        // And it is a first-class row: tags and favourites work on it.
+        assert!(store.set_clip_tags(id, &["ace".into()]).unwrap());
+        assert!(store.set_favourite(id, true).unwrap());
+        let again = store.list_clips().unwrap();
+        assert_eq!(again[0].tags, vec!["ace"]);
+        assert!(again[0].favourite);
+    }
+
+    #[test]
+    fn a_v5_database_gains_the_kind_column_and_its_rows_stay_videos() {
+        // The upgrade path a released v0.2.0 library takes. The column is added with a default, so
+        // every existing row is what it always was: a video.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("replayed.db");
+        let store = Store::open(&db).unwrap();
+        store.migrate().unwrap();
+        let id = store.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        // Rewind the file to v5 by dropping the column, as the released build's schema had it.
+        store
+            .conn
+            .execute("ALTER TABLE clips DROP COLUMN kind", [])
+            .unwrap();
+        store.conn.execute("PRAGMA user_version = 5", []).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 5);
+        assert!(!column_exists(&store.conn, "clips", "kind").unwrap());
+
+        store.migrate().unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), 6);
+        let clips = store.list_clips().unwrap();
+        assert_eq!(clips.len(), 1, "no row lost");
+        assert_eq!(clips[0].id, id);
+        assert_eq!(clips[0].kind, CLIP_KIND_CLIP);
+    }
+
+    #[test]
     fn a_v1_database_gains_the_v5_columns_backfills_the_game_and_loses_no_rows() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("replayed.db");
         let store = v1_database(&db);
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
 
         let clips = store.list_clips().unwrap();
         assert_eq!(clips.len(), 1);
@@ -2338,6 +2472,10 @@ mod tests {
             clips[0].game.as_deref(),
             Some("League of Legends"),
             "game back-filled from the session"
+        );
+        assert_eq!(
+            clips[0].kind, CLIP_KIND_CLIP,
+            "a pre-v6 row is a video: there was no way to make a screenshot before this build"
         );
         assert_eq!(clips[0].title, None);
         assert!(clips[0].tags.is_empty());

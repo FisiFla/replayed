@@ -23,6 +23,7 @@
   import StoragePanel from './lib/components/StoragePanel.svelte';
   import Toasts from './lib/components/Toasts.svelte';
   import {
+    basename,
     describeCombine,
     describeDelete,
     describeExport,
@@ -199,6 +200,9 @@
   async function loadThumbnails() {
     for (const clip of clips) {
       if (thumbnails[clip.id] !== undefined) continue;
+      // A screenshot is its own picture: the card shows the file, and asking for an ffmpeg frame
+      // of a PNG would be one process per screenshot for a thumbnail of itself.
+      if (clip.isScreenshot) continue;
       try {
         const thumb = await source.thumbnail(clip.id, thumbnailAtMs(clip.durationMs));
         thumbnails = { ...thumbnails, [clip.id]: source.assetUrl(thumb.path) };
@@ -440,6 +444,26 @@
   }
 
   /**
+   * Take a screenshot of the configured capture target.
+   *
+   * One frame, saved as a PNG in the library. It does not need a recording to be running — that is
+   * most of the time it is useful — and the backend holds the controls while it waits for the
+   * display to present.
+   */
+  async function screenshotNow() {
+    busy = true;
+    try {
+      const clip = await source.screenshotNow();
+      notice = `Screenshot saved as ${basename(clip.path)}.`;
+      await refresh();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
+  /**
    * Combine the ticked clips into one, losslessly.
    *
    * The backend refuses fewer than two, a file that is gone, and clips that do not share a stream
@@ -662,6 +686,7 @@
       onStart={startRecording}
       onStop={stopRecording}
       onClip={saveClip}
+      onScreenshot={screenshotNow}
       onOpenHealth={() => (view = navigate(view, 'health'))}
     />
 

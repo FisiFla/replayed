@@ -4,14 +4,12 @@
 // Scoped to the test build of this crate, so it cannot hide either in shipped code.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // The waiting machinery below is the Windows capture backend's, and its own tests'. Off Windows
 // and outside this crate's test build there is nothing that uses it, so it is not compiled.
 #[cfg(any(windows, test))]
 use std::sync::{Condvar, Mutex};
-#[cfg(any(windows, test))]
-use std::time::Instant;
 
 pub mod platform;
 pub mod stub;
@@ -218,6 +216,50 @@ impl Frame {
     /// is a bug.
     pub fn has_pixels(&self) -> bool {
         !self.data.is_empty()
+    }
+}
+
+/// Grab exactly one frame from `backend`, then stop it.
+///
+/// A screenshot needs one frame, not a stream: open the session, take the first frame the backend
+/// offers, close it again. On Windows that is a Windows Graphics Capture session whose frame pool
+/// holds nothing until the compositor presents a frame — which is why the wait is bounded and not
+/// assumed to be instant.
+///
+/// `timeout` bounds the wait rather than the whole call: a target that never presents (a
+/// minimised window, a display that went away, a secure desktop) must fail rather than hang the
+/// window that asked. The backend is stopped on every path, failure included: a WGC session left
+/// open holds the display's frames, and the next capture can then refuse to start.
+pub fn grab_frame(backend: &mut dyn CaptureBackend, timeout: Duration) -> anyhow::Result<Frame> {
+    use anyhow::Context;
+    backend
+        .start()
+        .context("starting the capture for a screenshot")?;
+    let first = (|| {
+        // Long enough that an idle display still presents, short enough that a frame which arrives
+        // late is picked up on the next turn of the loop rather than delaying the deadline check.
+        const SLICE: Duration = Duration::from_millis(50);
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(frame) = backend.next_frame(SLICE)? {
+                return Ok(frame);
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "no frame was presented within {timeout:?}. A minimised window, a display                      that was disconnected, or a secure desktop presents none; nothing was saved"
+                );
+            }
+        }
+    })();
+    let stopped = backend.stop();
+    match (first, stopped) {
+        (Ok(frame), Ok(())) => Ok(frame),
+        // The frame is real and the failure is the session's teardown: report it, keep the frame.
+        (Ok(frame), Err(err)) => {
+            tracing::warn!("the screenshot's capture session did not stop cleanly: {err:#}");
+            Ok(frame)
+        }
+        (Err(err), _) => Err(err),
     }
 }
 
@@ -682,6 +724,69 @@ pub trait AudioBackend: Send {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grabbing_one_frame_starts_reads_one_frame_and_stops() {
+        // The screenshot path: one frame, then the session closed. The stub is paced, so the first
+        // frame may not be due immediately; the bounded wait is what makes this work.
+        use crate::stub::{StubCapture, StubConfig};
+        let cfg = StubConfig {
+            width: 16,
+            height: 9,
+            fps: 60,
+        };
+        let mut backend = StubCapture::new(cfg);
+
+        let frame = grab_frame(&mut backend, Duration::from_secs(2)).expect("a frame");
+
+        assert_eq!((frame.width, frame.height), (16, 9));
+        assert_eq!(frame.format, crate::PixelFormat::Bgra8);
+        assert_eq!(
+            frame.data.len(),
+            16 * 9 * 4,
+            "a screenshot needs the pixels, not a texture handle"
+        );
+        // The session is closed: a second grab starts a fresh one rather than reading a stale pool.
+        assert!(grab_frame(&mut backend, Duration::from_secs(2)).is_ok());
+    }
+
+    /// A capture target that presents nothing: the state a minimised window is in.
+    struct SilentBackend {
+        started: bool,
+        stopped: bool,
+    }
+
+    impl CaptureBackend for SilentBackend {
+        fn start(&mut self) -> anyhow::Result<()> {
+            self.started = true;
+            Ok(())
+        }
+        fn next_frame(&mut self, _timeout: Duration) -> anyhow::Result<Option<crate::Frame>> {
+            Ok(None)
+        }
+        fn stop(&mut self) -> anyhow::Result<()> {
+            self.stopped = true;
+            Ok(())
+        }
+        fn native_size(&self) -> (u32, u32) {
+            (0, 0)
+        }
+    }
+
+    #[test]
+    fn a_target_that_never_presents_fails_with_a_named_reason_and_still_stops() {
+        let mut backend = SilentBackend {
+            started: false,
+            stopped: false,
+        };
+        let err = grab_frame(&mut backend, Duration::from_millis(60)).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("minimised window"),
+            "the refusal names the likely causes: {err:#}"
+        );
+        assert!(backend.started, "it was attempted");
+        assert!(backend.stopped, "and the session was closed anyway");
+    }
 
     #[test]
     fn a_normal_device_period_is_used_as_it_is_reported() {

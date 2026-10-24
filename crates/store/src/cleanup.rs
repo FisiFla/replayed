@@ -302,6 +302,7 @@ mod tests {
     fn clip(id: i64, created_at_ms: i64, size_bytes: u64, favourite: bool) -> Clip {
         Clip {
             id,
+            kind: crate::CLIP_KIND_CLIP.to_string(),
             path: PathBuf::from(format!("/clips/{id}.mp4")),
             started_at_ms: 0,
             duration_ms: 1_000,

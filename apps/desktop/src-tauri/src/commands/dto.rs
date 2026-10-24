@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClipDto {
     pub id: i64,
+    /// `"clip"` or `"screenshot"` (`replayed_store::CLIP_KIND_*`). Text, not an enum, for the reason
+    /// the store keeps it as text: a kind a newer build wrote must still render something.
+    pub kind: String,
     pub path: String,
     /// Media-time position of the clip's first frame (see `replayed_store::Clip`). Not
     /// comparable across captures; the list is ordered by `created_at_ms` instead.
@@ -36,6 +39,7 @@ impl From<&Clip> for ClipDto {
     fn from(clip: &Clip) -> Self {
         Self {
             id: clip.id,
+            kind: clip.kind.clone(),
             path: clip.path.to_string_lossy().into_owned(),
             started_at_ms: clip.started_at_ms,
             duration_ms: clip.duration_ms,
@@ -317,6 +321,7 @@ mod tests {
                 "favourite",
                 "game",
                 "id",
+                "kind",
                 "path",
                 "size_bytes",
                 "started_at_ms",

@@ -4,9 +4,9 @@ Status: in progress. Written 2026-10-24 against `main` at `a8acaf9`. **Phases A 
 implemented**, step 8's probe fix is in, and Phase D's non-code items (stray file, CI compiler,
 non-goals, changelog) are done — ledgers §38–§41 record what the tests prove and what they do
 not. Step 11 (combine and the export presets) is implemented — ledger §42. Phase C's Windows
-sweep, the release itself and step 10 (screenshot) are open; **step 12 is implemented** —
-hotkey rebinding (§45), autostart toggle, first-run checklist and the open-data-folder button
-(§43, §44). What has and has not been verified is recorded in
+sweep and the release itself are open. **Steps 10, 11 and 12 are implemented** — the
+screenshot hotkey and the `kind` column (§46), combine and the export presets (§42), hotkey
+rebinding, autostart, the first-run checklist and the open-data-folder button (§43–§45). What has and has not been verified is recorded in
 [`docs/verification-status.md`](../verification-status.md); this plan does not upgrade any claim
 there.
 

@@ -32,7 +32,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 const clip: ClipDto = {
-  id: 1, path: '/c/a.mp4', started_at_ms: 0, duration_ms: 30_000, size_bytes: 5_000_000,
+  id: 1, kind: 'clip', path: '/c/a.mp4', started_at_ms: 0, duration_ms: 30_000, size_bytes: 5_000_000,
   codec: 'h264', favourite: false, title: null, game: 'Valorant', tags: [], created_at_ms: 1_700_000_000_000,
 };
 const session: SessionDto = {

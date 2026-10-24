@@ -11,6 +11,11 @@ import type { ClipDto, DeleteOutcome, ExportOutcome, PruneOutcome, TrimRange } f
 /** One row of the clip list. */
 export interface ClipView {
   id: number;
+  /**
+   * Whether this row is a still image. A screenshot has no player, no trim, no duration and no
+   * combine; the file itself is its own picture.
+   */
+  isScreenshot: boolean;
   /** The file's name, which is what the list shows: the directory is noise there. */
   name: string;
   /** The full path, for the detail view and for error messages. */
@@ -65,13 +70,16 @@ export function thumbnailAtMs(durationMs: number): number {
 
 /** Map one row. `assetUrl` is injected so this stays free of the Tauri API. */
 export function toClipView(clip: ClipDto, assetUrl: (path: string) => string): ClipView {
+  const isScreenshot = clip.kind === 'screenshot';
   return {
     id: clip.id,
+    isScreenshot,
     name: basename(clip.path),
     path: clip.path,
     assetUrl: assetUrl(clip.path),
     durationMs: clip.duration_ms,
-    durationLabel: formatDuration(clip.duration_ms),
+    // "0:00" under a screenshot would read as a broken clip; there is no duration to show.
+    durationLabel: isScreenshot ? 'still' : formatDuration(clip.duration_ms),
     sizeBytes: clip.size_bytes,
     sizeLabel: formatBytes(clip.size_bytes),
     codec: clip.codec,

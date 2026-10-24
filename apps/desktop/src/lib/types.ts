@@ -14,6 +14,11 @@
 /** One clip as the index records it. */
 export interface ClipDto {
   id: number;
+  /**
+   * `"clip"` or `"screenshot"` (the store's `CLIP_KIND_*`). Text, not a union, for the reason the
+   * store keeps it as text: a kind a newer build wrote must still render something.
+   */
+  kind: string;
   /** Absolute path on disk. Playback goes through the asset protocol, never this string. */
   path: string;
   /** Media-time position of the clip's first frame. Not comparable across captures. */

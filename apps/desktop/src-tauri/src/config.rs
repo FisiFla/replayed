@@ -321,6 +321,8 @@ pub struct BackgroundConfig {
     pub toggle_recording_hotkey: Option<String>,
     /// `[hotkeys] bookmark`: drop a marker on the session timeline. Off unless set.
     pub bookmark_hotkey: Option<String>,
+    /// `[hotkeys] screenshot`: save one frame as a PNG in the library. Off unless set.
+    pub screenshot_hotkey: Option<String>,
     /// `[app] start_with_system`: whether the shell should own a start-with-Windows entry.
     pub start_with_system: bool,
 }
@@ -352,6 +354,8 @@ impl BackgroundConfig {
             toggle_recording: Option<String>,
             #[serde(default)]
             bookmark: Option<String>,
+            #[serde(default)]
+            screenshot: Option<String>,
         }
         #[derive(Deserialize)]
         struct AppSection {
@@ -368,14 +372,21 @@ impl BackgroundConfig {
                 ),
             )
         })?;
-        let (toggle_recording_hotkey, bookmark_hotkey) = file
+        let (toggle_recording_hotkey, bookmark_hotkey, screenshot_hotkey) = file
             .hotkeys
             .as_ref()
-            .map(|h| (h.toggle_recording.clone(), h.bookmark.clone()))
+            .map(|h| {
+                (
+                    h.toggle_recording.clone(),
+                    h.bookmark.clone(),
+                    h.screenshot.clone(),
+                )
+            })
             .unwrap_or_default();
         Ok(Self {
             toggle_recording_hotkey,
             bookmark_hotkey,
+            screenshot_hotkey,
             clip_hotkey: file.hotkeys.map(|h| h.clip).unwrap_or_else(|| {
                 tracing::info!(
                     "config.toml has no [hotkeys] section; using the documented default \

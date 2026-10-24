@@ -188,12 +188,25 @@
           title="Drag to copy this clip's file into another app"
         >
           <span class="frame">
-            {#if thumbnail}
+            {#if clip.isScreenshot}
+              <!-- A screenshot is its own picture: no ffmpeg thumbnail, no duration chip. -->
+              <img
+                class="thumb"
+                src={clip.assetUrl}
+                alt=""
+                loading="lazy"
+                decoding="async"
+                draggable="false"
+              />
+              <span class="duration">PNG</span>
+            {:else if thumbnail}
               <img class="thumb" src={thumbnail} alt="" loading="lazy" decoding="async" draggable="false" />
             {:else}
               <span class="thumb placeholder" aria-hidden="true"><Icon name="video" size={28} /></span>
             {/if}
-            <span class="duration">{clip.durationLabel}</span>
+            {#if !clip.isScreenshot}
+              <span class="duration">{clip.durationLabel}</span>
+            {/if}
           </span>
           <span class="meta">
             <span class="name">{clip.displayName}</span>
@@ -209,14 +222,16 @@
         </button>
 
         <div class="actions">
-          <input
-            class="pick"
-            type="checkbox"
-            checked={combineIds.includes(clip.id)}
-            aria-label={`Select ${clip.displayName} to combine`}
-            title="Select to combine with another clip"
-            onchange={() => onToggleCombine(clip.id)}
-          />
+          {#if !clip.isScreenshot}
+            <input
+              class="pick"
+              type="checkbox"
+              checked={combineIds.includes(clip.id)}
+              aria-label={`Select ${clip.displayName} to combine`}
+              title="Select to combine with another clip"
+              onchange={() => onToggleCombine(clip.id)}
+            />
+          {/if}
           <button
             class="icon star"
             type="button"

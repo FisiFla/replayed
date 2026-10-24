@@ -133,6 +133,24 @@
         transcribes audio; an empty caption track would satisfy the linter and tell a screen
         reader nothing.
       -->
+      {#if clip.isScreenshot}
+        <!-- A still image: no player, no timeline, no trim and no export presets. The file is the
+             picture, shown at its own aspect ratio. -->
+        <img class="player still" src={clip.assetUrl} alt={`Screenshot: ${clip.displayName}`} />
+        <section class="panel trim">
+          <div class="trim-head">
+            <h2>Screenshot</h2>
+            <div class="selection">
+              <span class="muted">one frame, saved as a lossless PNG</span>
+            </div>
+          </div>
+          <p class="lossless">
+            <strong>A still image.</strong> There is nothing to trim or export: the file is the
+            frame exactly as it was on screen, and it can be copied, revealed, tagged and
+            favourited like any clip.
+          </p>
+        </section>
+      {:else}
       <video
         class="player"
         bind:this={video}
@@ -215,6 +233,7 @@
           not to be another copy under the storage cap. The original is never modified.
         </p>
       </section>
+      {/if}
     </div>
 
     <aside class="side">
@@ -441,6 +460,15 @@
     display: flex;
     flex-wrap: wrap;
     gap: 6px;
+  }
+
+  /* A screenshot at its own aspect ratio, capped so a 4K capture still fits the column. */
+  .player.still {
+    width: 100%;
+    height: auto;
+    max-height: 60vh;
+    object-fit: contain;
+    background: #000;
   }
 
   .trim {

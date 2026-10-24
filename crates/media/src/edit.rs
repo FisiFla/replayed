@@ -77,6 +77,61 @@ pub fn thumbnail(bin: &FfmpegBinaries, src: &Path, at_ms: u64, dst: &Path) -> Re
     expect_success(cmd, "thumbnail", dst, EDIT_TIMEOUT)
 }
 
+/// Write one captured frame as a PNG.
+///
+/// A screenshot is the one media operation that does not involve the encoder at all: the frame is
+/// already pixels, and the only question is what container they go in. PNG, because it is lossless
+/// — a screenshot of a scoreboard should not have JPEG ringing on the text — and because every
+/// image viewer and chat client opens it.
+///
+/// `bgra` is the frame exactly as the capture delivered it: `width * height * 4` bytes, BGRA,
+/// top-down. The size is checked here rather than left to ffmpeg, which would read a short buffer
+/// as a truncated image and exit 0.
+pub fn screenshot_png(
+    bin: &FfmpegBinaries,
+    width: u32,
+    height: u32,
+    bgra: &[u8],
+    dst: &Path,
+) -> Result<()> {
+    if width == 0 || height == 0 {
+        bail!("a screenshot needs a non-empty frame, got {width}x{height}");
+    }
+    let expected = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|pixels| pixels.checked_mul(4))
+        .ok_or_else(|| anyhow::anyhow!("{width}x{height} BGRA does not fit in a buffer"))?;
+    if bgra.len() != expected {
+        bail!(
+            "the frame is {} bytes but a {width}x{height} BGRA frame is {expected}: refusing to \
+             write a truncated screenshot",
+            bgra.len()
+        );
+    }
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
+    cmd.args([
+        "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "bgra", "-s",
+    ])
+    .arg(format!("{width}x{height}"))
+    .args(["-i", "pipe:0", "-frames:v", "1"])
+    .arg(dst);
+    let out = crate::binaries::run_with_stdin(cmd, bgra.to_vec(), EDIT_TIMEOUT)?;
+    if !out.status.success() {
+        bail!(
+            "writing the screenshot {} failed: {}",
+            dst.display(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    if !dst.is_file() {
+        bail!(
+            "ffmpeg reported success but the screenshot {} does not exist",
+            dst.display()
+        );
+    }
+    Ok(())
+}
+
 /// Concatenate segments into one file with `-c copy`.
 ///
 /// Every segment must share identical codec parameters, which they do since they come from one

@@ -239,13 +239,26 @@ Two things the panel is honest about:
 
 The recorder bar always shows the chord in force and whether it is really installed.
 
-Two more chords exist and are **off unless you set them** in the same file:
+### Screenshots
+
+**The Screenshot button** in the recorder bar (and the optional `[hotkeys] screenshot` chord)
+saves one frame of the configured capture target as a lossless PNG in the library. It works while
+nothing is recording — that is most of the time it is useful — and it needs no game running.
+
+A screenshot is a real library entry: tag it, favourite it (which protects it from the storage
+policy), delete it. Its card shows the picture with a `PNG` chip, and its page has no player, no
+trim and no export, because there is nothing to play or cut. It cannot be combined.
+
+### The optional chords
+
+Three more chords exist and are **off unless you set them** in the same file:
 
 ```toml
 [hotkeys]
 clip = "Ctrl+F8"
 toggle_recording = "Ctrl+F9"   # start / stop the recording
 bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
+screenshot = "Ctrl+F7"         # one frame of the display → a PNG in the library
 ```
 
 ### Starting with Windows

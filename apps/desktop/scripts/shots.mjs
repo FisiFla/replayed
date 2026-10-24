@@ -929,6 +929,23 @@ function installMockSource(fixture) {
               },
       };
     },
+    async screenshotNow() {
+      const written = {
+        ...clips[0],
+        id: fixture.nextTrimId,
+        kind: 'screenshot',
+        path: `${fixture.clipsDir}\\screenshot-${fixture.trimmedAtMs}.png`,
+        duration_ms: 0,
+        codec: 'png',
+        size_bytes: 240_000,
+        favourite: false,
+        title: null,
+        created_at_ms: fixture.trimmedAtMs,
+      };
+      fixture.nextTrimId += 1;
+      clips.unshift(written);
+      return { ...written };
+    },
     async openDataDir() {
       // No file manager behind the harness; the command's real job is to spawn one.
       return undefined;

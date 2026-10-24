@@ -187,6 +187,13 @@ export interface ClipSource {
    */
   exportClip(id: number, preset: string): Promise<ExportOutcome>;
   /**
+   * Take one frame of the configured capture target and save it as a PNG in the library.
+   *
+   * Async on the backend side: it waits for the display to present a frame. A target that never
+   * presents (a minimised window, a display that went away) fails after a bounded wait.
+   */
+  screenshotNow(): Promise<ClipDto>;
+  /**
    * Show the application's data directory in the system file manager — the folder holding the
    * clips, the sessions, the index, the log and `config.toml`.
    */
@@ -361,6 +368,7 @@ export const tauriIpc: ClipSource = {
   combineClips: (ids) => invoke<ClipDto>('combine_clips', { ids }),
   exportClip: (id, preset) => invoke<ExportOutcome>('export_clip', { id, preset }),
   openDataDir: () => invoke<void>('open_data_dir'),
+  screenshotNow: () => invoke<ClipDto>('screenshot_now'),
   listSessions: () => invoke<SessionDto[]>('list_sessions'),
   sessionDetail: (sessionId) => invoke<SessionDto>('session_detail', { session_id: sessionId }),
   sessionEvents: (sessionId) =>

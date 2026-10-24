@@ -9,6 +9,11 @@ what has and has not been *verified* on real hardware, read
 ## [Unreleased]
 
 ### Added
+- **A screenshot hotkey** (`[hotkeys] screenshot`, and a **Screenshot** button in the recorder
+  bar): one frame of the configured capture target, saved as a lossless PNG in the library. It
+  needs no recording to be running. Schema v6 gives `clips` a `kind`, so a screenshot is a real
+  library entry — taggable, favouritable, counted by the storage policy — with no duration, no
+  player, no trim and no combine.
 - **Combine clips, losslessly** — tick two or more cards in the Library and press *Combine*: the
   result is their packets in order (`-c copy`), indexed as a new clip, originals untouched. Mixed
   codecs, frame sizes or audio-track counts are refused by name rather than concatenated into a

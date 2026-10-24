@@ -26,6 +26,7 @@ const assetUrl = (path: string) =>
 function clip(overrides: Partial<ClipDto> = {}): ClipDto {
   return {
     id: 1,
+    kind: 'clip',
     path: "/home/player/.local/share/replayed/clips/clip-1.mp4",
     started_at_ms: 0,
     duration_ms: 12_345,
@@ -275,6 +276,25 @@ describe("describePrune", () => {
     const message = describePrune(outcome({ failed: 3 }));
     expect(message).toContain("could not be deleted");
     expect(message).not.toContain("Nothing to remove");
+  });
+});
+
+describe("a screenshot in the view model", () => {
+  it("is marked as one, shows 'still' rather than a zero duration, and is its own picture", () => {
+    const view = toClipView(
+      clip({ kind: "screenshot", path: "/c/screenshot-1.png", duration_ms: 0, codec: "png" }),
+      assetUrl,
+    );
+    expect(view.isScreenshot).toBe(true);
+    expect(view.durationLabel).toBe("still");
+    // The card uses `assetUrl` for a screenshot, so it must be the file's own URL.
+    expect(view.assetUrl).toBe(assetUrl("/c/screenshot-1.png"));
+  });
+
+  it("leaves a clip a clip", () => {
+    const view = toClipView(clip(), assetUrl);
+    expect(view.isScreenshot).toBe(false);
+    expect(view.durationLabel).not.toBe("still");
   });
 });
 

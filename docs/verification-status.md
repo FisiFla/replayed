@@ -3506,3 +3506,54 @@ chord another application holds. The live-rebind design — a listener thread th
 and register again on command — was deliberately **not** built: without a Windows host to run it,
 a message-loop refactor whose failure mode is a silently dead hotkey is the wrong risk to take
 for a convenience.
+## 46. A screenshot hotkey, and what a PNG is in a library of clips (2026-10-24)
+
+### The design question, and the answer taken
+A screenshot is not a clip: no duration, no player, no trim, no combine, and its file *is* its
+picture. The library, though, is exactly where a user looks for it, and everything a user does to
+a clip — tag it, favourite it, protect it from the storage policy, delete it — is what they want
+to do to a screenshot. So it is a row in the **same table**, with a `kind`:
+
+- schema **v6** adds `clips.kind TEXT NOT NULL DEFAULT 'clip'`. The default is the only claim a v5
+  row supports: before this column existed there was no way to make a screenshot, so every row is
+  a video (tested: a v5 file with a row is rewound to v5, migrated, and comes back a clip).
+- `Clip.kind` stays **text**, for the reason `Session.mode` does: a kind a newer build writes must
+  be readable here. `Clip::is_screenshot()` is the only test a caller needs.
+- `Store::insert_screenshot` writes a row with no duration, `codec = "png"`, no timeline — and
+  `NewClip` is untouched, so nothing that inserts a video learned a new field to insert a still.
+
+### The pipeline
+`replayed_capture::grab_frame` opens a capture session, takes the first frame the backend offers,
+and closes it again — on every path, failure included, because a WGC session left open holds the
+display's frames. The wait is bounded (`SCREENSHOT_TIMEOUT`, 2 s) and its failure names the likely
+causes rather than hanging the window. `edit::screenshot_png` writes the BGRA frame as a PNG
+through ffmpeg's rawvideo pipe, refusing a buffer that is not `width × height × 4` before spawning
+anything — ffmpeg would read a short buffer as a truncated image and exit 0.
+
+`save_screenshot` is the command body: refuse a texture-only frame (a caller bug), write the PNG
+into the clips directory, index it. `screenshot_now` builds the backend from the configured
+`[capture]` target — on Windows WGC, off it the synthetic stub — and the recorder bar's
+**Screenshot** button and the optional `[hotkeys] screenshot` chord both land there. The button is
+not gated on a recording: a screenshot is one frame of the same target, and needing to start a
+recording first would be a restriction with no cause.
+
+In the window: a screenshot's card shows the file itself with a `PNG` chip and no duration, has no
+combine tick (there is no stream to copy), and its page shows the image instead of a player, with
+Trim and Export replaced by one sentence explaining why. `combine_clips` refuses a screenshot by
+name rather than letting the media layer fail on a file with no video stream.
+
+### Evidence
+Store 88 (+2: the screenshot row round-trips with tags and a favourite; the v5→v6 upgrade). Capture
+84 (+2: one frame from the stub, and a target that never presents failing with a named reason and
+still stopping). Media 9 integration tests (+2: a frame written as a PNG of its own size, and a
+short buffer refused before ffmpeg runs). Desktop 290 (+3: a captured frame saved, indexed and
+named; a pixel-less frame refused; a screenshot refused by combine). Frontend 349 (+3: the view
+model marks a screenshot and says "still", the card shows its own file with no tick, and the
+`kind` fixtures). fmt and clippy clean in both workspaces; `svelte-check` 0/0; the build.
+
+### What is NOT verified
+The WGC half has never run: off Windows the frame comes from the synthetic stub, so what is proven
+here is the pipeline *around* the capture, not a real screen's pixels. No screenshot has been
+taken on the box, the hotkey chord has not been pressed, and the window has not rendered a real
+PNG card. The schema upgrade was tested by rewinding a fresh database, not against a copy of a
+released v0.2.0 library.

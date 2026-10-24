@@ -534,6 +534,67 @@ pub fn delete_clip(deps: &Deps<'_>, id: i64) -> Result<DeleteOutcome, CommandErr
     Ok(outcome)
 }
 
+/// Save one captured frame as a PNG in the library.
+///
+/// The frame is already pixels in memory — the capture's job is done — so this is the media crate's
+/// [`replayed_media::edit::screenshot_png`] plus the index row. A screenshot is a first-class
+/// library entry with its own [`replayed_store::CLIP_KIND_SCREENSHOT`] kind: it can be tagged,
+/// favourited and counted by the storage policy, which is why it is a row in the same table
+/// rather than a file no surface knows about.
+///
+/// A frame delivered as a GPU texture has no bytes to write. That is a bug in the caller (it must
+/// not ask for textures), and it is refused by name rather than written as a black rectangle.
+pub fn save_screenshot(
+    deps: &Deps<'_>,
+    frame: &replayed_capture::Frame,
+) -> Result<ClipDto, CommandError> {
+    if !frame.has_pixels() {
+        return Err(CommandError::new(
+            ErrorCode::Io,
+            format!(
+                "the capture delivered a {}x{} frame as a GPU texture with no pixels, and a \
+                 screenshot needs them; nothing was saved",
+                frame.width, frame.height
+            ),
+        ));
+    }
+    let dst = free_output_path(
+        deps.paths
+            .clips_dir
+            .join(format!("screenshot-{}.png", now_ms())),
+    )?;
+    let bins = deps.binaries()?;
+    replayed_media::edit::screenshot_png(bins, frame.width, frame.height, &frame.data, &dst)
+        .map_err(|e| CommandError::media("writing the screenshot", e))?;
+
+    // The file exists from here on; a bookkeeping failure must not delete it.
+    let size_bytes = std::fs::metadata(&dst)
+        .map_err(|e| CommandError::io("sizing the screenshot", &dst, e))?
+        .len();
+    let id = deps
+        .store
+        .insert_screenshot(&replayed_store::NewScreenshot {
+            path: dst.clone(),
+            size_bytes,
+        })
+        .map_err(|e| {
+            CommandError::new(
+                ErrorCode::Store,
+                format!(
+                    "the screenshot was written to {} but could not be added to the index, so                      it will not appear in the library and the storage policy cannot manage                      it: {e:#}",
+                    dst.display()
+                ),
+            )
+        })?;
+    tracing::info!(
+        "screenshot #{id} saved: {}x{}, {size_bytes} bytes, {}",
+        frame.width,
+        frame.height,
+        dst.display()
+    );
+    Ok(ClipDto::from(&find_clip(deps.store, id)?))
+}
+
 /// Combine whole clips into one file, losslessly: the concatenation of their own packets.
 ///
 /// The refusal rules are the point, not the feature:
@@ -571,6 +632,18 @@ pub fn combine_clips(deps: &Deps<'_>, ids: &[i64]) -> Result<ClipDto, CommandErr
     let mut clips = Vec::with_capacity(ordered.len());
     for id in &ordered {
         let clip = find_clip(deps.store, *id)?;
+        if clip.is_screenshot() {
+            // A still image has no stream to copy into a concatenation; the media layer would fail
+            // on it, and the message here can say which clip and why.
+            return Err(CommandError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "clip #{id} is a screenshot ({}), and screenshots cannot be combined: they \
+                     have no video stream to concatenate",
+                    clip.path.display()
+                ),
+            ));
+        }
         if !clip.path.is_file() {
             return Err(CommandError::new(
                 ErrorCode::Io,
@@ -1306,6 +1379,80 @@ mod tests {
             err.code,
             ErrorCode::ClipNotFound,
             "a no-op update must not look like success"
+        );
+    }
+
+    // -- screenshots -----------------------------------------------------------------------
+
+    #[test]
+    fn a_captured_frame_is_saved_indexed_and_named_as_a_screenshot() {
+        use replayed_capture::{Frame, PixelFormat};
+        let f = Fixture::new();
+        let (width, height) = (32, 18);
+        let frame = Frame {
+            data: vec![0x40; (width * height * 4) as usize],
+            pts: std::time::Duration::ZERO,
+            width: width as u32,
+            height: height as u32,
+            format: PixelFormat::Bgra8,
+            texture: None,
+        };
+
+        let dto = save_screenshot(&f.deps(), &frame).expect("save the screenshot");
+
+        let path = PathBuf::from(&dto.path);
+        assert!(path.is_file(), "the PNG is on disk");
+        assert!(dto.path.ends_with(".png"), "{}", dto.path);
+        assert_eq!(dto.duration_ms, 0, "a still image has no length");
+        assert_eq!(dto.codec, "png");
+        // Indexed: it is a library entry, not a file beside one.
+        let rows = f.store.list_clips().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_screenshot());
+        let info = MediaInfo::probe(&f.bins, &path).unwrap();
+        assert_eq!(info.video.as_ref().unwrap().codec, "png");
+    }
+
+    #[test]
+    fn a_frame_with_no_pixels_is_refused_rather_than_written_black() {
+        use replayed_capture::{Frame, PixelFormat};
+        let f = Fixture::new();
+        let frame = Frame {
+            data: Vec::new(),
+            pts: std::time::Duration::ZERO,
+            width: 1920,
+            height: 1080,
+            format: PixelFormat::Bgra8,
+            texture: None,
+        };
+
+        let err = save_screenshot(&f.deps(), &frame).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Io);
+        assert!(err.message.contains("GPU texture"), "{}", err.message);
+        assert!(f.store.list_clips().unwrap().is_empty(), "nothing indexed");
+    }
+
+    #[test]
+    fn a_screenshot_cannot_be_combined_because_it_has_no_stream_to_copy() {
+        let f = Fixture::new();
+        let (clip, _) = f.add_real_clip("a.mp4", 1);
+        // A screenshot row, written straight through the store: the command that makes one needs a
+        // capture frame, and the refusal is what is under test here.
+        let shot = f
+            .store
+            .insert_screenshot(&replayed_store::NewScreenshot {
+                path: f.paths.clips_dir.join("screenshot-1.png"),
+                size_bytes: 100,
+            })
+            .unwrap();
+        std::fs::write(f.paths.clips_dir.join("screenshot-1.png"), b"png").unwrap();
+
+        let err = combine_clips(&f.deps(), &[clip, shot]).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(
+            err.message.contains("screenshots cannot be combined"),
+            "{}",
+            err.message
         );
     }
 

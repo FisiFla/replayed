@@ -38,11 +38,22 @@
     onStart: () => void;
     onStop: () => void;
     onClip: () => void;
+    /** Take one frame of the capture as a PNG in the library. Works without a recording. */
+    onScreenshot?: () => void;
     /** The failed pill is a link to the Health page when the shell provides one. */
     onOpenHealth?: () => void;
   }
 
-  let { status, app = null, busy = false, onStart, onStop, onClip, onOpenHealth }: Props = $props();
+  let {
+    status,
+    app = null,
+    busy = false,
+    onStart,
+    onStop,
+    onClip,
+    onScreenshot = () => {},
+    onOpenHealth,
+  }: Props = $props();
 
   /** The engine counters popover. The content stays in the DOM while closed (hidden), so the
    *  bar's text is the same whether or not it is open. */
@@ -90,6 +101,9 @@
         <button class="primary" type="button" onclick={onStart} disabled={busy}>Start recording</button>
       {/if}
       <button type="button" onclick={onClip} disabled={busy || mode !== 'recording'}>Save clip</button>
+      <!-- Deliberately not gated on a recording: a screenshot is one frame of the same capture
+           target, and needing to start a recording first would be a restriction with no cause. -->
+      <button type="button" onclick={onScreenshot} disabled={busy}>Screenshot</button>
       <button
         type="button"
         class="icon ghost engine-toggle"

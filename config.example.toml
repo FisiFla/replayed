@@ -269,6 +269,7 @@ clip = "Ctrl+F8"
 # Desktop app only, off unless uncommented. Each must be a chord nothing else holds:
 #   toggle_recording = "Ctrl+F9"   # start / stop the recording
 #   bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
+#   screenshot = "Ctrl+F7"         # one frame of the display → a PNG in the library
 # Only these three are read in this build. Anything else here is ignored, because the
 # config structs do not deny unknown fields.
 

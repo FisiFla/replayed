@@ -18,7 +18,7 @@ import type { ClipDto } from '../types';
 
 function clip(id: number): ClipView {
   const dto: ClipDto = {
-    id, path: `/c/${id}.mp4`, started_at_ms: 0, duration_ms: 12_345, size_bytes: 812 * 1024,
+    id, kind: 'clip', path: `/c/${id}.mp4`, started_at_ms: 0, duration_ms: 12_345, size_bytes: 812 * 1024,
     codec: 'h264', favourite: false, created_at_ms: 1_756_000_000_000, title: null, game: null,
     tags: [],
   };
@@ -161,6 +161,49 @@ describe('the clip grid', () => {
     const checklist = target.querySelector('[data-region="first-run-checklist"]');
     expect(checklist!.querySelector('kbd')?.textContent).toBe('Ctrl+F8');
     expect(checklist!.textContent).toContain('not active');
+  });
+
+  it('shows a screenshot as its own picture, with no combine tick and no duration', async () => {
+    const shot = toClipView(
+      {
+        id: 9,
+        kind: 'screenshot',
+        path: '/c/screenshot-1.png',
+        started_at_ms: 0,
+        duration_ms: 0,
+        size_bytes: 40_000,
+        codec: 'png',
+        favourite: false,
+        created_at_ms: 1_756_000_000_000,
+        title: null,
+        game: null,
+        tags: [],
+      },
+      (path) => `asset://${path}`,
+    );
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(ClipList, {
+      target,
+      props: {
+        clips: [shot],
+        thumbnails: {},
+        selectedId: null,
+        onSelect: () => {},
+        onFavourite: () => {},
+        onDelete: () => {},
+        onCopy: () => {},
+        onReveal: () => {},
+        onDragOut: () => {},
+      },
+    });
+    await tick();
+
+    const image = target.querySelector<HTMLImageElement>('.frame img');
+    expect(image?.getAttribute('src')).toBe('asset:///c/screenshot-1.png');
+    expect(target.textContent).toContain('PNG');
+    // A still image has no stream to copy, so it cannot be ticked for a combine.
+    expect(target.querySelector('input.pick')).toBeNull();
   });
 
   it('ticks the clips the window selected for combining, and only those', async () => {

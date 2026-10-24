@@ -538,6 +538,50 @@ fn open_data_dir(state: State<'_, AppState>) -> Result<(), CommandError> {
         })
 }
 
+/// How long a screenshot waits for the display to present a frame.
+///
+/// Long enough for a 30 Hz display and a compositor that is busy with a game; short enough that a
+/// minimised window or a disconnected display reports rather than hangs the window that asked.
+const SCREENSHOT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Take one frame from the configured capture target and save it as a PNG in the library.
+///
+/// A separate path from the recorder on purpose: a screenshot must work while nothing is recording
+/// (that is most of the time it is useful), and it needs one frame rather than a session. The
+/// backend is opened for this call and stopped at the end of it — [`replayed_capture::grab_frame`]
+/// is what guarantees the second half even when the first fails.
+fn take_screenshot(state: &AppState) -> Result<ClipDto, CommandError> {
+    let settings = commands::read_settings(&state.app_data_dir, &state.config_path())?;
+    let target = replayed_capture::target::CaptureTarget::from_config(
+        settings.capture_monitor,
+        &settings.capture_window,
+    );
+    // Off Windows the synthetic source's size is what a frame is; on Windows WGC reports the
+    // monitor and this is ignored.
+    let stub = replayed_capture::stub::StubConfig {
+        width: 1920,
+        height: 1080,
+        fps: settings.fps,
+    };
+    let mut backend = replayed_capture::platform::default_video_backend(stub, &target)
+        .map_err(|err| CommandError::new(commands::ErrorCode::Io, format!("{err:#}")))?;
+    // A screenshot needs the pixels on the CPU; the zero-copy path exists for the encoder, and a
+    // texture here would be a frame with nothing to write.
+    backend.deliver_textures(false);
+    let frame = replayed_capture::grab_frame(backend.as_mut(), SCREENSHOT_TIMEOUT)
+        .map_err(|err| CommandError::new(commands::ErrorCode::Io, format!("{err:#}")))?;
+    state.with_deps(|deps| commands::save_screenshot(deps, &frame))
+}
+
+/// Take a screenshot of the configured capture target.
+///
+/// Async because it waits for a frame: at 60 Hz that is a few milliseconds, but a target that
+/// presents nothing waits the whole [`SCREENSHOT_TIMEOUT`], and the window must keep answering.
+#[tauri::command(async, rename_all = "snake_case")]
+fn screenshot_now(state: State<'_, AppState>) -> Result<ClipDto, CommandError> {
+    take_screenshot(&state)
+}
+
 /// Begin a native drag of the clip's file out of the window (to Explorer, Discord, a browser
 /// upload). Called when the pointer has started dragging a library row; the OS drag loop
 /// then runs on the main thread until the drop or a cancel.
@@ -1129,6 +1173,9 @@ fn install_clip_hotkey(
     if let Some(chord) = &cfg.bookmark_hotkey {
         extras.push((background::HotkeyAction::Bookmark, chord.as_str()));
     }
+    if let Some(chord) = &cfg.screenshot_hotkey {
+        extras.push((background::HotkeyAction::Screenshot, chord.as_str()));
+    }
     background::install_hotkey(&cfg.clip_hotkey, &extras)
 }
 
@@ -1355,6 +1402,7 @@ pub fn run() {
             combine_clips,
             export_clip,
             open_data_dir,
+            screenshot_now,
             set_favourite,
             set_clip_title,
             set_clip_tags,
@@ -1523,6 +1571,21 @@ fn wire_background(
                                 Err(err) => err.message,
                             };
                             tracing::info!("the bookmark hotkey: {note}");
+                            wiring.set_last_press(note);
+                        }
+                        background::HotkeyAction::Screenshot => {
+                            let note = match shell.state().and_then(|state| take_screenshot(&state))
+                            {
+                                Ok(clip) => {
+                                    let name = Path::new(&clip.path)
+                                        .file_name()
+                                        .map(|name| name.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| clip.path.clone());
+                                    format!("screenshot saved: {name}")
+                                }
+                                Err(err) => err.message,
+                            };
+                            tracing::info!("the screenshot hotkey: {note}");
                             wiring.set_last_press(note);
                         }
                     }
