@@ -175,8 +175,9 @@ function statsFor(clips, overrides = {}) {
     clip_count: clips.length,
     total_bytes: totalBytes(clips),
     // Every fixture's clips are on disk; the one state that is about rows without files
-    // overrides this.
+    // overrides both counts.
     missing_count: 0,
+    missing_sessions: 0,
     favourite_count: favourites.length,
     favourite_bytes: totalBytes(favourites),
     cap_bytes: 50 * GIB,
@@ -678,6 +679,20 @@ function installMockSource(fixture) {
         already_missing: false,
         bytes_reclaimed: removed ? removed.size_bytes : 0,
         thumbnails_removed: removed ? 1 : 0,
+      };
+    },
+    async pruneMissing() {
+      // The fixture's phantom rows are exactly the ones the storage panel was told about:
+      // they are not in `clips`, which is the whole point of the `missingfiles` scenario (the
+      // two views count the same set). Removing them leaves every on-disk row alone.
+      const stats = fixture.stats ?? {};
+      return {
+        clips_removed: stats.missing_count ?? 0,
+        sessions_removed: stats.missing_sessions ?? 0,
+        thumbnails_removed: 0,
+        sessions_refused: 0,
+        rows_already_gone: 0,
+        failed: 0,
       };
     },
     // Sessions: the review UI the `d356b9b` feature added after this mock was written —

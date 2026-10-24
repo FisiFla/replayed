@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   basename,
   describeDelete,
+  describePrune,
   describeTrim,
   filterClips,
   gameOptions,
@@ -15,7 +16,7 @@ import {
   toClipViews,
 } from "./clips";
 import type { ClipView } from "./clips";
-import type { ClipDto, DeleteOutcome } from "./types";
+import type { ClipDto, DeleteOutcome, PruneOutcome } from "./types";
 
 const assetUrl = (path: string) =>
   `asset://localhost/${encodeURIComponent(path)}`;
@@ -189,6 +190,54 @@ describe("describeTrim", () => {
     expect(describeTrim({ startMs: 1_000, endMs: 4_000 }, written)).toContain(
       "losslessly remuxed",
     );
+  });
+});
+
+describe("describePrune", () => {
+  const outcome = (overrides: Partial<PruneOutcome> = {}): PruneOutcome => ({
+    clips_removed: 0,
+    sessions_removed: 0,
+    thumbnails_removed: 0,
+    sessions_refused: 0,
+    rows_already_gone: 0,
+    failed: 0,
+    ...overrides,
+  });
+
+  it("says plainly that an empty reconcile had nothing to do", () => {
+    const message = describePrune(outcome());
+    expect(message).toContain("Nothing to remove");
+    expect(message).not.toContain("failed");
+  });
+
+  it("names both libraries and that the disk was untouched", () => {
+    const message = describePrune(outcome({ clips_removed: 12, sessions_removed: 1 }));
+    expect(message).toContain("12 clips and 1 session");
+    expect(message).toContain("already gone");
+    expect(message).toContain("Nothing was deleted from disk");
+  });
+
+  it("uses the singular for one entry", () => {
+    const message = describePrune(outcome({ clips_removed: 1 }));
+    expect(message).toContain("1 clip");
+    expect(message).toContain("its file was");
+  });
+
+  it("reports a session that started recording before the delete as left alone", () => {
+    const message = describePrune(outcome({ clips_removed: 2, sessions_refused: 1 }));
+    expect(message).toContain("still recording");
+  });
+
+  it("separates a failure from a successful removal", () => {
+    const message = describePrune(outcome({ clips_removed: 2, failed: 1 }));
+    expect(message).toContain("2 clips");
+    expect(message).toContain("could not be removed");
+  });
+
+  it("reports an all-failed reconcile as a failure, not as nothing to do", () => {
+    const message = describePrune(outcome({ failed: 3 }));
+    expect(message).toContain("could not be deleted");
+    expect(message).not.toContain("Nothing to remove");
   });
 });
 

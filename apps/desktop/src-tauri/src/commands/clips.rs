@@ -124,6 +124,9 @@ pub fn storage_stats_at(deps: &Deps<'_>, now_ms: i64) -> Result<StorageStats, Co
         over_cap_by_bytes: plan.over_cap_by_bytes,
         planned_deletions: plan.deletions.len(),
         bytes_after: plan.bytes_after,
+        // The other library's phantoms, counted so the panel's reconciliation offer can name both:
+        // a session row has no entry in any figure above.
+        missing_sessions: super::prune::missing_sessions(deps)?,
         clips_dir: deps.paths.clips_dir.to_string_lossy().into_owned(),
         warnings: deps.warnings.to_vec(),
     })
@@ -680,7 +683,7 @@ pub fn thumbnail_file_name(clip_id: i64, at_ms: u64) -> String {
 ///
 /// The prefix match is exact about the id: `clip-1-` must not match `clip-12-0.jpg`, hence the
 /// trailing dash.
-fn remove_cached_thumbnails(dir: &Path, clip_id: i64) -> usize {
+pub(super) fn remove_cached_thumbnails(dir: &Path, clip_id: i64) -> usize {
     let prefix = format!("clip-{clip_id}-");
     let Ok(entries) = std::fs::read_dir(dir) else {
         // No cache directory is the normal case for a library whose clips were never thumbnailed.

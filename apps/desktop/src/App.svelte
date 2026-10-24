@@ -24,6 +24,7 @@
   import Toasts from './lib/components/Toasts.svelte';
   import {
     describeDelete,
+    describePrune,
     describeTrim,
     filterClips,
     gameOptions,
@@ -403,6 +404,27 @@
     }
   }
 
+  /**
+   * Remove the index rows whose files are gone, after the Storage panel's confirmation.
+   *
+   * The one command that rewrites the index from the filesystem's evidence, which is why it is
+   * user-confirmed and never automatic: a network directory that is merely offline looks the same
+   * as a library whose files were deleted, and the backend refuses in that case instead of
+   * emptying the index.
+   */
+  async function pruneMissing() {
+    busy = true;
+    try {
+      const outcome = await source.pruneMissing();
+      notice = describePrune(outcome);
+      await refresh();
+    } catch (err) {
+      error = errorMessage(err);
+    } finally {
+      busy = false;
+    }
+  }
+
   async function trimClip(id: number, range: TrimRange) {
     busy = true;
     try {
@@ -683,7 +705,7 @@
       {:else if view.kind === 'storage'}
         <section class="page" data-region="storage">
           {#if stats !== null}
-            <StoragePanel {stats} />
+            <StoragePanel {stats} {busy} onPruneMissing={pruneMissing} />
           {/if}
         </section>
       {:else if view.kind === 'health'}

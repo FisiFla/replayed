@@ -25,8 +25,8 @@ use background::{
 };
 use commands::{
     AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, DiagnosticsReport,
-    EncoderSettings, EncoderStatus, ErrorCode, RecordedClipDto, RecorderHost, RecordingStatusDto,
-    SessionDto, SessionEventDto, StorageConfigView, StorageStats, ThumbnailRef,
+    EncoderSettings, EncoderStatus, ErrorCode, PruneOutcome, RecordedClipDto, RecorderHost,
+    RecordingStatusDto, SessionDto, SessionEventDto, StorageConfigView, StorageStats, ThumbnailRef,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use replayed_media::FfmpegBinaries;
@@ -174,11 +174,28 @@ impl AppState {
             }
         };
 
+        // The startup summary says what is on disk, not what the index claims: a row whose file is
+        // gone holds no bytes and is left out of both lists, and the count of them is what tells a
+        // user why the library is smaller than the index (the storage panel offers the prune).
+        let clips = store.list_clips().unwrap_or_default();
+        let sessions = store.list_sessions().unwrap_or_default();
+        let missing_clips = clips
+            .iter()
+            .filter(|clip| replayed_store::prune::clip_is_missing(clip))
+            .count();
+        let missing_sessions = sessions
+            .iter()
+            .filter(|session| replayed_store::prune::session_is_missing(session))
+            .count();
         tracing::info!(
-            "clip index {} (schema v{}): {} clips, {} bytes",
+            "clip index {} (schema v{}): {} clip(s) on disk ({} row(s) name a file that is gone), \
+             {} session(s) ({} row(s) name a file that is gone), {} bytes",
             paths.db_path.display(),
             store.schema_version().unwrap_or(-1),
-            store.list_clips().map(|c| c.len()).unwrap_or(0),
+            clips.len() - missing_clips,
+            missing_clips,
+            sessions.len() - missing_sessions,
+            missing_sessions,
             store.total_bytes().unwrap_or(0)
         );
 
@@ -402,6 +419,13 @@ fn list_clips(state: State<'_, AppState>) -> Result<Vec<ClipDto>, CommandError> 
 #[tauri::command(rename_all = "snake_case")]
 fn storage_stats(state: State<'_, AppState>) -> Result<StorageStats, CommandError> {
     state.with_deps(commands::storage_stats)
+}
+
+/// Remove the index rows whose files are gone. The user confirms this in the Storage panel: it is
+/// the one place the shell rewrites the index from the filesystem's evidence.
+#[tauri::command(rename_all = "snake_case")]
+fn prune_missing(state: State<'_, AppState>) -> Result<PruneOutcome, CommandError> {
+    state.with_deps(commands::prune_missing)
 }
 
 /// Mark a clip as a favourite, or clear it.
@@ -1229,6 +1253,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             list_clips,
             storage_stats,
+            prune_missing,
             set_favourite,
             set_clip_title,
             set_clip_tags,

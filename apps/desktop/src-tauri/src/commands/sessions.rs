@@ -32,16 +32,35 @@ fn load_session(deps: &Deps<'_>, id: i64) -> Result<Session, CommandError> {
         .ok_or_else(|| CommandError::session_not_found(id))
 }
 
-/// Every session the index knows, newest first.
+/// Every session the index knows whose footage is on disk, newest first.
 ///
 /// The order is the store's own (`ORDER BY started_at DESC, id DESC`), not re-sorted here: one
 /// definition of "newest", the one the retention rules also use.
+///
+/// A row whose recorded file was deleted outside the application is left out, by the same rule the
+/// clips list applies (`clips_on_disk`) and for the same reason: listing it is a promise the window
+/// cannot keep — the session page would have no footage to scrub, cut from or play. The row is kept
+/// rather than deleted (a file can be temporarily unavailable) and the storage panel offers the
+/// user-confirmed reconciliation ([`prune_missing`]).
 pub fn list_sessions(deps: &Deps<'_>) -> Result<Vec<SessionDto>, CommandError> {
     let sessions = deps
         .store
         .list_sessions()
         .map_err(|e| CommandError::store("listing the sessions", e))?;
-    Ok(sessions.iter().map(SessionDto::from).collect())
+    let missing = sessions
+        .iter()
+        .filter(|session| replayed_store::prune::session_is_missing(session))
+        .count();
+    if missing > 0 {
+        tracing::debug!(
+            "skipping {missing} session row(s) from the listing: the recorded file is gone"
+        );
+    }
+    Ok(sessions
+        .iter()
+        .filter(|session| !replayed_store::prune::session_is_missing(session))
+        .map(SessionDto::from)
+        .collect())
 }
 
 /// One session's row, for the detail panel.
@@ -701,6 +720,80 @@ mod tests {
                 .code,
             ErrorCode::SessionNotFound
         );
+    }
+
+    #[test]
+    fn a_session_whose_file_is_gone_is_not_listed_but_its_row_is_kept() {
+        // The reported symptom: a session file deleted in Explorer stayed in the sidebar, and
+        // selecting it opened a page with no footage to scrub. The row is not deleted by the read
+        // (the file may be temporarily unavailable); it is left out, and the storage panel offers
+        // the user-confirmed prune.
+        let f = Fixture::new();
+        let (kept, _) = f.add_finished_session(1, 0);
+        // A second row naming a file that does not exist: the fixture always writes
+        // `session-1.mp4`, so the phantom is built by hand rather than by deleting the kept
+        // session's own file.
+        let missing_path = f
+            .paths
+            .clips_dir
+            .parent()
+            .unwrap()
+            .join("sessions-out")
+            .join("session-2.mp4");
+        let gone = f
+            .store
+            .start_session(
+                None,
+                replayed_store::SESSION_MODE_SESSION,
+                WALL_START_MS,
+                "/nowhere",
+                0,
+            )
+            .unwrap();
+        f.store
+            .end_session(
+                gone,
+                WALL_START_MS + 1_000,
+                Some(&missing_path.to_string_lossy()),
+                0,
+                0,
+            )
+            .unwrap();
+
+        let listed: Vec<i64> = list_sessions(&f.deps())
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(
+            listed,
+            vec![kept],
+            "only the session with footage is listed"
+        );
+        assert!(!listed.contains(&gone));
+        assert_eq!(
+            f.store.list_sessions().unwrap().len(),
+            2,
+            "the row itself is kept: reconciling the index is the prune's job, not a read's"
+        );
+    }
+
+    #[test]
+    fn a_buffer_session_with_no_file_is_still_listed() {
+        // "No concatenated file" is the normal state of a buffer session, not evidence that its
+        // footage is gone: the ring owns it and the clips it produced are the artefacts.
+        let f = Fixture::new();
+        let (id, _) = f.add_running_session(replayed_store::SESSION_MODE_BUFFER);
+        f.store
+            .end_session(id, WALL_START_MS + 1_000, None, 0, 0)
+            .unwrap();
+
+        let listed: Vec<i64> = list_sessions(&f.deps())
+            .unwrap()
+            .iter()
+            .map(|s| s.id)
+            .collect();
+        assert_eq!(listed, vec![id]);
     }
 
     #[test]

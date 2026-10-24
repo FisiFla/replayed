@@ -1,8 +1,10 @@
 # Production readiness and Outplayed parity plan
 
-Status: proposed. Written 2026-10-24 against `main` at `a8acaf9`. What has and has
-not been verified is recorded in [`docs/verification-status.md`](../verification-status.md);
-this plan does not upgrade any claim there.
+Status: in progress. Written 2026-10-24 against `main` at `a8acaf9`. **Phase A is
+implemented** (ledger §38 records what its tests prove and what they do not); Phases B–F are
+open. What has and has not been verified is recorded in
+[`docs/verification-status.md`](../verification-status.md); this plan does not upgrade any claim
+there.
 
 ## Goal
 
@@ -35,7 +37,7 @@ Order: correctness → parity you asked for → Windows proof → unsigned relea
 
 ## Steps
 
-### Phase A — Fix the stale index
+### Phase A — Fix the stale index (implemented; ledger §38)
 
 1. Failing tests first: folder-deleted clip must not inflate retention; folder-deleted session must not list; prune removes row + tags + events + thumbnails.
 2. Retention/cleanup plan over live files only; `Store` prune API + `prune_missing` command; Storage page "N entries point at missing files — Remove from library" (confirm; refuse when `clips_dir` unreachable).

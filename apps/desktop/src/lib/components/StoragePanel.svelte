@@ -3,26 +3,48 @@
    * The storage panel: what is on disk, what the cap is, and what the policy makes of it
    * (spec §8.1).
    *
-   * It is READ-ONLY, and says so. The cleanup pass itself belongs to the recorder
-   * (`replayed-cli`), which runs it at startup and on a timer while it is capturing; this
-   * window reports the verdict that `plan_cleanup` reaches and never deletes anything on
-   * its own initiative. A panel that appeared to manage storage without being able to
-   * would be worse than one that explains who does.
+   * The cleanup pass itself belongs to the recorder (`replayed-cli`), which runs it at
+   * startup and on a timer while it is capturing; this window reports the verdict that
+   * `plan_cleanup` reaches. The one write it can perform is the *reconciliation*: index
+   * rows whose files are gone are not listed and not counted, so the panel says how many
+   * there are and offers to remove them — after a confirmation, because deleting rows that
+   * a temporarily-offline directory made look dead would be unrecoverable in the window.
    *
-   * It owns the whole Storage view, so nothing is folded away: the figures, the usage meter
-   * and the verdict are all on screen at once.
+   * It owns the whole Storage view, so nothing is folded away: the figures, the usage meter,
+   * the verdict and the reconciliation are all on screen at once.
    */
   import { formatBytes, percentOf } from '../time';
   import type { StorageStats } from '../types';
 
   interface Props {
     stats: StorageStats;
+    /** A command is in flight; the reconciliation controls are held while it is. */
+    busy: boolean;
+    /** The user confirmed: remove the index rows whose files are gone. */
+    onPruneMissing: () => void;
   }
 
-  let { stats }: Props = $props();
+  let { stats, busy, onPruneMissing }: Props = $props();
+
+  /** The reconciliation is a two-step action, like a clip's delete. */
+  let confirming = $state(false);
 
   const usedPercent = $derived(percentOf(stats.total_bytes, stats.cap_bytes));
   const favouritePercent = $derived(percentOf(stats.favourite_bytes, stats.cap_bytes));
+  /** Both libraries' phantoms: one entry point, because one user decision. */
+  const missingTotal = $derived(stats.missing_count + stats.missing_sessions);
+  const missingLabel = $derived(
+    [
+      stats.missing_count > 0
+        ? `${stats.missing_count} ${stats.missing_count === 1 ? 'clip' : 'clips'}`
+        : null,
+      stats.missing_sessions > 0
+        ? `${stats.missing_sessions} ${stats.missing_sessions === 1 ? 'session' : 'sessions'}`
+        : null,
+    ]
+      .filter((part): part is string => part !== null)
+      .join(' and '),
+  );
 </script>
 
 <section class="panel storage">
@@ -47,14 +69,13 @@
         <dt>Clips on disk</dt>
         <dd>{stats.clip_count} <span class="muted">({stats.favourite_count} favourite)</span></dd>
       </div>
-      {#if stats.missing_count > 0}
-        <!-- Counted nowhere above, so the panel says so here: the clips list filters rows
-             whose file is gone, and a storage number that did not would contradict it. -->
+      {#if missingTotal > 0}
+        <!-- Counted nowhere above, so the panel says so here: both lists filter rows whose
+             file is gone, and a storage number that did not would contradict them. -->
         <div class="wide">
           <dt>Missing files</dt>
           <dd>
-            {stats.missing_count}
-            {stats.missing_count === 1 ? 'indexed clip' : 'indexed clips'} whose file is gone
+            {missingLabel} whose file is gone
             <span class="muted">
               — not counted or measured above; the rows stay in the index in case the file
               comes back
@@ -105,9 +126,51 @@
       <p class="verdict bad">{warning}</p>
     {/each}
 
+    {#if missingTotal > 0}
+      <div class="reconcile">
+        <p>
+          <strong>{missingTotal}</strong>
+          {missingTotal === 1 ? 'index entry points' : 'index entries point'} at {missingTotal === 1 ? 'a file' : 'files'}
+          that {missingTotal === 1 ? 'is' : 'are'} gone. Removing {missingTotal === 1 ? 'it' : 'them'} from the library
+          leaves the disk untouched — there is nothing there to delete.
+        </p>
+        {#if confirming}
+          <div class="actions">
+            <button
+              class="danger"
+              type="button"
+              disabled={busy}
+              onclick={() => {
+                confirming = false;
+                onPruneMissing();
+              }}
+            >
+              Remove {missingTotal} {missingTotal === 1 ? 'entry' : 'entries'}
+            </button>
+            <button type="button" onclick={() => (confirming = false)}>Cancel</button>
+          </div>
+          <p class="muted">
+            The index entries and their cached thumbnails go. If a directory is offline rather
+            than deleted, the removal is refused and nothing changes.
+          </p>
+        {:else}
+          <div class="actions">
+            <button
+              class="danger"
+              type="button"
+              disabled={busy}
+              onclick={() => (confirming = true)}
+            >
+              Remove from the library…
+            </button>
+          </div>
+        {/if}
+      </div>
+    {/if}
+
     <p class="muted footnote">
-      Read-only: the recorder cleans up while it is capturing; this window deletes only the
-      clip you ask it to.
+      The recorder cleans up while it is capturing; this window deletes only what you ask it
+      to.
     </p>
   </div>
 </section>
@@ -234,6 +297,27 @@
   .verdict.bad {
     border-color: var(--warn);
     background: rgba(251, 191, 36, 0.07);
+  }
+
+  /* The reconciliation: a warning-toned block with its own two-step confirmation. */
+  .reconcile {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+    padding: var(--s-3) var(--s-4);
+    border: 1px solid var(--warn);
+    border-radius: var(--r-md);
+    background: rgba(251, 191, 36, 0.07);
+    font: var(--t-small);
+  }
+
+  .reconcile p {
+    margin: 0;
+  }
+
+  .actions {
+    display: flex;
+    gap: var(--s-2);
   }
 
   .footnote {

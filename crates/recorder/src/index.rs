@@ -8,10 +8,11 @@ use anyhow::{Context, Result};
 use replayed_events::GameEvent;
 use replayed_media::edit::Chapter;
 use replayed_replay::splice::ClipMetadata;
+use replayed_store::prune::{clip_is_missing, session_is_missing};
 use replayed_store::retention::{
     execute_retention, plan_retention, RetentionOutcome, RetentionPolicy, RetentionRules,
 };
-use replayed_store::{Event, NewClip, NewEvent, Store};
+use replayed_store::{Clip, Event, NewClip, NewEvent, Session, Store};
 use std::path::{Path, PathBuf};
 
 /// Wall-clock now, in ms since the Unix epoch: the clock `clips.created_at` and the storage age rule use.
@@ -263,7 +264,36 @@ pub fn cleanup_pass(
         }
     };
 
-    let plan = plan_retention(&clips, &sessions, &policy, now_ms());
+    // The index is a cache and the filesystem is the truth: a row whose file is gone claims bytes
+    // that cannot be reclaimed, so planning over it makes the cap look fuller than the disk is and
+    // evicts live clips to pay for empty space. Plan over what is on disk; the dead rows themselves
+    // are removed by an explicit, user-confirmed prune (`replayed_store::prune`), never here — a
+    // retention read is not allowed to rewrite the library, and a network directory that is merely
+    // offline must not look like a library of deletions.
+    let live_clips: Vec<Clip> = clips
+        .iter()
+        .filter(|clip| !clip_is_missing(clip))
+        .cloned()
+        .collect();
+    let live_sessions: Vec<Session> = sessions
+        .iter()
+        .filter(|session| !session_is_missing(session))
+        .cloned()
+        .collect();
+    let missing_clips = clips.len() - live_clips.len();
+    let missing_sessions = sessions.len() - live_sessions.len();
+    if missing_clips > 0 || missing_sessions > 0 {
+        // Debug rather than warn: a pass runs at startup and on a timer, so the condition would
+        // repeat. The startup summary the desktop logs is where a user is told, and the storage
+        // panel offers the prune.
+        tracing::debug!(
+            "storage policy: {missing_clips} clip row(s) and {missing_sessions} session row(s) \
+             name a file that is gone; they were left out of the plan because they hold no bytes \
+             to reclaim"
+        );
+    }
+
+    let plan = plan_retention(&live_clips, &live_sessions, &policy, now_ms());
     let outcome = match execute_retention(store, &plan) {
         Ok(outcome) => outcome,
         Err(err) => {
@@ -343,7 +373,7 @@ pub fn cleanup_pass(
 /// A clip is kept when its index write fails — the user asked for it — but then nothing in the
 /// index knows about it: it is not in the library, and the storage policy, which plans over the
 /// rows, cannot see it either. These are those files.
-fn orphan_clips(clips_dir: &Path, rows: &[replayed_store::Clip]) -> Vec<(PathBuf, u64)> {
+fn orphan_clips(clips_dir: &Path, rows: &[Clip]) -> Vec<(PathBuf, u64)> {
     let named: std::collections::HashSet<&Path> =
         rows.iter().map(|row| row.path.as_path()).collect();
     let mut orphans = Vec::new();
@@ -724,6 +754,125 @@ mod tests {
         assert_eq!(store.list_clips().unwrap().len(), 1);
         assert!(survivor.is_file(), "an idle pass deletes nothing");
         assert_eq!(outcome.deleted(), 0);
+    }
+
+    #[test]
+    fn a_clip_row_whose_file_is_gone_does_not_make_the_cap_evict_a_live_clip() {
+        // The stale-index defect, at the layer that caused the loss: retention plans over the ROWS
+        // it is given, so a row whose file was deleted in Explorer still claims its bytes. With the
+        // live clip indexed first it is the oldest candidate, so a plan built from rows evicts it to
+        // pay for empty space and keeps the phantom. A pass plans over what is on disk instead.
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+
+        let live_path = clips_dir.join("clip-live.mp4");
+        std::fs::write(&live_path, vec![0u8; 1_000]).unwrap();
+        let live = index_clip(&store, &metadata(live_path.clone(), 1_000), 1_000).unwrap();
+
+        let dead_path = clips_dir.join("clip-dead.mp4");
+        std::fs::write(&dead_path, vec![0u8; 1_000]).unwrap();
+        let dead = index_clip(&store, &metadata(dead_path.clone(), 1_000), 2_000).unwrap();
+        // The user deleted the file in Explorer: the row is now a phantom claiming 1_000 bytes.
+        std::fs::remove_file(&dead_path).unwrap();
+
+        // A cap the live clip exactly fills, and a session store with nothing in it.
+        let storage = storage(&clips_dir, 1_000, &dir.path().join("sessions"), 1 << 30);
+        let mut report = CleanupReport::default();
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+
+        assert_eq!(
+            outcome.deleted(),
+            0,
+            "nothing is over the cap once only files on disk are counted"
+        );
+        assert!(
+            live_path.is_file(),
+            "clip #{live} is on disk and within the cap: it must not be evicted for a row that \
+             holds no bytes"
+        );
+        assert!(
+            store.list_clips().unwrap().iter().any(|c| c.id == dead),
+            "the dead row is left alone: reconciling the index with the disk is an explicit, \
+             user-confirmed prune, not a retention pass's decision"
+        );
+        assert_eq!(store.list_clips().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_session_row_whose_file_is_gone_does_not_make_the_cap_evict_a_live_session() {
+        // The sessions half of the same defect: a finished session whose concatenated file was
+        // deleted in Explorer claims `size_bytes` that no longer exists. Planning over it evicts the
+        // older live session (the plan's order is oldest-started first) and keeps the phantom.
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("clips");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        // Recent wall-clock starts: the age rule is not the one under test, and a session that
+        // started in 1970 is legitimately too old to keep.
+        let now = now_ms();
+        let live_path = sessions_dir.join("session-live.mp4");
+        std::fs::write(&live_path, vec![0u8; 1_000]).unwrap();
+        let live = store
+            .start_session(
+                Some("R6"),
+                replayed_store::SESSION_MODE_SESSION,
+                now - 2_000,
+                "/nowhere",
+                0,
+            )
+            .unwrap();
+        store
+            .end_session(
+                live,
+                now - 1_500,
+                Some(&live_path.display().to_string()),
+                1_000,
+                1_000,
+            )
+            .unwrap();
+
+        let dead_path = sessions_dir.join("session-dead.mp4");
+        std::fs::write(&dead_path, vec![0u8; 1_000]).unwrap();
+        let dead = store
+            .start_session(
+                Some("R6"),
+                replayed_store::SESSION_MODE_SESSION,
+                now - 1_000,
+                "/nowhere",
+                0,
+            )
+            .unwrap();
+        store
+            .end_session(
+                dead,
+                now - 500,
+                Some(&dead_path.display().to_string()),
+                1_000,
+                1_000,
+            )
+            .unwrap();
+        std::fs::remove_file(&dead_path).unwrap();
+
+        // A clips cap with nothing to do and a sessions cap the live session exactly fills.
+        let storage = storage(&clips_dir, 1 << 30, &sessions_dir, 1_000);
+        let mut report = CleanupReport::default();
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+
+        assert_eq!(outcome.sessions.deleted, 0);
+        assert!(
+            live_path.is_file(),
+            "session #{live} is on disk and within the cap: it must not be evicted for a row \
+             whose footage is gone"
+        );
+        assert_eq!(
+            store.list_sessions().unwrap().len(),
+            2,
+            "both rows stay: the dead one is pruned on request, never by a retention pass"
+        );
+        assert!(store.list_sessions().unwrap().iter().any(|s| s.id == dead));
     }
 
     /// The two libraries are evicted independently, and a favourite survives in each.

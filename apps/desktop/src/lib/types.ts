@@ -40,6 +40,11 @@ export interface StorageStats {
   total_bytes: number;
   /** Indexed rows whose file is gone: not counted above, and named so the panel can say so. */
   missing_count: number;
+  /**
+   * Session rows whose recorded file is gone. No clip figure covers a session, so this is the
+   * other library's phantom count and the panel offers one reconciliation for both.
+   */
+  missing_sessions: number;
   favourite_count: number;
   favourite_bytes: number;
   cap_bytes: number;
@@ -60,6 +65,25 @@ export interface ThumbnailRef {
   path: string;
   at_ms: number;
   cached: boolean;
+}
+
+/** What removing the index rows whose files are gone did. */
+export interface PruneOutcome {
+  /** Clip rows removed because their file is gone. */
+  clips_removed: number;
+  /** Session rows removed because their recorded file is gone. */
+  sessions_removed: number;
+  /** Cached thumbnails removed for those clips. */
+  thumbnails_removed: number;
+  /**
+   * Session rows the store refused because they are still recording. The plan never selects one,
+   * so a non-zero count means a session started between the plan and the delete.
+   */
+  sessions_refused: number;
+  /** Rows that no longer existed when the prune ran. */
+  rows_already_gone: number;
+  /** Rows whose delete failed; the library is unchanged for them. */
+  failed: number;
 }
 
 /** What a delete did, in the vocabulary of spec §8.2. */

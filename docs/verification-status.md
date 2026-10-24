@@ -3163,3 +3163,59 @@ and the app as a user runs it were not touched by this change, and the ledger's 
 code-signing certificate) are unchanged.
 
 
+## 38. The stale index, and the retention pass that paid for empty space (2026-10-24)
+
+### The symptom, and the three places it came from
+A clip deleted in Explorer (or a session file deleted the same way) left a row in the index. The
+clips list already hid such a row (`clips_on_disk`), so the visible half of the defect was a
+disagreement between two panels. The dangerous half was not visible at all:
+
+1. **Nothing ever pruned.** The row was kept on purpose ("a file can be temporarily
+   unavailable"), and no code path existed to remove it later. Dead rows accumulated.
+2. **Retention planned over rows.** `cleanup_pass` handed `Store::list_clips` /
+   `Store::list_sessions` straight to `plan_retention`, so a row whose file was gone still
+   claimed its recorded bytes. The plan orders oldest-first and evicts until the cap is met, so
+   a live clip *older* than the phantom was deleted to pay for bytes that were not on disk, and
+   the phantom stayed.
+3. **Sessions had no existence filter at all.** `list_sessions` listed every row, so a session
+   whose concatenated file was deleted opened a page with no footage to scrub.
+
+### The fix
+- `replayed-store::prune`: `clip_is_missing`, `session_is_missing` (a running session and a
+  buffer session with no file are both *present*), `plan_prune`, `execute_prune`, and
+  `Store::prune_clip_row` / `Store::prune_session_row` — one transaction each, removing the row
+  **with** its tags and events (a prune removes phantoms; the retention delete keeps events as
+  history and is untouched), and refusing a session that is still recording.
+- `cleanup_pass` plans over the files that are on disk only. The dead rows are left alone by the
+  pass: reconciling the index is a decision the user makes, not a retention read.
+- The shell's `list_sessions` hides rows whose file is gone, exactly as the clips list does.
+- The Storage panel counts both libraries' phantoms (`missing_count`, `missing_sessions`) and
+  offers the two-step reconciliation (`prune_missing`). It refuses when the clips directory
+  cannot be read — an offline share looks like a library whose files were all deleted — and a
+  session is only a candidate when the directory its file lived in is still reachable. The
+  startup line now states clips/sessions on disk and how many rows name a file that is gone.
+
+### The evidence that the filter is what fixes it
+The two retention tests were run with the filter removed: both fail
+(`a_clip_row_whose_file_is_gone_does_not_make_the_cap_evict_a_live_clip`,
+`a_session_row_whose_file_is_gone_does_not_make_the_cap_evict_a_live_session` — the live clip is
+deleted, the phantom kept), and pass with it. In both, the phantom is *newer* than the live
+artefact, which is the ordering that turns stale bytes into a deletion of real footage.
+
+On the host, all green: `cargo fmt --all --check`; workspace clippy `-D warnings`; the workspace
+test suite with `replayed-encoder/test-encoders`; the desktop crate's `cargo test` and clippy;
+`svelte-check` (0 errors, 0 warnings); `vitest` (309); the production build. New tests: 10 in
+`replayed-store::prune`, 2 in the recorder (the discriminating pair above), 7 in
+`commands::prune`, 2 for the sessions list, 5 in `StoragePanel.test.ts`, 6 for `describePrune`.
+
+### What is NOT verified
+Nothing here ran on Windows, and no real library was reconciled. Specifically:
+
+- The Clips-tab delete's suspected locked-file ghost was **not reproduced**, so nothing was
+  changed for it. If a delete reports `orphaned_path`, the file is still on disk and a later
+  prune will *not* remove its row (the file is not missing) — that is the honest state.
+- The reconciliation button has been driven in jsdom (`StoragePanel.test.ts`) and the screenshot
+  harness gained a `pruneMissing` fake, but no one has clicked it in a real window against a
+  real directory.
+- The reachability guard is tested by removing the clips directory outright. A real network
+  mount that goes offline (stale handles, ESTALE) was not exercised.

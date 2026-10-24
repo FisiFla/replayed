@@ -44,7 +44,7 @@ const clipA: ClipDto = {
 };
 const clipB: ClipDto = { ...clipA, id: 2, path: '/c/b.mp4' };
 const stats: StorageStats = {
-  clip_count: 1, total_bytes: 5_000_000, missing_count: 0, favourite_count: 0, favourite_bytes: 0,
+  clip_count: 1, total_bytes: 5_000_000, missing_count: 0, missing_sessions: 0, favourite_count: 0, favourite_bytes: 0,
   cap_bytes: 10_000_000_000, max_age_days: 30, cap_met: true, over_cap_by_bytes: 0,
   planned_deletions: 0, bytes_after: 5_000_000, clips_dir: '/c', warnings: [],
 };

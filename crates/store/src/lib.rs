@@ -9,6 +9,7 @@
 
 pub mod cleanup;
 pub mod matches;
+pub mod prune;
 pub mod retention;
 
 use anyhow::{Context, Result};

@@ -158,6 +158,10 @@ pub struct StorageStats {
     /// Indexed rows whose file is gone: not counted above, and named here rather than
     /// silently dropped.
     pub missing_count: usize,
+    /// Session rows whose recorded file is gone. Not counted in any figure above either — a
+    /// session has no entry in `clip_count`/`total_bytes` — and named so the panel can offer the
+    /// reconciliation for both libraries at once.
+    pub missing_sessions: usize,
     pub favourite_count: usize,
     pub favourite_bytes: u64,
     pub cap_bytes: u64,
@@ -206,6 +210,28 @@ pub struct DeleteOutcome {
     pub bytes_reclaimed: u64,
     /// Cached thumbnails for this clip that were removed with it.
     pub thumbnails_removed: usize,
+}
+
+/// What removing the index rows whose files are gone did.
+///
+/// Counts rather than ids: the window reports what happened and refreshes, and a list of ids it
+/// would not use is another thing to keep true.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct PruneOutcome {
+    /// Clip rows removed because their file is gone.
+    pub clips_removed: usize,
+    /// Session rows removed because their recorded file is gone.
+    pub sessions_removed: usize,
+    /// Cached thumbnails removed for those clips (best effort; a stale JPEG is not a failure).
+    pub thumbnails_removed: usize,
+    /// Session rows the store refused because they are still recording. The plan never selects
+    /// one, so a non-zero count means a session started between the plan and the delete: nothing
+    /// was touched for those ids, and the next prune sees them again.
+    pub sessions_refused: usize,
+    /// Rows that no longer existed when the prune ran (a concurrent pass got there first).
+    pub rows_already_gone: usize,
+    /// Rows whose delete failed. The affected library is unchanged for them.
+    pub failed: usize,
 }
 
 /// The displays this machine has, and the one the capture is pointed at.
@@ -303,6 +329,7 @@ mod tests {
                 "favourite_count",
                 "max_age_days",
                 "missing_count",
+                "missing_sessions",
                 "over_cap_by_bytes",
                 "planned_deletions",
                 "total_bytes",

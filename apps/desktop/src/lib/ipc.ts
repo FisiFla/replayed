@@ -34,6 +34,7 @@ import type {
   GsiTarget,
   Health,
   MatchDto,
+  PruneOutcome,
   RecordedClip,
   RecordingStatus,
   SessionDto,
@@ -163,6 +164,16 @@ export interface ClipSource {
   trimClip(id: number, startMs: number, endMs: number): Promise<ClipDto>;
   thumbnail(id: number, atMs: number): Promise<ThumbnailRef>;
   deleteClip(id: number): Promise<DeleteOutcome>;
+  /**
+   * Remove the index rows whose files are gone, from both libraries. This is the one command
+   * that rewrites the index from the filesystem's evidence, so the Storage panel asks for
+   * confirmation first; the row's files are already gone and nothing here deletes anything.
+   *
+   * Refused when the clips directory cannot be read (an offline or unmounted directory looks
+   * exactly like a library whose clips were all deleted), and a session that is still recording
+   * is never removed.
+   */
+  pruneMissing(): Promise<PruneOutcome>;
   /**
    * Sessions: one recording, the file it was concatenated into, and the markers on its
    * timeline. Read-only apart from the favourite flag and deletion — the engine that writes
@@ -329,6 +340,7 @@ export const tauriIpc: ClipSource = {
     invoke<ClipDto>('trim_clip', { id, start_ms: startMs, end_ms: endMs }),
   thumbnail: (id, atMs) => invoke<ThumbnailRef>('thumbnail', { id, at_ms: atMs }),
   deleteClip: (id) => invoke<DeleteOutcome>('delete_clip', { id }),
+  pruneMissing: () => invoke<PruneOutcome>('prune_missing'),
   listSessions: () => invoke<SessionDto[]>('list_sessions'),
   sessionDetail: (sessionId) => invoke<SessionDto>('session_detail', { session_id: sessionId }),
   sessionEvents: (sessionId) =>

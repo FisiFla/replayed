@@ -6,7 +6,7 @@
 
 import { formatBytes, formatDateTime, formatDuration } from './time';
 import { isClick } from './markers';
-import type { ClipDto, DeleteOutcome, TrimRange } from './types';
+import type { ClipDto, DeleteOutcome, PruneOutcome, TrimRange } from './types';
 
 /** One row of the clip list. */
 export interface ClipView {
@@ -159,6 +159,43 @@ export function describeDelete(outcome: DeleteOutcome, name: string): string {
     return `${name} was removed from the index; its file was already gone.`;
   }
   return `${name} deleted, freeing ${formatBytes(outcome.bytes_reclaimed)}.`;
+}
+
+/**
+ * What a reconciliation of the index with the disk did, in one sentence.
+ *
+ * Two counts, because the libraries are separate: a session row has no clip to be counted in.
+ * "Nothing to remove" is not a failure — a second press is allowed, and so is a press after the
+ * files came back (a network directory that was briefly offline).
+ */
+export function describePrune(outcome: PruneOutcome): string {
+  const plural = (n: number, one: string) => `${n} ${one}${n === 1 ? '' : 's'}`;
+  const parts: string[] = [];
+  if (outcome.clips_removed > 0) parts.push(plural(outcome.clips_removed, 'clip'));
+  if (outcome.sessions_removed > 0) parts.push(plural(outcome.sessions_removed, 'session'));
+
+  if (parts.length === 0) {
+    if (outcome.failed > 0) {
+      return (
+        `Nothing could be removed: ${plural(outcome.failed, 'index entry')} could not be ` +
+        'deleted. The library is unchanged; the log names the rows.'
+      );
+    }
+    return 'Nothing to remove: every entry in the index has its file.';
+  }
+
+  let line =
+    `Removed ${parts.join(' and ')} from the index; ` +
+    `${parts.length === 1 ? 'its file was' : 'their files were'} already gone. ` +
+    'Nothing was deleted from disk.';
+  if (outcome.sessions_refused > 0) {
+    line +=
+      ` ${plural(outcome.sessions_refused, 'session')} is still recording and was left alone.`;
+  }
+  if (outcome.failed > 0) {
+    line += ` ${plural(outcome.failed, 'index entry')} could not be removed; the log names which.`;
+  }
+  return line;
 }
 
 /**
