@@ -8,6 +8,16 @@ what has and has not been *verified* on real hardware, read
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-10-24
+
+The production-readiness and Outplayed-parity work from the 2026-10-24 plan: the stale index and
+its reconciliation, automatic full-session as a first-class feature, combine and the export
+presets, the screenshot hotkey, and the settings the panel was missing. It was verified on the
+Windows test machine — the workspace suite, the desktop crate, `cargo xtask verify` (29 checks, 0
+failed), a real 4K WGC frame written as a PNG, autostart and hide-on-close — and the ledger
+(`docs/verification-status.md` §38–§51) records exactly what each run proved and what it did not.
+A real game with an integration has **not** been exercised against this build.
+
 ### Added
 - **A screenshot hotkey** (`[hotkeys] screenshot`, and a **Screenshot** button in the recorder
   bar): one frame of the configured capture target, saved as a lossless PNG in the library. It

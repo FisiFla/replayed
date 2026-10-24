@@ -1,7 +1,7 @@
 {
   "name": "replayed-desktop",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.2.1",
   "type": "module",
   "description": "replayed desktop shell (Tauri v2 + Svelte 5) — Phase 2 session review UI",
   "scripts": {

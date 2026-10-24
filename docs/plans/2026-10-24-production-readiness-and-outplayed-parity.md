@@ -26,8 +26,12 @@ verification harness — one criterion fails there.** Written 2026-10-24 against
   runs at ~60 Hz, so the picker cannot offer 120 (the probe's ceiling at 4K is ~155 fps, §49). The
   **72-hour soak is dropped by the owner's decision** (§48) — a measurement that will not be made,
   not one that was failed.
-- **Open:** step 9's release (publish v0.2.0, install, v0.2.1, self-update proof) and Phase E's
-  signing — both need credentials and a release page, not a host.
+- **Step 9 is prepared and not executed.** No tag has ever been cut; the tree is now version
+  `0.2.1` with a `[0.2.1]` changelog section the updater's notes extractor matches, and the
+  sidecar pin has been verified on the box (fetch + SHA-256 + the two binaries run, ledger §52).
+  Publishing `v0.2.0`/`v0.2.1`, installing and watching it update needs the owner's go-ahead on a
+  push and a release page.
+- **Open:** Phase E's signing — a certificate, and nothing else waits on it.
 - Phase F is deferred until after 1.0 by the plan's own ordering.
 
 What has and has not been verified is recorded in

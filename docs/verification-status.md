@@ -3832,3 +3832,30 @@ crate, `xtask verify`, a real 4K screenshot, autostart, hide-on-close, the hotke
 the startup line against a real library (§47–§51). 4K120 remains unmeasurable here: the display the
 capture targets runs at ~60 Hz, so the picker cannot offer 120 and the live path cannot be measured
 at 120 on this machine (the probe's own ceiling at 4K is ~155 fps, §49).
+## 52. Release preparation: versions, notes, and the sidecar pin verified (2026-10-24)
+
+Step 9 of the plan is "publish unsigned `v0.2.0`; install; publish `v0.2.1`; prove the
+self-update". It needs a push and a release page, so nothing has been published — but everything
+that can be prepared and *checked* without the remote has been:
+
+- **`git ls-remote --tags` returns nothing**: no tag has ever been cut, locally or on GitHub. So
+  the first release is the first tag, and the plan's `v0.2.0 → v0.2.1` update test starts from a
+  blank slate.
+- **The version now says what it is.** `0.2.0` was the version in the manifest, the Tauri config,
+  the frontend package and the lockfile, while `main` had moved a long way past the `[0.2.0]`
+  changelog section. It is **0.2.1** in all five places (workspace `Cargo.toml`, the desktop
+  crate's `Cargo.toml`, `tauri.conf.json`, `package.json`, `package-lock.json`), the config test
+  that pins the Tauri version to the workspace one updated with it, and `CHANGELOG.md` gained a
+  `## [0.2.1] - 2026-10-24` section (what this session's work is, with a pointer to the ledger).
+  The release workflow's notes extractor matches exactly that heading shape
+  (`^## \[<version>\]`), which was read rather than assumed.
+- **The sidecar pin resolves and verifies, on Windows.** `cargo xtask sidecars fetch --target
+  x86_64-pc-windows-msvc` on the box: the recorded SHA-256 matched the archive BtbN served
+  (`6b264b9e…`), 48 archive entries were inspected with only `bin/ffmpeg.exe` and `bin/ffprobe.exe`
+  allowlisted into `binaries/`, and both extracted binaries ran (`ffmpeg version
+  n9.0.2-17-g2a571b6068-20260930`). That is the dependency gate the release build runs, and it
+  passes today rather than at release time.
+
+What remains is not preparation: pushing `main`, cutting the tag(s), and installing the result to
+watch it update — decisions and a release page, not code or measurements. The `0.2.1` bump is
+committed on `main` and **not tagged**.

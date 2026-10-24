@@ -2145,7 +2145,7 @@ mod tests {
             "the installed exe is replayed, as the crates and the CLI are"
         );
         assert_eq!(
-            config["version"], "0.2.0",
+            config["version"], "0.2.1",
             "in step with the workspace version"
         );
 
