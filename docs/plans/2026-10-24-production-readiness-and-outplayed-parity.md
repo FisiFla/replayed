@@ -1,14 +1,20 @@
 # Production readiness and Outplayed parity plan
 
-Status: **every code step is implemented; the computer-facing ones are not run.** Written
-2026-10-24 against `main` at `a8acaf9`.
+Status: **every code step is implemented, and the Windows box has run the suite and the
+verification harness — one criterion fails there.** Written 2026-10-24 against `main` at
+`a8acaf9`.
 
 - Phase A (§38), Phase B (§39), and Phase D's steps 10–13 (§42–§46) are implemented and tested
-  on the development host.
+  on the development host — and the workspace suite, the screenshot frame and `xtask verify`
+  have now been run on the Windows box too (§47).
 - Step 8's probe fix is in (§40); its Windows verification is not.
-- **Open, and not for a host without Windows:** Phase C's manual sweep (the box, real games,
-  `xtask verify`, 4K120, the 72-hour soak, #79 closed on evidence), step 9's release (publish
-  v0.2.0, install, v0.2.1, self-update proof), Phase E's signing.
+- **Phase C is started on the box (ledger §47), and not clean:** the workspace suite is exit 0
+  there after three Windows-only findings, a real 4K frame becomes a PNG, and `xtask verify`
+  reports 27/28 passed — the steady-state CPU criterion is missed at 5.2–5.5% against a < 5%
+  target on two runs. Real-game sessions, 4K120, the 72-hour soak and closing #79 on evidence
+  remain.
+- **Open:** step 9's release (publish v0.2.0, install, v0.2.1, self-update proof) and Phase E's
+  signing — both need credentials and a release page, not a host.
 - Phase F is deferred until after 1.0 by the plan's own ordering.
 
 What has and has not been verified is recorded in
