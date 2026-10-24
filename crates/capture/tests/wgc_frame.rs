@@ -73,8 +73,17 @@ fn one_real_frame_is_captured_and_written_as_a_png() {
     );
 
     let bin = replayed_media::FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+    // By default the PNG goes in a temporary directory and dies with it. A verification run that
+    // wants to *look* at the frame — the tray icon, the window, the empty library's checklist —
+    // sets `REPLAYED_WGC_FRAME_OUT` to a path and gets to keep it.
+    let keep = std::env::var_os("REPLAYED_WGC_FRAME_OUT").map(std::path::PathBuf::from);
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let dst = dir.path().join("screenshot.png");
+    let dst = keep
+        .clone()
+        .unwrap_or_else(|| dir.path().join("screenshot.png"));
+    if let Some(parent) = keep.as_ref().and_then(|path| path.parent()) {
+        std::fs::create_dir_all(parent).expect("the frame's destination directory");
+    }
     replayed_media::edit::screenshot_png(&bin, frame.width, frame.height, &frame.data, &dst)
         .expect("the frame written as a PNG");
 
