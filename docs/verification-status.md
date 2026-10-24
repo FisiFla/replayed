@@ -3918,3 +3918,37 @@ exactly one `ControlType.Window` element.
 run there — only `dist` was shipped), then `npm run dev` beside the binary, or build through
 `npm run tauri -- build`. The UIA dump is the instrument that worked: it read the error page's text
 character for character where a screenshot only suggested it.
+
+### It was the missing `node` on PATH — and then the UI was there
+`npm install` in `apps/desktop` on the box succeeded (one EBADENGINE warning: the machine's portable
+Node is 22.14, the package asks for ≥22.22). `npm run dev` still failed with `'"node"' is not
+recognized`, because npm's `vite` shim execs `node` from `PATH` and that machine has no Node on
+`PATH` at all. With `C:\Users\Flavio\nodeportable\node-v22.14.0-win-x64` prepended, Vite served the
+page and UI Automation read the window (**1942x1376**, title `replayed`) as:
+
+```
+Group | Main
+ListItem | Library   Button | Library
+ListItem | Sessions  Button | Sessions
+ListItem | Storage   Button | Storage
+ListItem | Health    Button | Health
+ListItem | Settings  Button | Settings
+Text | not recording
+Text | Automatic recording is off.
+Button | Start recording   Button | Save clip   Button | Screenshot   Button | Engine counters
+Text | Library   Text | 0 indexed
+Edit | Search clips   ComboBox | Filter by game   ComboBox | Filter by tag
+Text | Nothing recorded yet
+ListItem | Press Start recording in the bar above. The buffer fills in memory and writes nothing until something is kept.
+ListItem | Play. Press Ctrl+F8 - or Save clip - and the last 30 seconds plus the next 5 are written.
+ListItem | Find it here. The clip is indexed and appears in this grid; the Storage page names the folder it is in.
+```
+
+That is **the parity UI this session built, on real Windows**: the Sessions and Storage pages, the
+**Screenshot** button next to Save clip, the 0-indexed Library with its search and both filters, and
+the first-run checklist's three steps. The empty library is the box's real state (0 clips, the 11
+phantom rows are not listed). What it still does not show is a *recording* running, a clip in the
+grid, or a game — those need the real-game session, which remains open.
+
+`Test-NetConnection` reported 5173 unreachable while the app was demonstrably loading it: a
+false negative worth remembering — the page text is better evidence than a port probe.
