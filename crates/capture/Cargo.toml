@@ -13,6 +13,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# The Windows-only frame test writes its frame through the media crate's PNG writer: the same
+# function the screenshot command uses, so the test measures the real path.
+replayed-media.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-core = "0.62"

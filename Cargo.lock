@@ -914,6 +914,7 @@ name = "replayed-capture"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "replayed-media",
  "serde",
  "serde_json",
  "tempfile",
