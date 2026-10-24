@@ -3691,3 +3691,37 @@ honest options are the maintainer's:
 
 Until one of those is chosen, the ledger says the criterion fails on this box, with the numbers
 and the context that explain why the same code once read 3.1–4.0%.
+## 49. #79 does not reproduce — with the fix or without it — and the desktop suite is green (2026-10-24)
+
+### Issue #79: the probe now measures on the box, and the fix is not why
+The issue's symptom was `IMFTransform::ProcessOutput: Catastrophic failure (0x8000FFFF)` during the
+hardware-encoder throughput probe on this machine. On the box today:
+
+| code | the probe's Windows-only test (`the_hardware_encoders_rate_is_measured_the_same_way_on_every_run`) |
+|---|---|
+| **with** this session's probe changes (`main`) | **PASS** — 155.5, 156.4, 156.2 fps at 3840x2160 |
+| **without** them (`68be4d8`, before the probe change) | **PASS** — 152.4, 156.9, 156.4 fps at 3840x2160 |
+
+and the harness's own probe measured the hardware path three times in the verify runs
+(156.4, 153.2 and 155.8 fps at 3840x2160).
+
+**So the failure does not reproduce on this machine, and this session's change is not what fixed
+it** — the pre-fix code passes the same test, three measurements in a row, minutes apart. What the
+change did do is remove two real differences between the probe and the recording (it re-submitted
+one texture where the recording hands over a new one; it told the encoder a one-frame-per-second
+timeline where the recording's is `1/fps`) and make a failure report the transform's state. Those
+are worth keeping on their own terms; claiming them as #79's fix would be claiming evidence this
+run does not support.
+
+What is *not* explained: what was different on 2026-10-21 (a driver update, a machine state, a
+different session, or the probe failing only under some inputs). #79 can be closed as **not
+reproducible**, with this table as the evidence, rather than as "fixed".
+
+### The desktop crate's suite on the box: 283 passed, 0 failed
+Ran over SSH after one finding: `the_hotkey_status_is_honest_about_what_this_build_can_do`
+asserts that Ctrl+F8 registers on Windows, which it does **in the logged-on session** and not from
+an SSH shell (session 0, no interactive desktop). Reproduced both ways on the box — fails over SSH,
+passes through a scheduled task in the interactive session — so the test now skips with that reason
+when `SESSIONNAME` is unset (the tell for an SSH/service session), and still asserts the real thing
+wherever there is a desktop to judge it on. Everything else in that crate passes on Windows too,
+the autostart sync included (its fake `reg.exe` boundary is what makes it host-independent).
