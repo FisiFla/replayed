@@ -7,12 +7,16 @@ verification harness — one criterion fails there.** Written 2026-10-24 against
 - Phase A (§38), Phase B (§39), and Phase D's steps 10–13 (§42–§46) are implemented and tested
   on the development host — and the workspace suite, the screenshot frame and `xtask verify`
   have now been run on the Windows box too (§47).
-- Step 8's probe fix is in (§40); its Windows verification is not.
+- Step 8's probe fix is in (§40) and #79 **does not reproduce** on the box — the probe's
+  Windows-only test passes there both with and without the fix (§49), so the issue is closable as
+  not-reproducible, not as fixed.
 - **Phase C is started on the box (ledger §47), and not clean:** the workspace suite is exit 0
   there after three Windows-only findings, a real 4K frame becomes a PNG, and `xtask verify`
-  reports 27/28 passed — the steady-state CPU criterion is missed at 5.2–5.5% against a < 5%
-  target on two runs. Real-game sessions, 4K120, the 72-hour soak and closing #79 on evidence
-  remain.
+  reports 27/28 passed — the steady-state CPU criterion is missed at 5.2–7.5% against a < 5%
+  target on four runs, because the box's desktop offers ~58 frames/s (ledger §48 puts the choice
+  of how to resolve that to the maintainer). The desktop crate's suite is 283/283 there (§49).
+  Real-game sessions, 4K120 and the 72-hour soak remain; the soak needs the owner's consent for a
+  three-day capture on their machine.
 - **Open:** step 9's release (publish v0.2.0, install, v0.2.1, self-update proof) and Phase E's
   signing — both need credentials and a release page, not a host.
 - Phase F is deferred until after 1.0 by the plan's own ordering.
