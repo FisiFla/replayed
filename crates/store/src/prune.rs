@@ -233,39 +233,41 @@ impl Store {
     ///
     /// The row is removed whatever it names, for the reason [`Store::prune_clip_row`] gives.
     pub fn prune_session_row(&self, id: i64) -> Result<PruneRow> {
-        let row: Option<Option<i64>> = self
-            .conn
-            .query_row(
-                "SELECT ended_at FROM sessions WHERE id = ?1",
-                params![id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let Some(ended_at) = row else {
-            return Ok(PruneRow::AlreadyGone);
-        };
-        if ended_at.is_none() {
-            return Ok(PruneRow::Refused);
-        }
         let tx = self.conn.unchecked_transaction()?;
+        // One no-op write first, and the reason is the transaction, not the value: it acquires the
+        // database's write lock, so from here until the commit nothing else can end, start or
+        // delete this row. The rowcount is what the check below reads: 1 means the row exists and
+        // is finalised, 0 means it is gone or still recording. A `SELECT` first would not do —
+        // reading does not take the lock, and a session that started recording between the read
+        // and the event delete would lose its timeline on the way to being refused.
+        let finalised = tx.execute(
+            "UPDATE sessions SET ended_at = ended_at WHERE id = ?1 AND ended_at IS NOT NULL",
+            params![id],
+        )?;
+        if finalised == 0 {
+            let exists: Option<i64> = tx
+                .query_row("SELECT id FROM sessions WHERE id = ?1", params![id], |r| {
+                    r.get(0)
+                })
+                .optional()?;
+            // Dropping the transaction rolls it back; the update changed no value either way.
+            return Ok(if exists.is_none() {
+                PruneRow::AlreadyGone
+            } else {
+                PruneRow::Refused
+            });
+        }
+        // The row is finalised and this call holds the write lock: its events go with it, and the
+        // clips cut out of it survive as first-class artefacts (their `session_id` cleared, as a
+        // normal session delete leaves them).
         tx.execute("DELETE FROM events WHERE session_id = ?1", params![id])?;
         tx.execute(
             "UPDATE clips SET session_id = NULL WHERE session_id = ?1",
             params![id],
         )?;
-        let removed = tx.execute(
-            "DELETE FROM sessions WHERE id = ?1 AND ended_at IS NOT NULL",
-            params![id],
-        )?;
+        tx.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         tx.commit()?;
-        Ok(if removed == 1 {
-            PruneRow::Removed
-        } else {
-            // The row was there when this call read it, so a zero rowcount means another writer
-            // ended or deleted it between the read and the write. Either way this call removed
-            // nothing.
-            PruneRow::AlreadyGone
-        })
+        Ok(PruneRow::Removed)
     }
 }
 
@@ -548,6 +550,15 @@ mod tests {
                 1_000,
             )
             .unwrap();
+        store
+            .insert_event(&NewEvent {
+                session_id: Some(id),
+                kind: "game_start".into(),
+                at_ms: 0,
+                payload: None,
+                clip_id: None,
+            })
+            .unwrap();
         let plan = plan_prune(&[], &store.list_sessions().unwrap());
         // It starts recording again (a re-used id, a re-opened row: whatever the cause, the row is
         // now live footage).
@@ -560,5 +571,11 @@ mod tests {
         assert!(outcome.sessions_removed.is_empty());
         assert_eq!(outcome.sessions_refused, vec![id]);
         assert_eq!(count(&store, "SELECT COUNT(*) FROM sessions"), 1);
+        assert_eq!(
+            count(&store, "SELECT COUNT(*) FROM events"),
+            1,
+            "a refused session keeps its timeline: the refusal is decided under the same write \
+             lock as the delete, so nothing of it was touched"
+        );
     }
 }
