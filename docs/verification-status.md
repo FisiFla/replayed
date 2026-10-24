@@ -3725,3 +3725,20 @@ passes through a scheduled task in the interactive session — so the test now s
 when `SESSIONNAME` is unset (the tell for an SSH/service session), and still asserts the real thing
 wherever there is a desktop to judge it on. Everything else in that crate passes on Windows too,
 the autostart sync included (its fake `reg.exe` boundary is what makes it host-independent).
+
+### And the criterion that failed was then changed, with the owner's decision
+§48 put three options to the owner rather than moving the target under a failing check. The answer
+was **make it frame-rate-aware**, and that is what `xtask verify` does now:
+
+- the verdict is `CPU <= 3.5% + 0.08% × offered frames/s` of one core;
+- the old fixed `5%` is still printed beside the verdict, so both numbers are visible;
+- with no frame data the old `5%` is the bound, so a run whose status lines did not parse still
+  means something;
+- the coefficients are **fitted** to the five measurements on record (3.1–4.0% on a quiet screen in
+  §15; 5.22, 5.49, 5.55 and 7.45% at 58–60/s offered in §48), and the criterion text says so. A
+  regression is still caught: +2 points at 4K60 sits outside the envelope, and issue #1's 50.8% is
+  nowhere near it. The unit test pins all six numbers against the bound.
+
+The 72-hour soak is **dropped from Phase C by the owner's decision**: it would capture their desktop
+for three days on their machine and write hundreds of gigabytes. It is not a criterion that was
+failed; it is a measurement that will not be made, and the plan says so.
