@@ -3605,8 +3605,9 @@ see below), twice, `--seconds 20`, 4K capture, hardware encoder:
 
 | run | verdict | the failure |
 |---|---|---|
-| 1 | 27 passed, 1 failed, 2 not performed | steady-state CPU **5.22%** of one core vs a **< 5%** target |
-| 2 | 28 passed, 1 failed, 1 not performed | steady-state CPU **5.49%** of one core |
+| 1 (by hand, `schtasks`) | 27 passed, 1 failed, 2 not performed | steady-state CPU **5.22%** of one core vs a **< 5%** target |
+| 2 (by hand, `schtasks`) | 28 passed, 1 failed, 1 not performed | steady-state CPU **5.49%** of one core |
+| 3 (the repo's own script, after the SID fix) | 28 passed, 1 failed, 1 not performed | steady-state CPU, same criterion |
 
 Everything else that could run passed: capture started, the encoder sustained the rate
 (`dropped=3`, all during encoder startup), audio arrived, the clip was written, the timeline was
@@ -3629,8 +3630,10 @@ one would be a guess; the honest state is "the criterion is missed and the cause
 `Register-ScheduledTask : No mapping between account names and security IDs was done (0x80070534)`.
 It named the principal `"$env:USERDOMAIN\$env:USERNAME"`, and an SSH session on a workgroup
 machine reports `USERDOMAIN=WORKGROUP`, which does not resolve. The principal is named by **SID**
-now (`WindowsIdentity::GetCurrent().User.Value`), which needs no domain lookup. The runs above
-used the same one-shot `schtasks` pattern by hand, which is why they happened at all.
+now (`WindowsIdentity::GetCurrent().User.Value`), which needs no domain lookup. Runs 1 and 2 used
+the same one-shot `schtasks` pattern by hand; run 3 was the fixed script itself, which registered
+the task, waited for the marker, read the exit code, printed the report's verdict and unregistered
+the task — so the fix is confirmed on the machine that exposed the bug.
 
 ### Still not run on the box
 The desktop shell's own `cargo test` (it needs `apps/desktop/dist`, which was shipped over, and
