@@ -3742,3 +3742,27 @@ was **make it frame-rate-aware**, and that is what `xtask verify` does now:
 The 72-hour soak is **dropped from Phase C by the owner's decision**: it would capture their desktop
 for three days on their machine and write hundreds of gigabytes. It is not a criterion that was
 failed; it is a measurement that will not be made, and the plan says so.
+
+### The run that passed
+With the criterion in place, `xtask verify` ran on the box through the repo's own script
+(`--seconds 45`) and returned **exit 0**:
+
+> **PASS with 1 check(s) not performed (on this machine, this run)** — 29 passed, 0 failed, 1 not
+> performed.
+
+The CPU row reads: **6.55% of one core over a 34.3 s window, at 58.5 frames/s offered (pacer
+skipped 1366), bound 8.18%** — and prints the old fixed target of 5.00% beside it. The one
+_not performed_ check is still the silence detector, which needs a non-48 kHz converted endpoint.
+
+**Phase C's `cargo xtask verify` gate is therefore met on the box**, on a build that contains every
+change in this session. What that run does and does not cover is in the report itself: it drives
+the real WGC capture, the real NVENC encode, the splicer and the index; it says nothing about a
+real game being played, which is still open.
+
+### GitHub, on the owner's instruction
+- **#79 was closed as not reproducible**, with the A/B table from §49 attached as a comment. The
+  comment says in as many words that this session's probe change is *not* what fixed it, and that
+  the change is kept on its own merits.
+- **#93 was opened** for the CPU criterion: the four failing runs, the offered-frame-rate analysis,
+  the envelope that replaced the fixed target, and the open question of whether an envelope is the
+  right long-term shape.

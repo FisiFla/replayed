@@ -10,13 +10,17 @@ verification harness — one criterion fails there.** Written 2026-10-24 against
 - Step 8's probe fix is in (§40) and #79 **does not reproduce** on the box — the probe's
   Windows-only test passes there both with and without the fix (§49), so the issue is closable as
   not-reproducible, not as fixed.
-- **Phase C is started on the box (ledger §47), and not clean:** the workspace suite is exit 0
-  there after three Windows-only findings, a real 4K frame becomes a PNG, and `xtask verify`
-  reports 27/28 passed — the steady-state CPU criterion is missed at 5.2–7.5% against a < 5%
-  target on four runs, because the box's desktop offers ~58 frames/s (ledger §48 puts the choice
-  of how to resolve that to the maintainer). The desktop crate's suite is 283/283 there (§49).
-  Real-game sessions, 4K120 and the 72-hour soak remain; the soak needs the owner's consent for a
-  three-day capture on their machine.
+- **Phase C's automated half is met on the box (ledger §47–§49):** the workspace suite is exit 0
+  there (after three Windows-only findings, all fixed), the desktop crate is 283/283, a real
+  3840x2160 WGC frame becomes an 8.03 MB PNG, and **`cargo xtask verify` passes — 29 checks
+  judged, 0 failed, 1 not performed** (the silence detector's machine-setup condition). The CPU
+  criterion needed a decision to get there: it judged a fixed <5% of a core against a 4K60
+  animating desktop and now scales with the frames the screen offers (issue #93, ledger §48).
+  `#79` is closed as not reproducible (§49).
+- **Still open in Phase C:** a real-game session with an integration (LoL / CS2 / Dota 2), the
+  tray / hide-on-close / autostart as *observed* behaviour, and 4K120 on the live path. The
+  **72-hour soak is dropped by the owner's decision** (§48) — it is a measurement that will not be
+  made, not one that was failed.
 - **Open:** step 9's release (publish v0.2.0, install, v0.2.1, self-update proof) and Phase E's
   signing — both need credentials and a release page, not a host.
 - Phase F is deferred until after 1.0 by the plan's own ordering.
