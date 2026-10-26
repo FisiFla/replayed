@@ -436,6 +436,14 @@ jobs:
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The scanner is pinned, deliberately, instead of taking the action's default. The
+          # exceptions in `.gitleaks.toml` use the top-level `[[allowlists]]` array, which
+          # arrived in gitleaks 8.25: 8.24.3 — the action's default — has no such key in its
+          # config struct, ignores it without a word, and reports the three documented test
+          # fixtures as leaks. That is what the weekly scan did on 2026-10-26, with the config
+          # loaded and the allowlists silently dropped. The pin is kept in step with
+          # `.github/workflows/secret-scan.yml`, which runs the same binary over all history.
+          GITLEAKS_VERSION: "8.30.1"
           # The review-comment feature needs `pull-requests: write`, which this workflow
           # does not grant — it is `contents: read` and `pull-requests: read` — so the
           # comment would fail with a 403 and be downgraded to a warning. The scan

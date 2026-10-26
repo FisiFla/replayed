@@ -9,6 +9,15 @@
 # `scripts/check-forbidden-apis.sh` guards the other half of the same promise (no process
 # manipulation, no input synthesis) and is a different kind of check: it is about what the
 # code may call, not about what it may contain.
+#
+# The form below — top-level `[[allowlists]]` — needs gitleaks 8.25 or newer, and the scanner
+# version is pinned in both workflows that run it (`.github/workflows/ci.yml`,
+# `.github/workflows/secret-scan.yml`) for exactly that reason. 8.24.3, which the action
+# installs when no version is given, has no such key in its config struct: it reads this file
+# ("using existing gitleaks config"), drops both allowlists without a word, and reports the
+# three test fixtures as leaks. That is what the first scheduled full-history scan did on
+# 2026-10-26. The failure direction is the safe one — an old scanner reports too much, never
+# too little — but a weekly red scan that is wrong is still a broken alarm.
 
 [extend]
 useDefault = true
