@@ -3952,3 +3952,78 @@ grid, or a game — those need the real-game session, which remains open.
 
 `Test-NetConnection` reported 5173 unreachable while the app was demonstrably loading it: a
 false negative worth remembering — the page text is better evidence than a port probe.
+
+## 54. The secret scan's config was newer than its scanner (2026-10-26)
+
+### The symptom
+The first scheduled sweep of the whole history — `Secret scan` run 40305889071, on `main` at
+`1226677` — went red with three findings:
+
+| rule | file | what it is |
+|---|---|---|
+| `generic-api-key` | `crates/events/src/gsi.rs:904` | the fixed hex fixture the token gate is tested against |
+| `generic-api-key` | `crates/events/src/gsi/integration.rs:228` | the same fixture, in the cfg file the game reads |
+| `private-key` | `crates/events/tests/fixtures/tls/key-pkcs8.pem` | the TLS test key committed 2026-09-23, removed 2026-09-26 |
+
+All three are documented exceptions in `.gitleaks.toml`, written there precisely so that this
+sweep could pass. The run's log says the file was read: *"using existing gitleaks config
+.gitleaks.toml from `(--source)/.gitleaks.toml`"*.
+
+Read, and not understood. The exceptions use the top-level `[[allowlists]]` array, which gitleaks
+8.25 introduced. Version 8.24.3 — what `gitleaks-action` installs when `GITLEAKS_VERSION` is unset,
+and it was unset — has no top-level `Allowlists` field in its config struct (only the per-rule
+`allowlists` inside a `[[rules]]` entry), so it dropped the key without a word and scanned with no
+allowlist at all.
+
+### Reproduced, both ways, on the same repository
+```
+8.24.3   leaks found: 3    gsi.rs, gsi/integration.rs, tests/fixtures/tls/key-pkcs8.pem
+8.30.1   no leaks found    432 commits scanned, 7.50 MB
+```
+Same history, same working tree, same config file; the only variable is the binary. So the scan's
+verdict was decided by a version nobody had chosen — the action's default, which changes when the
+action changes.
+
+### The fix, and why a pin is the fix
+`GITLEAKS_VERSION: "8.30.1"` in both workflows that run the scanner (`.github/workflows/ci.yml`'s
+per-push job and `.github/workflows/secret-scan.yml`), and `.gitleaks.toml` now states the
+requirement and what an older binary does with it. The pin is not decoration: the scanner is part
+of the gate, so its version belongs in the repository rather than in an action's default.
+
+The failure direction was the safe one — an old scanner reports too much and never too little —
+but a weekly red alarm that is wrong teaches people to ignore the alarm, and this alarm sits on the
+same file that names a real committed key.
+
+### Verified
+`Secret scan` run 40307357677 on `f78072c`: `Version to install: 8.30.1`, the same config line as
+before, **no leaks found** over the whole history. The per-push scan in CI run 40309409646 passed
+with the same pin.
+
+## 55. A yanked crate turned the supply-chain job red with nothing changed (2026-10-26)
+
+The CI run on `f78072c` failed its dependency audit, and the commit that triggered it touched only
+two workflow files and a comment. The check had not changed and neither had the code: the advisory
+database had.
+
+```
+error[yanked]: detected yanked crate (try `cargo update -p crypto-bigint`)
+```
+
+`crypto-bigint` arrives through the test path only — `p256 0.14` → `ecdsa 0.17` →
+`elliptic-curve 0.14` — and the lockfile held 0.7.6, which had been published and then yanked.
+Every release from 0.7.3 to 0.7.8 is yanked; 0.7.9 and 0.7.10 are not. `cargo update -p
+crypto-bigint` moves the lock to 0.7.10 (and `ctutils` 0.4.5 → 0.4.6 with it, its only other
+change).
+
+### What it says about the pin that made it visible
+Two days earlier the same lockfile was green (`main` at `a8acaf9`, run 39990699219). Nothing in this
+repository changed in between; a third party's decision did. A dependency gate is a statement about
+*now*, and the only way a lockfile satisfies it is to be re-checked and, when the answer changes,
+updated.
+
+### Verified
+`cargo deny check` on the host: advisories, bans, licenses and sources all ok (the
+"advisory was not encountered" warnings are pre-existing and unchanged). The `replayed-events`
+suite passes with 0.7.10, the `lol_mock` TLS tests included. CI run 40309409646 on `76bd380`: all
+five jobs green, the dependency audit and the per-push secret scan among them.
+
