@@ -6,7 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 # The cleanup executor reports what it could not delete, where it happened (an orphaned
 # file is otherwise only visible as a path nobody logs). Runtime, not test-only.
 tracing.workspace = true
@@ -16,7 +16,7 @@ tracing.workspace = true
 # API for that (`created_at` is stamped by the store, never by the caller), so the test
 # reaches the column the way an operator would: with SQL.
 [dev-dependencies]
-rusqlite = { version = "0.40", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 tempfile.workspace = true
 
 [lints]
