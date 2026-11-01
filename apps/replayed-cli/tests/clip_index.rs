@@ -21,7 +21,7 @@ use replayed_media::FfmpegBinaries;
 use replayed_recorder::memory_ring::{MemoryRing, RingSetup};
 use replayed_recorder::{pump_until_span_on, FramePacer};
 use replayed_store::cleanup::{execute_cleanup, plan_cleanup, CleanupPolicy};
-use replayed_store::Store;
+use replayed_store::{LibraryRoots, Store};
 use std::time::Duration;
 
 const WIDTH: u32 = 64;
@@ -157,7 +157,7 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
     // A zero cap makes every non-favourited clip evictable, and the just-indexed clip is the only
     // one there is.
     let policy = CleanupPolicy {
-        max_total_bytes: 0,
+        max_total_bytes: 1,
         max_age_days: 3_650,
     };
     let plan = plan_cleanup(&store.list_clips().expect("list"), &policy, now_ms());
@@ -166,7 +166,12 @@ fn a_spliced_clip_is_indexed_with_its_real_values_and_the_policy_can_evict_it() 
         vec![id],
         "the policy selects the clip the hotkey produced"
     );
-    let outcome = execute_cleanup(&store, &plan).expect("execute the plan");
+    let outcome = execute_cleanup(
+        &store,
+        &plan,
+        &LibraryRoots::new(clips.path(), clips.path().join("sessions")),
+    )
+    .expect("execute the plan");
     assert_eq!(outcome.deleted, 1);
     assert_eq!(outcome.bytes_reclaimed, clip.size_bytes);
     assert!(outcome.cap_met, "with no favourites left, the cap is met");

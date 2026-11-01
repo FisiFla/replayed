@@ -610,6 +610,114 @@ output_size = \"\"
             "the clips rule is untouched"
         );
     }
+
+    /// The example file, parsed into the three sections [`validate`] looks at.
+    #[derive(Debug, Deserialize)]
+    struct Sections {
+        buffer: BufferSection,
+        encode: EncodeSection,
+        storage: StorageSection,
+    }
+
+    fn example_sections() -> Sections {
+        toml::from_str(include_str!("../../../config.example.toml")).expect("the example parses")
+    }
+
+    fn check(sections: &Sections) -> Result<()> {
+        validate(&sections.buffer, &sections.encode, &sections.storage)
+    }
+
+    #[test]
+    fn the_example_config_validates() {
+        check(&example_sections()).expect("config.example.toml must stay valid");
+    }
+
+    /// A zero retention rule used to mean "delete every non-favourite clip" at the next cleanup pass.
+    #[test]
+    fn a_zero_retention_rule_is_refused_at_load() {
+        for (what, edit) in [
+            (
+                "storage.max_age_days",
+                (|s: &mut Sections| s.storage.max_age_days = 0) as fn(&mut Sections),
+            ),
+            ("storage.max_total_bytes", |s| s.storage.max_total_bytes = 0),
+            ("storage.sessions.max_age_days", |s| {
+                s.storage.sessions.max_age_days = 0
+            }),
+            ("storage.sessions.max_total_bytes", |s| {
+                s.storage.sessions.max_total_bytes = 0
+            }),
+        ] {
+            let mut sections = example_sections();
+            edit(&mut sections);
+            let err = check(&sections).expect_err(what);
+            assert!(format!("{err:#}").contains(what), "{what}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn the_config_check_and_the_stores_policy_check_agree() {
+        // One rule, two doors: the config check asks the store, so every combination of zero and
+        // non-zero values gets the same answer from both, and a huge day count (clamped, not
+        // wrapped to zero) is accepted by both.
+        for bits in 0..16u32 {
+            let mut sections = example_sections();
+            let pick = |bit: u32| if bits & bit == 0 { 5 } else { 0 };
+            sections.storage.max_total_bytes = pick(1);
+            sections.storage.max_age_days = pick(2);
+            sections.storage.sessions.max_total_bytes = pick(4);
+            sections.storage.sessions.max_age_days = pick(8);
+            assert_eq!(
+                validate_retention(&sections.storage).is_ok(),
+                retention_policy(&sections.storage).validate().is_ok(),
+                "bits {bits:04b}"
+            );
+            assert_eq!(check(&sections).is_ok(), bits == 0, "bits {bits:04b}");
+        }
+        let mut sections = example_sections();
+        sections.storage.max_age_days = u64::from(u32::MAX) + 1;
+        sections.storage.sessions.max_age_days = u64::MAX;
+        assert!(check(&sections).is_ok(), "above u32::MAX clamps to 'never'");
+        assert_eq!(
+            retention_policy(&sections.storage).clips.max_age_days,
+            u32::MAX
+        );
+    }
+
+    #[test]
+    fn the_cli_checks_now_live_in_the_library() {
+        for (what, edit) in [
+            (
+                "buffer.segment_time",
+                (|s: &mut Sections| s.buffer.segment_time = 0) as fn(&mut Sections),
+            ),
+            ("buffer.post_seconds", |s| s.buffer.post_seconds = 0),
+            ("encode.fps", |s| s.encode.fps = 0),
+            ("encode.vendor", |s| s.encode.vendor = "software".into()),
+            ("encode.vendor", |s| s.encode.vendor = "bogus".into()),
+        ] {
+            let mut sections = example_sections();
+            edit(&mut sections);
+            let err = check(&sections).expect_err(what);
+            assert!(format!("{err:#}").contains(what), "{what}: {err:#}");
+        }
+    }
+
+    #[test]
+    fn the_ram_cap_has_a_floor_and_a_ceiling() {
+        let mut sections = example_sections();
+        sections.buffer.ram_cap_bytes = 0;
+        assert!(check(&sections).is_err(), "a ring that holds nothing");
+        sections.buffer.ram_cap_bytes = MIN_RAM_CAP_BYTES - 1;
+        assert!(check(&sections).is_err());
+        sections.buffer.ram_cap_bytes = MIN_RAM_CAP_BYTES;
+        assert!(check(&sections).is_ok());
+        sections.buffer.ram_cap_bytes = MAX_RAM_CAP_BYTES + 1;
+        assert!(
+            check(&sections).is_err(),
+            "a struct built in code is bounded like a parsed file"
+        );
+    }
 }
 
 /// `[storage]`: the clips directory and the policy applied to it. [`StorageSection::sessions`] is additive,
@@ -656,4 +764,120 @@ impl Default for SessionStorageRules {
             max_age_days: 7,
         }
     }
+}
+
+/// The smallest RAM budget the replay buffer may be given: 8 MiB.
+///
+/// A budget below one fragment of footage (a second of high-bitrate video is several MiB) makes the
+/// ring evict each fragment as it arrives, so a clip request finds nothing and the user sees
+/// "nothing covers that range" with no hint that their own setting caused it. Better refused at start.
+pub const MIN_RAM_CAP_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Check the recorder's own sections, the one place the CLI and the desktop shell share.
+///
+/// These rules used to live in the CLI's config loader only, so a desktop-recorded session with
+/// `segment_time = 0` or a zero retention rule skipped them. The recorder calls this at start
+/// ([`crate::RecorderConfig::validate`]), so a front-end that forgets still cannot start from a
+/// bad file; a front-end may call it earlier to report the problem at load.
+///
+/// Every refusal names the key, and none is quietly repaired: a value that is wrong is wrong.
+///
+/// * `max_age_days = 0` and `max_total_bytes = 0` are refused for both the clips and the sessions
+///   rule. Zero has no "disabled" meaning in the retention policy: a zero cap is exceeded by
+///   every file and a zero age by every clip, so the next cleanup pass deletes every
+///   non-favourite item. A user who wants no retention sets a very large number.
+/// * `ram_cap_bytes` is held between [`MIN_RAM_CAP_BYTES`] and [`MAX_RAM_CAP_BYTES`]. The upper
+///   bound is also clamped when a file is parsed; checking it here covers a struct built in code.
+pub fn validate(
+    buffer: &BufferSection,
+    encode: &EncodeSection,
+    storage: &StorageSection,
+) -> Result<()> {
+    use anyhow::bail;
+    // Fail closed: there is no CPU encoder to fall back to.
+    match encode.vendor.as_str() {
+        "auto" | "nvenc" | "qsv" | "amf" => {}
+        "software" => bail!(
+            "encode.vendor = \"software\" is not supported: replayed requires a GPU hardware \
+             encoder (nvenc, qsv or amf) so that capturing does not cost game performance"
+        ),
+        other => bail!("unknown encode.vendor: {other}"),
+    }
+    if buffer.segment_time == 0 {
+        bail!("buffer.segment_time must be at least 1 second");
+    }
+    if buffer.post_seconds == 0 {
+        bail!("buffer.post_seconds must be at least 1 second");
+    }
+    // The rate declared to the encoder (`-framerate`) and capture is paced to. Zero is not a rate:
+    // it makes `1 / fps` meaningless and ffmpeg's `-framerate 0` an error.
+    if encode.fps == 0 {
+        bail!(
+            "encode.fps must be at least 1: it is the ceiling on the frame rate the pipeline \
+             paces to (it measures itself against this - see encode.adapt_fps)"
+        );
+    }
+    if !(MIN_RAM_CAP_BYTES..=MAX_RAM_CAP_BYTES).contains(&buffer.ram_cap_bytes) {
+        bail!(
+            "buffer.ram_cap_bytes must be between {MIN_RAM_CAP_BYTES} (8 MiB) and \
+             {MAX_RAM_CAP_BYTES} (64 GiB), got {}",
+            buffer.ram_cap_bytes
+        );
+    }
+    validate_retention(storage)
+}
+
+/// The storage section as the retention rules the store plans with.
+///
+/// The one conversion, used by the check ([`validate_retention`]) and by the pass that deletes
+/// ([`crate::index::cleanup_pass`]), so what is validated is exactly what is applied. Days are `u32`
+/// in the retention rules and `u64` in the config; above `u32::MAX` means "never", so clamp rather
+/// than wrap (a wrap could turn a huge number into the refused zero, or worse into a tiny age).
+pub fn retention_policy(storage: &StorageSection) -> replayed_store::retention::RetentionPolicy {
+    use replayed_store::retention::{RetentionPolicy, RetentionRules};
+    let days = |days: u64| days.min(u64::from(u32::MAX)) as u32;
+    RetentionPolicy {
+        clips: RetentionRules {
+            max_total_bytes: storage.max_total_bytes,
+            max_age_days: days(storage.max_age_days),
+        },
+        sessions: RetentionRules {
+            max_total_bytes: storage.sessions.max_total_bytes,
+            max_age_days: days(storage.sessions.max_age_days),
+        },
+    }
+}
+
+/// The retention half of [`validate`]: no zero cap and no zero age, for the clips and the sessions.
+///
+/// There is one rule, [`replayed_store::retention::RetentionPolicy::validate`], the check the store's own
+/// planner makes before it plans anything; this asks it about the policy the configuration
+/// converts to ([`retention_policy`]) and says which keys to look at. Two copies of "zero is
+/// refused" drift (one gains a rule, the other keeps deleting). Also called by
+/// [`crate::index::cleanup_pass`] where the deleting happens.
+pub fn validate_retention(storage: &StorageSection) -> Result<()> {
+    retention_policy(storage).validate().map_err(|err| {
+        // The store's refusal does not know the config's key names, so say which of them are zero.
+        // Only the message: whether to refuse was the store's decision.
+        let zero: Vec<&str> = [
+            ("storage.max_total_bytes", storage.max_total_bytes),
+            ("storage.max_age_days", storage.max_age_days),
+            (
+                "storage.sessions.max_total_bytes",
+                storage.sessions.max_total_bytes,
+            ),
+            (
+                "storage.sessions.max_age_days",
+                storage.sessions.max_age_days,
+            ),
+        ]
+        .into_iter()
+        .filter(|(_, value)| *value == 0)
+        .map(|(key, _)| key)
+        .collect();
+        err.context(format!(
+            "invalid retention rule: {} must be at least 1",
+            zero.join(", ")
+        ))
+    })
 }

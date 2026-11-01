@@ -548,6 +548,34 @@ pub const AUTOSTART_VALUE: &str = "replayed";
 /// user looks to see what starts with their session.
 pub const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 
+/// The argument the Run entry passes, which means "started by the login, not by the user".
+///
+/// A tray-resident clipper that starts with the session must not put its 1280x880 review window
+/// on top of whatever the user logs in to (a game launcher, say). The entry therefore carries this
+/// flag, and the shell hides the main window when it sees it ([`is_background_launch`]).
+pub const AUTOSTART_ARG: &str = "--background";
+
+/// The text of the Run value for `exe`: the executable quoted, because an install path may
+/// contain spaces, then [`AUTOSTART_ARG`].
+pub fn autostart_command(exe: &Path) -> String {
+    format!("\"{}\" {AUTOSTART_ARG}", exe.display())
+}
+
+/// Whether the process arguments say this launch came from the Run entry.
+///
+/// `args` is the whole argument list, program name included (it is never matched). A
+/// second launch handed over by the single-instance plugin is a *user* launch and must show the
+/// window, so the caller applies this to the first process's own arguments only.
+pub fn is_background_launch<I, A>(args: I) -> bool
+where
+    I: IntoIterator<Item = A>,
+    A: AsRef<std::ffi::OsStr>,
+{
+    args.into_iter()
+        .skip(1)
+        .any(|arg| arg.as_ref() == std::ffi::OsStr::new(AUTOSTART_ARG))
+}
+
 /// One step of the sync, as a `reg.exe` invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegCommand {
@@ -580,7 +608,7 @@ pub fn reg_argv(cmd: RegCommand, value: &str, exe: &Path) -> Vec<String> {
             "/t".to_string(),
             "REG_SZ".to_string(),
             "/d".to_string(),
-            format!("\"{}\"", exe.display()),
+            autostart_command(exe),
             "/f".to_string(),
         ],
         RegCommand::Disable => vec![
@@ -695,15 +723,29 @@ fn registered_path(output: &str, value: &str) -> Option<String> {
     })
 }
 
+/// The executable a registered Run value starts: the quoted path, or the whole value when it is
+/// not quoted. What follows the closing quote (the [`AUTOSTART_ARG`] this application writes, or
+/// the arguments of an older entry) is not part of the path.
+fn registered_exe(data: &str) -> &str {
+    let data = data.trim();
+    match data.strip_prefix('"') {
+        Some(rest) => rest.split('"').next().unwrap_or(rest),
+        None => data
+            .strip_suffix(AUTOSTART_ARG)
+            .map_or(data, |path| path.trim_end()),
+    }
+}
+
 /// Whether a registered entry is this application's own.
 ///
 /// The Run key is shared and user-visible, so a value carrying this application's name that
 /// points at something else is somebody else's entry: overwriting it with `/f` or deleting it
 /// would take their program away. The check is on the binary's name rather than on the whole
 /// path, so an install that moved is still recognised as this application's entry and repaired
-/// instead of duplicated.
+/// instead of duplicated. An entry written before [`AUTOSTART_ARG`] existed is the bare quoted
+/// path; it is still ours, and the next sync rewrites it with the flag.
 fn is_our_entry(data: &str, exe: &Path) -> bool {
-    let data = data.trim().trim_matches('"');
+    let data = registered_exe(data);
     // The data is a Windows path and this may not be Windows: split on both separators.
     let name = data.rsplit(['/', '\\']).next().unwrap_or(data);
     let exe = exe.to_string_lossy();
@@ -753,7 +795,7 @@ pub fn sync_autostart(
             None
         }
     };
-    let wanted = format!("\"{}\"", exe.display());
+    let wanted = autostart_command(exe);
 
     match (enabled, registered) {
         (true, Some(path)) if path == wanted => Ok(AutostartOutcome::Unchanged),
@@ -973,6 +1015,31 @@ pub fn reveal_command(path: &Path, manager: FileManager) -> (String, Vec<String>
         // The generic case has nothing to select with: the folder is what a user can act on.
         (FileManager::XdgOpen, _) => ("xdg-open".to_string(), vec![folder()]),
     }
+}
+
+/// The process that reveals `path`, ready to spawn.
+///
+/// [`reveal_command`] says *what* to run; this is how to run it, and on Windows the difference is
+/// the whole fix. Explorer parses its own command line: it wants `/select,"C:\a b\c.toml"`
+/// with plain quotes. `Command::arg` escapes a quote inside an argument as `\"`, so the
+/// quoted form passed through `arg` reached Explorer as `"/select,\"C:\a b\c.toml\""`, which it
+/// does not recognise as a selection, and it opened the default folder (or did nothing) instead of
+/// selecting the file. `raw_arg` hands the text to `CreateProcess` as it is.
+///
+/// Every call site that spawns [`reveal_command`] should spawn this instead.
+pub fn reveal_process(path: &Path, manager: FileManager) -> std::process::Command {
+    let (program, args) = reveal_command(path, manager);
+    let mut command = replayed_media::sidecar_command(&program);
+    for arg in &args {
+        #[cfg(windows)]
+        if manager == FileManager::Explorer && arg.starts_with("/select,") {
+            use std::os::windows::process::CommandExt;
+            command.raw_arg(arg);
+            continue;
+        }
+        command.arg(arg);
+    }
+    command
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1329,6 +1396,45 @@ mod tests {
             vec![folder],
             "the generic case has nothing to select with"
         );
+    }
+
+    #[test]
+    fn a_non_windows_reveal_passes_every_argument_as_a_plain_argument() {
+        // The other platforms' file managers parse a normal argument vector, so nothing is raw.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("config.toml");
+        std::fs::write(&file, "[app]\n").unwrap();
+        let command = reveal_process(&file, FileManager::MacOs);
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(command.get_program(), "open");
+        assert_eq!(args, ["-R", file.to_str().unwrap()]);
+    }
+
+    /// The Windows half of the reveal fix, on the exact command line.
+    ///
+    /// `Debug` for a Windows `Command` prints a regular argument escaped (`\"`) and a raw one
+    /// verbatim, so this is the line `CreateProcess` is given, without launching Explorer. The
+    /// path has a space in it on purpose: that is what makes `Command::arg` quote the argument.
+    #[cfg(windows)]
+    #[test]
+    fn explorer_is_handed_the_select_argument_without_escaped_quotes() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("a folder with spaces");
+        std::fs::create_dir_all(&folder).unwrap();
+        let file = folder.join("config.toml");
+        std::fs::write(&file, "[app]\n").unwrap();
+
+        let command = reveal_process(&file, FileManager::Explorer);
+        let line = format!("{command:?}");
+        let expected = format!("\"explorer\" /select,\"{}\"", file.display());
+        assert_eq!(line, expected, "the quotes reach Explorer unescaped");
+        assert!(!line.contains("\\\""), "no escaped quote anywhere: {line}");
+
+        // The folder case has nothing quoted by hand: a plain argument, which Rust quotes itself.
+        let missing = folder.join("not-created-yet.toml");
+        let line = format!("{:?}", reveal_process(&missing, FileManager::Explorer));
+        assert!(line.starts_with("\"explorer\" "), "{line}");
+        assert!(!line.contains("/select,"), "{line}");
     }
 
     // -- one press, one clip -------------------------------------------------------------
@@ -1721,7 +1827,7 @@ mod tests {
                 "/t",
                 "REG_SZ",
                 "/d",
-                r#""C:\Program Files\replayed\replayed.exe""#,
+                r#""C:\Program Files\replayed\replayed.exe" --background"#,
                 "/f",
             ]
         );
@@ -1807,7 +1913,7 @@ mod tests {
     fn autostart_leaves_a_correct_entry_alone() {
         // The common case on every start after the first: no registry write at all.
         let exe = Path::new(r"C:\replayed\replayed.exe");
-        let reg = FakeReg::new(Some(r#""C:\replayed\replayed.exe""#));
+        let reg = FakeReg::new(Some(r#""C:\replayed\replayed.exe" --background"#));
         let mut run = reg.runner();
 
         let outcome = sync_autostart(true, exe, &mut run).unwrap();
@@ -1818,6 +1924,59 @@ mod tests {
             ["query"],
             "nothing is written when nothing changed"
         );
+    }
+
+    #[test]
+    fn an_entry_from_before_the_background_flag_is_ours_and_is_upgraded() {
+        // Every install that enabled autostart before the flag existed has the bare quoted path.
+        // It is this application's entry (not somebody else's), so the next sync rewrites it with
+        // the flag instead of refusing it as foreign, and the login stops opening the window.
+        let exe = Path::new(r"C:\replayed\replayed.exe");
+        let reg = FakeReg::new(Some(r#""C:\replayed\replayed.exe""#));
+        let mut run = reg.runner();
+
+        let outcome = sync_autostart(true, exe, &mut run).unwrap();
+
+        assert_eq!(outcome, AutostartOutcome::Enabled);
+        assert_eq!(reg.commands(), ["query", "add"]);
+        assert!(
+            reg.calls.borrow()[1]
+                .iter()
+                .any(|a| a == r#""C:\replayed\replayed.exe" --background"#),
+            "the new value carries the flag: {:?}",
+            reg.calls.borrow()[1]
+        );
+    }
+
+    #[test]
+    fn a_flagged_entry_is_recognised_as_ours_when_autostart_is_switched_off() {
+        // The data after the closing quote must not make our own entry look foreign: that is the
+        // difference between removing it and leaving it behind while claiming to be in sync.
+        let exe = Path::new(r"C:\Program Files\replayed\replayed.exe");
+        let reg = FakeReg::new(Some(
+            r#""C:\Program Files\replayed\replayed.exe" --background"#,
+        ));
+        let mut run = reg.runner();
+
+        let outcome = sync_autostart(false, exe, &mut run).unwrap();
+
+        assert_eq!(outcome, AutostartOutcome::Removed);
+        assert_eq!(reg.commands(), ["query", "delete"]);
+        assert!(is_our_entry(r#""D:\moved\Replayed.exe" --background"#, exe));
+        assert!(!is_our_entry(r#""C:\other\tool.exe" --background"#, exe));
+    }
+
+    #[test]
+    fn only_the_background_flag_marks_a_login_launch() {
+        // The program name is never matched, and a user launch has no flag.
+        assert!(is_background_launch(["replayed.exe", "--background"]));
+        assert!(!is_background_launch(["replayed.exe"]));
+        assert!(
+            !is_background_launch(["--background"]),
+            "that is the program name"
+        );
+        assert!(!is_background_launch(["replayed.exe", "--backgrounds"]));
+        assert!(!is_background_launch(Vec::<String>::new()));
     }
 
     #[test]

@@ -323,3 +323,259 @@ fn a_failed_chapter_remux_leaves_the_clip_intact() {
         "the original clip must survive"
     );
 }
+
+/// Trimming a two-audio recording keeps both tracks and both names.
+///
+/// `trim_lossless` once passed no `-map`, so ffmpeg's default selection kept one audio stream: a
+/// clip trimmed out of a session recorded with a microphone lost the microphone with exit status
+/// 0, and the track that survived lost its name.
+#[test]
+fn trim_keeps_the_microphone_track_and_both_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let src = two_track_fixture(dir.path(), "trim");
+    let dst = dir.path().join("trimmed.mp4");
+
+    edit::trim_lossless(&bin, &src, &dst, 500, 1500).expect("trim");
+
+    let expected: Vec<Option<String>> = edit::audio_titles(2)
+        .iter()
+        .map(|t| Some((*t).to_string()))
+        .collect();
+    assert_eq!(
+        audio_names(&bin, &dst),
+        expected,
+        "the trim must keep the game audio and the microphone, named"
+    );
+    let layout = replayed_media::stream_layout(&bin, &dst).unwrap();
+    assert_eq!(layout.video_count(), 1);
+    assert_eq!(layout.audio_count(), 2);
+}
+
+/// A recording with audio turned off has no audio stream at all, and it still trims.
+///
+/// The `-map 0:a` that keeps the microphone once carried no `?`, and ffmpeg refuses a map that
+/// matches nothing ("Stream map '' matches no streams"), so every clip recorded without audio
+/// became impossible to trim or to extract from its session.
+#[test]
+fn a_clip_with_no_audio_stream_still_trims() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let src = dir.path().join("silent.mp4");
+    let status = Command::new(&bin.ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x240:rate=30",
+            "-t",
+            "3",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-g",
+            "30",
+        ])
+        .arg(&src)
+        .status()
+        .expect("spawn ffmpeg");
+    assert!(status.success(), "fixture generation failed");
+    let dst = dir.path().join("trimmed.mp4");
+
+    edit::trim_lossless(&bin, &src, &dst, 1000, 2000).expect("a video-only clip must trim");
+
+    let layout = replayed_media::stream_layout(&bin, &dst).unwrap();
+    assert_eq!(layout.video_count(), 1);
+    assert_eq!(layout.audio_count(), 0);
+}
+
+/// A trimmed clip that carries chapters keeps them and does not gain a second chapter track.
+///
+/// The chapter track is a `data` stream. A bare `-map 0` would copy it and the muxer would also
+/// write one for the copied chapters, so every trim of a chaptered clip would add one.
+#[test]
+fn trimming_a_chaptered_clip_keeps_its_chapters_and_adds_no_data_stream() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let src = two_track_fixture(dir.path(), "chaptered-trim");
+    let marks = [
+        edit::Chapter {
+            start_ms: 0,
+            title: "Kill".into(),
+        },
+        edit::Chapter {
+            start_ms: 1000,
+            title: "Death".into(),
+        },
+    ];
+    edit::add_chapters(&bin, &src, &marks, 2000).expect("adding chapters");
+    let data_streams = |path: &std::path::Path| {
+        let layout = replayed_media::stream_layout(&bin, path).unwrap();
+        layout.streams.len() - layout.video_count() - layout.audio_count()
+    };
+    let before = data_streams(&src);
+
+    let dst = dir.path().join("trimmed.mp4");
+    edit::trim_lossless(&bin, &src, &dst, 0, 2000).expect("trim");
+
+    assert_eq!(data_streams(&dst), before, "no second chapter track");
+    assert_eq!(chapters(&bin, &dst).len(), 2, "the chapters were carried");
+    assert_eq!(
+        replayed_media::stream_layout(&bin, &dst)
+            .unwrap()
+            .audio_count(),
+        2
+    );
+}
+
+/// A fake `ffmpeg`: writes half a file at the last argument (the output) and exits non-zero, as
+/// an ffmpeg killed or failing part way through a write does. Real `ffprobe` is kept, so the
+/// callers that probe first still work.
+#[cfg(unix)]
+fn failing_ffmpeg(dir: &std::path::Path) -> FfmpegBinaries {
+    use std::os::unix::fs::PermissionsExt;
+    let script = dir.join("fake-ffmpeg");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\nfor last; do :; done\nprintf 'half a file' > \"$last\"\ncat >/dev/null 2>&1 </dev/null\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    FfmpegBinaries {
+        ffmpeg: script,
+        ffprobe: ffmpeg().ffprobe,
+    }
+}
+
+/// A trim, a remux and an in-memory clip save that fail leave no half-written file behind.
+///
+/// No row names such a file and the caller returns the error, so it would otherwise sit in the
+/// library directory using disk the retention cap never counts.
+#[cfg(unix)]
+#[test]
+fn a_failed_edit_removes_the_partial_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = fixture(dir.path());
+    let bin = failing_ffmpeg(dir.path());
+
+    let trimmed = dir.path().join("trimmed.mp4");
+    edit::trim_lossless(&bin, &src, &trimmed, 0, 1000).unwrap_err();
+    assert!(!trimmed.exists(), "a failed trim leaves no file");
+
+    let remuxed = dir.path().join("remuxed.mp4");
+    edit::remux_lossless(&bin, &src, &remuxed).unwrap_err();
+    assert!(!remuxed.exists(), "a failed remux leaves no file");
+
+    let saved = dir.path().join("clip.mp4");
+    edit::remux_stream_lossless(&bin, vec![1, 2, 3], &saved, 1).unwrap_err();
+    assert!(!saved.exists(), "a failed in-memory save leaves no file");
+
+    let exported = dir.path().join("export.mp4");
+    replayed_media::export::export(
+        &bin,
+        &src,
+        &exported,
+        replayed_media::export::ExportPreset::Discord,
+        1_000,
+    )
+    .unwrap_err();
+    assert!(!exported.exists(), "a failed export leaves no file");
+}
+
+/// Three real segments, as the session recorder leaves them.
+fn segments(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    (0..3)
+        .map(|i| {
+            let path = dir.join(format!("seg-{i:06}.mp4"));
+            std::fs::copy(two_track_fixture(dir, &format!("src{i}")), &path).unwrap();
+            path
+        })
+        .collect()
+}
+
+/// Cut `path` before its `moov`, which is where a crashed segment muxer leaves it: the index of
+/// an ordinary MP4 is written when the segment closes.
+fn truncate_before_moov(path: &std::path::Path) {
+    let bytes = std::fs::read(path).unwrap();
+    let moov = bytes.windows(4).rposition(|w| w == b"moov").unwrap();
+    std::fs::write(path, &bytes[..moov / 2]).unwrap();
+}
+
+/// A crash-truncated newest segment is dropped and reported; the readable prefix concatenates.
+///
+/// `check_concat_layout` propagated the probe error of the truncated tail, so `finalise` refused
+/// to run and a session killed mid-write was never recovered.
+#[test]
+fn a_crash_truncated_last_segment_is_dropped_and_the_rest_recovered() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let segs = segments(dir.path());
+    truncate_before_moov(&segs[2]);
+
+    assert!(
+        edit::check_concat_layout(&bin, &segs).is_err(),
+        "the strict check still refuses it"
+    );
+    let plan = edit::check_concat_layout_tolerating_tail(&bin, &segs).expect("recoverable");
+    assert_eq!(plan.kept, segs[..2].to_vec());
+    assert_eq!(plan.dropped_tail.as_ref().map(|(p, _)| p), Some(&segs[2]));
+    assert!(!plan.dropped_tail.unwrap().1.is_empty(), "with a reason");
+    assert_eq!(plan.layout.audio_count(), 2);
+
+    let list = dir.path().join("list.txt");
+    let total = edit::write_concat_list(&plan.kept, &list).unwrap();
+    let out = dir.path().join("session.mp4");
+    edit::concat_lossless_sized(&bin, &list, &out, total, plan.layout.audio_count())
+        .expect("the prefix concatenates");
+    assert!(MediaInfo::probe(&bin, &out).unwrap().duration_ms >= 3500);
+}
+
+#[test]
+fn an_intact_session_drops_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let segs = segments(dir.path());
+    let plan = edit::check_concat_layout_tolerating_tail(&bin, &segs).unwrap();
+    assert_eq!(plan.kept, segs);
+    assert!(plan.dropped_tail.is_none());
+}
+
+/// Only the last segment may be dropped. A truncated middle segment would be a hole spliced into
+/// the recording, and a session with nothing readable has nothing to recover.
+#[test]
+fn only_the_last_segment_is_ever_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+
+    let segs = segments(dir.path());
+    truncate_before_moov(&segs[1]);
+    let err = edit::check_concat_layout_tolerating_tail(&bin, &segs).unwrap_err();
+    assert!(format!("{err:#}").contains("seg-000001"), "{err:#}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let segs = segments(dir.path());
+    let only = &segs[..1];
+    truncate_before_moov(&segs[0]);
+    edit::check_concat_layout_tolerating_tail(&bin, only)
+        .expect_err("a lone unreadable segment is not recoverable");
+}
+
+/// A final segment that probes but disagrees in layout is the refusal, not a truncation.
+#[test]
+fn a_readable_last_segment_with_another_layout_is_still_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let bin = ffmpeg();
+    let mut segs = segments(dir.path());
+    // One audio track instead of two.
+    let odd = fixture(dir.path());
+    segs[2] = odd;
+    let err = edit::check_concat_layout_tolerating_tail(&bin, &segs).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("differs in stream layout"),
+        "{err:#}"
+    );
+}

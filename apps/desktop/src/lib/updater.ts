@@ -24,6 +24,7 @@
  */
 
 import { check, type DownloadEvent, type Update } from '@tauri-apps/plugin-updater';
+import { errorCode, prepareForUpdate } from './ipc';
 
 /** What the update check found, in the words the panel shows. */
 export interface UpdateOffer {
@@ -42,7 +43,8 @@ export interface UpdateOffer {
    * server said what the total is.
    *
    * On Windows the installer takes over and the application exits, so this promise
-   * does not resolve there: the panel says what is happening before it calls.
+   * does not resolve there: the panel says what is happening before it calls. It
+   * therefore must not be called until `prepareToInstall` has answered `'ready'`.
    */
   install(onProgress?: (downloaded: number, total: number | null) => void): Promise<void>;
   /** Let the update go: the Rust side releases the resource it was holding. */
@@ -89,6 +91,45 @@ async function installUpdate(
       onProgress?.(downloaded, total);
     }
   });
+}
+
+/** What the shell said about installing now. */
+export type InstallGate = 'ready' | 'recording_active';
+
+/**
+ * Get the recording out of the way before an install, asking the shell rather than the poll.
+ *
+ * Installing ends the process: on Windows the installer takes over and the application exits
+ * under it, and nothing on the way out stops the recorder first. A recording that is running
+ * then loses what only exists in memory (the replay buffer, a clip's post-roll that has not
+ * been spliced) and its session is left unfinished for the next start to recover with no length
+ * and no file. The ffmpeg child lives in the install directory the installer is about to
+ * overwrite, too, so it can also fail on a file in use.
+ *
+ * The shell's `prepare_for_update` is the authority on whether a recording is running, not the
+ * window's last poll, which is half a second old at best and absent at worst. Call this with
+ * `false` first. `'ready'` means nothing was recording and the install may go on.
+ * `'recording_active'` means one is, nothing was touched, and the user has to be asked; if they
+ * agree, call again with `true`, which stops and finalises the recording as the Stop button does
+ * and answers `'ready'`.
+ *
+ * Every other outcome throws, and the caller must not install: a stop that failed, a shell that
+ * could not be asked, an answer that says a recording was left running. The refusal is only
+ * translated when consent had *not* been given; with it given, `recording_active` is a
+ * recording that would not stop, and treating it as "ask again" would loop.
+ */
+export async function prepareToInstall(stopRecording: boolean): Promise<InstallGate> {
+  let outcome;
+  try {
+    outcome = await prepareForUpdate(stopRecording);
+  } catch (err) {
+    if (!stopRecording && errorCode(err) === 'recording_active') return 'recording_active';
+    throw err;
+  }
+  if (outcome.was_recording && !outcome.stopped) {
+    throw new Error('A recording is running and the shell did not stop it, so the update was held back.');
+  }
+  return 'ready';
 }
 
 /**

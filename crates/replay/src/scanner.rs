@@ -41,7 +41,7 @@ pub fn segment_seq(name: &str) -> Option<u64> {
 /// * the ledger may hold entries whose files were deleted or evicted, so it is the floor for
 ///   numbers already used;
 /// * the disk may hold a file the ledger never recorded (a crash between ffmpeg writing a
-///   segment and the next `save_ledger` leaves exactly that), so it is the floor for numbers
+///   segment and the ledger being brought up to date leaves exactly that), so it is the floor for numbers
 ///   already present.
 ///
 /// A number is never reused, so the encoder only creates new files. Pure: the caller reads the

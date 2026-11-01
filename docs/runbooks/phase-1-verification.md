@@ -429,6 +429,30 @@ the same call, on the same media-time path, with the same reason (`Manual`) — 
 keypress adds is proof that the global hotkey itself fires, and that is worth doing once
 by hand (press it and watch for the same `hotkey pressed:` line).
 
+### Manual step: quit the CLI with Ctrl+C (not automated, not yet run on Windows)
+
+`cargo xtask verify` drives the CLI with its own self-test trigger and ends it through the
+engine, so it never presses Ctrl+C. The console handler (`apps/replayed-cli/src/shutdown.rs`) is
+therefore covered by unit tests and a test that raises the shutdown flag directly, and **not** by a
+run in which a person quits a real console. Do this once on a Windows machine, in a real console
+(`cmd.exe` or PowerShell, not a remote shell with no console):
+
+1. Start `replayed-cli buffer` (add `[recorder] mode = "session"`, or `--mode session`, for the
+   second half of this step) and let it run past one full pre-roll.
+2. Press **Ctrl+F8**, then press **Ctrl+C** while the post-roll is still running.
+3. **PASS:** the log says `shutting down: stopping the recorder (press Ctrl+C again to quit at
+   once)`; the clip you triggered is still written and indexed (the clip in flight is finished, not
+   abandoned); with `--mode session` the `session-<timestamp>.mp4` file appears under `sessions\`
+   and the segment folder is gone; and `echo %ERRORLEVEL%` (or `$LASTEXITCODE`) prints `0`.
+4. Start it again and press **Ctrl+C twice**. **PASS:** the second press ends the process at
+   once, without waiting for the recorder.
+5. Start it again and **close the console window** (the close button). **PASS:** the same files
+   as in step 3 appear. The system gives the handler a few seconds (the code waits at most 4.5 s),
+   so a very long session may be cut off here; that is the same outcome as before the handler
+   existed and not a failure of this step, but note it.
+
+Record what you saw in the ledger (`docs/verification-status.md`, the line marked for it).
+
 ---
 
 ## Criterion 4 — Clip duration matches `pre_seconds + post_seconds` (±0.5 s)
@@ -559,6 +583,14 @@ first 30–60 s), not during startup.
 **Do not misread:** a **debug** build's CPU/RSS are not representative and may fail while
 release passes — always sample the `--release` binary. Startup spikes (ffmpeg spawn,
 encoder init, first probes) are not the steady-state figure; sample later.
+
+**The 5% is a quiet-screen figure.** The cost is per frame the display presents, and Windows
+Graphics Capture offers a frame whenever the screen changes, so the same build reads several times
+higher while something animates. `cargo xtask verify` therefore judges the flat 5% only when the
+display offered 15 frames/s or fewer, and reports a busier screen as *not performed*, with the
+offered rate, rather than as a failure or a pass (ledger §48, §56). Close animating windows before
+reading this number by hand, too. The RSS figure of the harness is taken at its 16 MiB ring; a
+default `ram_cap_bytes` of 256 MiB holds more.
 
 ---
 

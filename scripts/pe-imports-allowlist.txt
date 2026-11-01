@@ -1,0 +1,6 @@
+# Exemptions for scripts/check-pe-imports.py: one Windows function name per line, then
+# `# the reason`. A name here is let through the BINARY guard for every executable it checks,
+# so an entry is a reviewed decision: say which dependency imports it, why that import is not
+# a way to synthesise input or reach another process, and what removes the entry.
+#
+# It is empty on purpose. Nothing is exempt.

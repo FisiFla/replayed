@@ -26,12 +26,31 @@ loopback — **with one exception, the update check, described below**.
 - the **League Live Client Data API** — polled at `127.0.0.1:2999`, GET only, over TLS with
   Riot's root pinned and the platform roots disabled
   (`crates/events/src/lol/client.rs`; the one relaxation of the host-name check lives in
-  that same file, and nothing may disable certificate-chain verification);
-- the **audio transport to ffmpeg** — a loopback TCP socket whose accepted peer is checked
-  to be loopback (`crates/encoder/src/ffmpeg.rs`).
+  that same file, and nothing may disable certificate-chain verification). The same
+  service answers the **game-presence check**: a `GET /liveclientdata/gamestats` (a couple
+  of hundred bytes) through the same pinned client, and the body has to name a game (a map
+  or a running clock) for League to count as open. A `200` with `null`, `{}` or a body that
+  is not JSON is not "a game"
+  (`crates/events/src/process.rs::LiveClientPresence`, `serves_a_game`);
+- the **audio transport to ffmpeg** — a link the encoder listens on and the ffmpeg child
+  dials, and the encoder uses a connection only if the operating system says its peer **is
+  the child it spawned**. Loopback is not enough: another program on the machine that dials
+  freshly opened loopback ports would otherwise win the race, become the audio input and be
+  fed the game's and the microphone's PCM. On Windows the link is loopback TCP and the owner
+  of the client end of the accepted connection is read from the system TCP table
+  (`GetExtendedTcpTable`, the table `netstat -o` prints) and compared with the child's process
+  id; that is a read of a system-wide table, not an open of any process. Elsewhere it is a Unix
+  socket in a directory created exclusively with mode `0700`, and the kernel reports the
+  connecting process (`SO_PEERCRED` on Linux, `LOCAL_PEERPID` on macOS). A peer that is not the
+  child is dropped and the wait carries on to its deadline; a peer whose owner cannot be
+  determined is refused the same way. **There is no fallback to an unauthenticated link**
+  (`crates/encoder/src/audio_link.rs`).
 
-The tree's outbound sockets are exactly five files, and that list is pinned by a test:
+The tree's outbound sockets (the files that call `TcpStream::connect`) are exactly five, and
+that list is pinned by a test:
 `crates/events/tests/no_egress.rs::only_the_loopback_modules_talk_to_a_socket_at_all`. The
+audio link only *accepts* a connection, so it is not on that list; it is on the capability
+check's exemption list below, with its reason. The
 updater's request is made inside the updater plugin, whose code is not this tree's; what
 this tree grants it, and how narrow that is, is described below. The
 same file carries the rest of the egress guard, and it is worth knowing how:
@@ -108,9 +127,25 @@ Every artifact the updater downloads is checked against it **before it is instal
 **The private key never ships.** It lives only in the release pipeline's secrets
 (`TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`) and in the
 maintainer's own storage; it is not in this repository, not in the installer, and not in
-the application's data directory. The CLI refuses to sign with a key that does not match
-the pinned public key, so a release signed with the wrong key fails at the pipeline rather
-than on a user's machine.
+the application's data directory. The Tauri CLI signs with whatever key it is given and only
+warns when that is not the pinned one, so the release pipeline checks the signature itself
+(`scripts/verify-updater-signature.py`, before the draft exists and again on the bytes GitHub
+stored): a release signed with the wrong key fails at the pipeline rather than on a user's
+machine.
+
+**Installing an update ends a running recording, and asks first.** The installer replaces the
+executable and the application exits, which would cut a recording off where it stands. So the
+install first asks the shell to prepare for it (`prepare_for_update`). The shell, not the page's
+last poll, decides whether a recording is running: if one is, it refuses unless the call says the
+user agreed to stop it, and the Updates panel then asks. Nothing is stopped or downloaded until
+the user answers; agreeing stops and finalises the recording (the same stop as the Stop button)
+before the installer starts, and declining leaves the recording running and the update
+uninstalled. The updater ends the process directly once the installer has run, which skips the
+exit path that normally stops the recorder and finalises the segment in flight; this check is the
+only guard on that path. If the stop fails, the install is not attempted
+(`apps/desktop/src-tauri/src/commands/recorder.rs::prepare_for_update`,
+`apps/desktop/src/lib/updater.ts::prepareToInstall`). This is a consent step in the user's own
+window, not a defence against the webview.
 
 **What this does not protect against.** The updater inherits the platform's trust: the
 request is made with the platform's certificate roots, so whoever controls the DNS or the
@@ -160,10 +195,39 @@ application's own; the tokens are never logged and never printed — the `Debug`
 binding, a configuration and a live binding all redact them
 (`GsiGameBinding`, `GsiConfig`, `replayed_recorder::GsiBinding`).
 
-**The old single token file is migrated by copy and left in place.** An install that predates
-per-game tokens keeps working: `gsi-token.txt` is copied into each per-game file (a copy
-keeps the owner-only mode) and the old file is left where it is, so an older build still
-finds its token (`crates/recorder/src/event_driver.rs::per_game_token`).
+**The old single token is not carried over.** An install that predates per-game tokens has
+one shared `gsi-token.txt`. It is **not** copied into the per-game files: each game gets a
+fresh token the first time, the old file is left where it is and is never read, and a
+warning in the log says the integration has to be installed again
+(`crates/recorder/src/event_driver.rs::per_game_token`). Carrying the old token forward would
+have kept a token that is already sitting in a game folder, readable by the `Users` group,
+valid on both games' paths. When the desktop app starts a recording it finds a
+`gamestate_integration_replayed.cfg` in a detected Steam library game folder and rewrites it
+to carry the new token and the live port; the CLI, and a game outside a detected library, need
+the file installed or copied again, and the game restarted
+(`apps/desktop/src-tauri/src/health.rs::refresh_installed_gsi`). The rewrite has not been
+exercised on Windows.
+
+**How a request is taken in.** The listener is reachable by every process on the machine and by
+every web page in the user's browser, so the order in which it spends its effort is part of
+the design (`crates/events/src/gsi.rs::serve`, "Starving the game"):
+
+- no reader thread waits on a peer. The accept loop collects each connection's bytes without
+  blocking and hands a reader only a request that is already whole in memory. A connection that
+  sends nothing, or a head and then stalls, costs one of 16 pending slots and is answered and
+  closed after 2 seconds; when the slots are full the new connection replaces the most idle one;
+- a request that carries the token for its path goes in the **game's lane**: its own bound, served
+  first, and not charged to the rate limit. Every other request waits in the anonymous lane and is
+  charged to 100 requests per second, past which it is answered `429` unread. A peer without the
+  token can use up its own budget and its own lane; it cannot reach the game's. Lane choice
+  decides only where a request waits: the token is still checked in full, in constant time,
+  before the body is parsed;
+- a request a **web page** made is refused with `403` as soon as its head is in, token or not.
+  Every browser fetch carries `Sec-Fetch-*` headers, which a script can neither set nor remove
+  and which the game never sends (`crates/events/src/gsi/http.rs`, `Framing::Browser`). A
+  browser too old to send them falls under the lane rules above.
+
+What none of this defends against is a local process with enough CPU to starve the whole PC.
 
 **The listener is bound before any configuration file is written.** The order is the point:
 a `.cfg` written before the bind names a port nobody may be listening on — a taken port, or
@@ -195,7 +259,11 @@ A game in a **secondary** Steam library — one the user's own `libraryfolders.v
 **is** installed. That file is the user's own Steam configuration: it lives in the user's
 Steam directory, so no other unprivileged account can edit it, and the application writes
 with that user's own permissions either way. Refusing a secondary library would break a game
-on a second drive for no security gain.
+on a second drive for no security gain. Where to *look* for libraries is Steam's registered
+install path (`HKCU\Software\Valve\Steam`, value `SteamPath`, read through `reg.exe` from the
+user's own hive; nothing is written) plus the default locations; those roots only say where to
+look, and the containment rule above still applies to whatever they lead to
+(`apps/desktop/src-tauri/src/health.rs::steam_roots`).
 
 ### The residual risks, stated plainly
 
@@ -217,7 +285,9 @@ These are **not** solved, and this document does not pretend they are.
   user who does not turn it on.
 - **`events.gsi_port = 0` switches the listener off entirely**, in both modes. That key
   chooses *whether* there is a listener; `gsi_ephemeral_port` chooses *which* port it binds
-  (`crates/recorder/src/event_driver.rs::EventsSection` and `start_event_sources`).
+  (`crates/recorder/src/event_driver.rs::EventsSection` and `start_event_sources`). Leaving
+  the key out is **not** the same as `0`: an omitted `gsi_port` is `45671`, so the listener
+  is on. A non-zero value must be between 1024 and 65535.
 - The token in the application's own data directory is created owner-only (`0600`) where the
   platform has file modes. On Windows it is in the per-user application data directory with
   **no ACL hardening**.
@@ -232,9 +302,11 @@ treated as untrusted input, not as the application.
 - **Strict CSP** (`apps/desktop/src-tauri/tauri.conf.json`, `app.security.csp`):
   `default-src 'self'`, no `object-src`, no `base-uri`, no `form-action`, no
   `frame-ancestors`.
-- **No filesystem, shell or http capability**
-  (`apps/desktop/src-tauri/capabilities/default.json`): `core:default`, the open-file
-  dialog, notifications, and the updater's two commands — and nothing else. The updater
+- **No filesystem, shell, http, dialog or notification capability**
+  (`apps/desktop/src-tauri/capabilities/default.json`): `core:default` and the updater's two
+  commands (`updater:allow-check`, `updater:allow-download-and-install`) — and nothing else.
+  The folder picker and the "clip saved" toast are driven from Rust, which the capability
+  system does not gate, so the page cannot call either itself. The updater
   permissions are **not** an http capability: they let the *Rust side* make the one
   request described above, to the one URL pinned in `tauri.conf.json`. The webview still
   has no way to open a connection of its own — the CSP's `connect-src` is
@@ -273,12 +345,21 @@ discovered. Nothing in the application reads either half.
 The log is the application's own record of its warnings and errors: file paths and error
 text, never the GSI token and never footage.
 
-- **It is written under an exclusive lock.** Two shells would otherwise interleave their
-  lines into one file, and the rotation would rename a file the other process holds open —
-  which fails on Windows. The process that cannot take the lock writes a file of its own
-  (`replayed-<pid>.log`) rather than sharing
+- **It is written under an exclusive lock**, held on a file of its own, `logs\replayed.lock`,
+  not on the log: the log is renamed when it rotates, and a lock on a renamed file locks
+  nothing. Two shells would otherwise interleave their lines into one file, and the rotation
+  would rename a file the other process holds open — which fails on Windows. The process that
+  cannot take the lock writes a file of its own (`replayed-<pid>.log`) rather than sharing
   (`apps/desktop/src-tauri/src/log_file.rs::open_locked`,
   `apps/desktop/src-tauri/src/lib.rs::init_tracing`).
+- **"Copy diagnostics" is a manual, local copy.** It puts the configuration and the tail of the
+  log on the clipboard when the user presses it; nothing is sent anywhere. Credentials are
+  replaced with `<redacted>` (credential-looking keys, the GSI tokens wherever they appear, an
+  `Authorization: Bearer` header), and the Windows profile prefix in paths is shortened to
+  `%LOCALAPPDATA%`, `%APPDATA%` or `%USERPROFILE%`, which drops the account name. **That is
+  all it does**: game names, window titles and paths outside the profile are still in the
+  text, so read it before pasting it into a public issue
+  (`apps/desktop/src-tauri/src/commands/diagnostics.rs`).
 - **The webview cannot forge multi-line entries** — see above.
 
 ---
@@ -302,19 +383,39 @@ exceptions — the user may point either elsewhere.
 | `gsi\<game>\gamestate_integration_replayed.cfg` | the file to copy into the game's own folder |
 
 **The data directory moves with the rebrand.** The project is now `replayed`; the directory
-was `%LOCALAPPDATA%\localplay` and is now `%LOCALAPPDATA%\replayed`. The old directory is
-**migrated in place**: both binaries rename it over when it exists and the new one does not,
-and leave the old one alone if both are there — merging two directories is not something to
-do to somebody's library unasked. The move is a rename, not a copy, so a failure leaves the
-old directory exactly as it was
-(`apps/desktop/src-tauri/src/config.rs::migrate_legacy_data_dir`,
-`apps/replayed-cli/src/lib.rs::migrate_legacy_data_dir`).
+was `%LOCALAPPDATA%\localplay` and is now `%LOCALAPPDATA%\replayed`. The installer creates the
+new directory before the application ever runs, so what decides the move is the data in it: if
+the new directory already holds a `replayed.db` or a `config.toml`, this build has been used and
+the old directory is left alone — merging two libraries is not something to do to somebody's
+clips unasked. Otherwise each entry of the old directory is **moved across one at a time**
+(renamed, never copied, never overwriting a name that is taken), and a directory present on both
+sides is merged entry by entry. A failure loses nothing: what did not move is still in the old
+directory. The desktop shell leaves a marker while entries remain, so an interrupted move is
+finished at the next start, and it writes a report next to the data when anything was skipped or
+left behind. The paths *inside* the index are then repaired: a row is rewritten only if its path
+is under the old directory, nothing exists at it, and the same file exists under the new
+one (`apps/desktop/src-tauri/src/config.rs::migrate_legacy_data_dir`,
+`plan_legacy_path_repair`; the index is backed up first and the rewrite is one transaction that
+changes a row only if it still holds the value that was read). The CLI has its own, simpler
+move (`apps/replayed-cli/src/lib.rs::migrate_legacy_data_dir`).
 
 The index is user-writable and `config.toml` is hand-edited, so a path read from either can
 name anything. Every path the shell unlinks, removes or cuts from goes through
 `apps/desktop/src-tauri/src/paths.rs` first: the path's real parent (symlinks, junctions and
 `..` resolved) must sit under one of the directories replayed manages, and the path must be
 a proper child of it.
+
+**The automatic cleanup has its own, narrower rule.** Retention and cleanup run at start-up and
+every few minutes with nobody watching, on paths read out of that same editable database. They
+delete only through a `LibraryRoots` (`crates/store/src/roots.rs`): a clip's file must be inside
+the clips directory, a session's concatenated file inside the sessions directory, and a session's
+scratch directory must be a direct child of the sessions directory named `session-<digits>` (what
+the recorder creates), never the clips directory or an ancestor of it. "Inside" is decided on
+canonical paths, so a symlink or junction planted in the library cannot lead a removal out of
+it. A row that fails the check costs the user the row, not a file, and is reported as refused.
+The price is that rows written under a previous clips or sessions directory are no longer cleaned
+up automatically after the setting changes. A shared `[buffer] scratch_dir` is never a session's
+directory, so it is never removed as one.
 
 One thing worth stating in a security document because it is **data at rest**: the derived
 game payload is stored verbatim — in-game player names, kill/death/assist totals and, for
@@ -332,7 +433,10 @@ flag. The GSI token and the footage are never in the index or the log.
   before anything is extracted, and only the allowlisted paths inside it are. (The pin was
   repinned from Gyan's *essentials* build, which upstream documents as **GPLv3** and which
   carries libx264 and libx265, while the docs claimed LGPL.)
-- **`cargo-deny`, `npm audit` and gitleaks run in CI** (`.github/workflows/ci.yml`).
+- **`cargo-deny`, `npm audit` and gitleaks run in CI** (`.github/workflows/ci.yml`). The npm audit
+  covers dev dependencies as well as production ones and blocks at `--audit-level=moderate`.
+- **The two crates that would synthesise input are vendored and patched** (see
+  [Anti-cheat](#anti-cheat)).
 - **Every CI action is pinned to a full commit SHA**, and clippy, the formatter, the
   Windows-target lint and the verification harness are gates rather than advisories.
 - **The secret scan covers the whole history.** The per-push gitleaks step narrows itself
@@ -348,15 +452,37 @@ flag. The GSI token and the footage are never in the index or the log.
 ## Anti-cheat
 
 The project must be safe to run next to kernel anti-cheat. The policy is
-[`docs/anti-cheat.md`]; two things enforce it:
+[`docs/anti-cheat.md`]; these enforce it:
 
 - **`scripts/check-forbidden-apis.sh`** greps the tree for the *names* of the APIs the
   policy forbids — process injection, hooking, reading or writing another process, and
   input synthesis. The list covers more names than it did (`OpenProcess`,
   `LoadLibraryEx`, the `Nt`/`Zw` memory calls, `DeviceIoControl`, `PostMessage`,
   `GetProcAddress` and more), and it now scans the **`scripts/`** directory as well as the
-  Rust tree. Window enumeration is the one group that cannot be forbidden outright, so it
-  is asserted to be in the capture backend and nowhere else.
+  Rust tree and the **vendored crates** under `apps/desktop/src-tauri/vendor/`, which are
+  deliberately not excluded. It also bans a `.set_focus(` call in our own code. Window
+  enumeration is the one group that cannot be forbidden outright, so it is asserted to be in
+  the capture backend and nowhere else.
+- **`scripts/check-forbidden-apis.sh --binary <exe>`** (which runs
+  `scripts/check-pe-imports.py`) is the half that sees dependencies: it reads the import table
+  and the delay-load table of the *built* executable, and scans it for the names of functions
+  that would be looked up at run time, against an **empty** allowlist
+  (`scripts/pe-imports-allowlist.txt`). A file it cannot read as a PE image, or one with no
+  imports, fails rather than passes. CI runs it on the Windows build, and the release workflow
+  runs it again on the binary that goes into the installer.
+- **Two dependencies are vendored for this reason.** `tao` and `muda` each contained a
+  `SendInput` call (tao's `set_focus` pressed a synthetic Alt key when the system refused to
+  raise the window; muda's Copy/Paste menu items work by sending Ctrl+C/V), and the binary guard
+  found the import in `replayed-desktop.exe`. They live in `apps/desktop/src-tauri/vendor/`
+  with the call removed, wired in with `[patch.crates-io]`. The shell never calls `set_focus`;
+  it raises its window with `SetForegroundWindow` and `FlashWindowEx`
+  (`apps/desktop/src-tauri/src/window_focus.rs`), and a window the system will not raise stays
+  where it is. How to re-vendor is in `apps/desktop/src-tauri/vendor/README.md`.
+- **The CLI installs a console-control handler** for Ctrl+C, Ctrl+Break and closing the
+  console, so a recording is finalised instead of abandoned. It is
+  `SetConsoleCtrlHandler` for the process's own console: it sets a flag, touches no other
+  process, installs no hook and synthesises no input
+  (`apps/replayed-cli/src/shutdown.rs`).
 - **`crates/events/tests/anti_cheat.rs`** pins the `windows` feature groups the events
   crate enables and the Windows APIs it imports — a list of what *is* allowed, so a new
   import from anywhere else fails whatever it is called. The groups that would allow

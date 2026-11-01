@@ -81,16 +81,45 @@ impl Config {
         Self::from_toml(&text)
     }
 
+    /// Every rule the CLI enforces on a parsed file, in two groups.
+    ///
+    /// **Engine rules** protect the recording engine, not this front-end, so they live in
+    /// `replayed-recorder` ([`replayed_recorder::config::validate`], the function behind
+    /// [`replayed_recorder::RecorderConfig::validate`]) where every front-end is held to them. This
+    /// calls the library on the parsed `buffer`, `encode` and `storage` sections rather than on a
+    /// `RecorderConfig`, because a `RecorderConfig` needs the ffmpeg binaries and the data directory
+    /// and a config file that is refused should be refused at load, before either is looked for;
+    /// `Recorder::start` runs the same check again on what it is handed. The rules:
+    ///
+    /// | rule | refused |
+    /// |---|---|
+    /// | `encode.vendor` | `"software"` (no CPU fallback by design), and anything not `auto`/`nvenc`/`qsv`/`amf` |
+    /// | `buffer.segment_time` | `0` (an all-intra stream, a segment file per frame) |
+    /// | `buffer.post_seconds` | `0` (a clip with no post-roll to wait for) |
+    /// | `encode.fps` | `0` (`1 / fps` is meaningless, and ffmpeg's `-framerate 0` is an error) |
+    /// | `buffer.ram_cap_bytes` | outside 8 MiB..=64 GiB |
+    /// | `storage.*` retention | a zero cap or a zero age, for the clips and the sessions |
+    ///
+    /// **CLI rules** are about what only this front-end parses or runs, and stay here
+    /// ([`Config::validate_cli_rules`]):
+    ///
+    /// | rule | refused |
+    /// |---|---|
+    /// | `events.gsi_port` | anything but `0` (listener off) or `1024..=65535` |
+    /// | `audio.codec` | anything but `"aac"` (the `[audio]` section's only parser is the CLI) |
+    /// | `audio.source` | anything but `"loopback"` |
+    ///
+    /// Checked elsewhere in the CLI's startup, not in this function: the hotkey chord
+    /// (`Hotkey::parse`, in `replayed-events`), `[events] mute_clips` (`Policy::new`), a
+    /// schema version from the future (`config_schema::parse`), and microphone-on with game
+    /// audio off (refused by the recorder itself).
     fn validate(&self) -> Result<()> {
-        // Fail closed: there is no CPU encoder to fall back to.
-        match self.encode.vendor.as_str() {
-            "auto" | "nvenc" | "qsv" | "amf" => {}
-            "software" => bail!(
-                "vendor = \"software\" is not supported: replayed requires a GPU hardware \
-                 encoder (nvenc, qsv or amf) so that capturing does not cost game performance"
-            ),
-            other => bail!("unknown encode.vendor: {other}"),
-        }
+        replayed_recorder::config::validate(&self.buffer, &self.encode, &self.storage)?;
+        self.validate_cli_rules()
+    }
+
+    /// The rules about what only this front-end parses or runs; see [`Config::validate`].
+    fn validate_cli_rules(&self) -> Result<()> {
         // 0 disables the listener (documented in `config.example.toml`). Anything else is a real port,
         // and the default sits above the ephemeral range so a temporarily bound listener elsewhere
         // cannot shadow it at startup.
@@ -98,21 +127,6 @@ impl Config {
             bail!(
                 "events.gsi_port must be 0 (disabled) or between 1024 and 65535, got {}",
                 self.events.gsi_port
-            );
-        }
-        if self.buffer.segment_time == 0 {
-            bail!("buffer.segment_time must be at least 1 second");
-        }
-        if self.buffer.post_seconds == 0 {
-            bail!("buffer.post_seconds must be at least 1 second");
-        }
-        // The rate declared to the encoder (`-framerate`) and capture is paced to. Zero is not a rate:
-        // it makes `1 / fps` meaningless and ffmpeg's `-framerate 0` an error, and the engine would
-        // clamp it to 1 rather than guess. Say so instead.
-        if self.encode.fps == 0 {
-            bail!(
-                "encode.fps must be at least 1: it is the ceiling on the frame rate the \
-                 pipeline paces to (it measures itself against this — see encode.adapt_fps)"
             );
         }
         // The pipeline records aac over the system loopback and nothing else (ffmpeg input 1 is a
@@ -336,6 +350,79 @@ gsi_port = 45671
             .replace("gsi_port = 45671", "gsi_port = 0");
         let cfg = Config::from_toml(&text).expect("0 is a valid setting");
         assert_eq!(cfg.events.gsi_port, 0);
+    }
+
+    /// A zero segment is an all-intra stream and a segment file per frame; the desktop shell, which
+    /// reads the same file, does not refuse it (see `Config::validate`).
+    #[test]
+    fn rejects_a_zero_segment_time() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("segment_time = 1", "segment_time = 0");
+        assert!(
+            text.contains("segment_time = 0"),
+            "the substitution must apply"
+        );
+        let err = Config::from_toml(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("buffer.segment_time"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_zero_post_seconds() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("post_seconds = 5", "post_seconds = 0");
+        assert!(
+            text.contains("post_seconds = 0"),
+            "the substitution must apply"
+        );
+        let err = Config::from_toml(&text).unwrap_err();
+        assert!(
+            err.to_string().contains("buffer.post_seconds"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn rejects_an_unknown_vendor() {
+        let text = include_str!("../../../config.example.toml")
+            .replace("vendor = \"auto\"", "vendor = \"vulkan\"");
+        assert!(
+            text.contains("vendor = \"vulkan\""),
+            "the substitution must apply"
+        );
+        let err = Config::from_toml(&text).unwrap_err();
+        assert!(err.to_string().contains("encode.vendor"), "got: {err}");
+    }
+
+    /// The retention and RAM-cap rules were never the CLI's: they arrive with the library's check, so
+    /// a CLI-loaded file is held to what the desktop and `Recorder::start` hold it to.
+    #[test]
+    fn the_library_rules_beyond_the_old_four_apply_to_a_cli_file() {
+        let example = include_str!("../../../config.example.toml");
+        for (from, to, key) in [
+            (
+                "max_age_days = 7",
+                "max_age_days = 0",
+                "storage.max_age_days",
+            ),
+            (
+                "max_total_bytes = 53687091200",
+                "max_total_bytes = 0",
+                "storage.max_total_bytes",
+            ),
+            (
+                "ram_cap_bytes = 268435456",
+                "ram_cap_bytes = 1024",
+                "buffer.ram_cap_bytes",
+            ),
+        ] {
+            let text = example.replacen(from, to, 1);
+            assert_ne!(text, example, "the substitution must apply: {from}");
+            let err = Config::from_toml(&text).unwrap_err();
+            assert!(format!("{err:#}").contains(key), "{key}: {err:#}");
+        }
     }
 
     /// The frame rate is what the pipeline declares and paces to, so zero must fail with a sentence

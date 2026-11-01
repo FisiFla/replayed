@@ -250,6 +250,100 @@ describe('the encoder section', () => {
     expect(text(target)).toContain('They apply on the next recording start');
   });
 
+  /** Type into a field, as the user would. */
+  async function type(field: HTMLInputElement, value: string) {
+    field.value = value;
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    await tick();
+  }
+
+  it('writes only what was edited here, over a fresh read of the file', async () => {
+    // The Capture group saved 120 fps after this panel read the file at 60. Raising the
+    // bitrate here used to send the whole stale draft and put 60 back, then say "saved".
+    let reads = 0;
+    const sent: { value: EncoderSettings | null } = { value: null };
+    const source = fakeSource({
+      encoderSettings: () => {
+        reads += 1;
+        return Promise.resolve(reads === 1 ? SAVED : { ...SAVED, fps: 120, output_size: '1920x1080' });
+      },
+      updateEncoderSettings: (settings: EncoderSettings) => {
+        sent.value = settings;
+        return Promise.resolve(settings);
+      },
+    });
+    const target = await mountPanel(source);
+    expect(select(target, 'Frame rate (ceiling)')?.value).toBe('60');
+
+    await type(input(target, 'Video bitrate (kbit/s)')!, '24000');
+    button(target, 'Apply encoder')?.click();
+    await settle();
+
+    expect(sent.value?.bitrate_kbps, 'the edit was sent').toBe(24000);
+    expect(sent.value?.fps, 'the frame rate Capture saved was kept').toBe(120);
+    expect(sent.value?.output_size, 'so was the size').toBe('1920x1080');
+  });
+
+  it('still sends a field the user did edit here, even when another one changed under it', async () => {
+    let reads = 0;
+    const sent: { value: EncoderSettings | null } = { value: null };
+    const source = fakeSource({
+      encoderSettings: () => {
+        reads += 1;
+        return Promise.resolve(reads === 1 ? SAVED : { ...SAVED, fps: 120 });
+      },
+      updateEncoderSettings: (settings: EncoderSettings) => {
+        sent.value = settings;
+        return Promise.resolve(settings);
+      },
+    });
+    const target = await mountPanel(source);
+
+    const fps = select(target, 'Frame rate (ceiling)')!;
+    fps.value = '30';
+    fps.dispatchEvent(new Event('change', { bubbles: true }));
+    await tick();
+    button(target, 'Apply encoder')?.click();
+    await settle();
+
+    expect(sent.value?.fps).toBe(30);
+  });
+
+  it('writes nothing when the file cannot be read again first', async () => {
+    // Laying a stale draft over a table that could not be read is the overwrite itself.
+    let reads = 0;
+    const update = vi.fn((settings: EncoderSettings) => Promise.resolve(settings));
+    const source = fakeSource({
+      encoderSettings: () => {
+        reads += 1;
+        return reads === 1 ? Promise.resolve(SAVED) : Promise.reject(new Error('the file is locked'));
+      },
+      updateEncoderSettings: update,
+    });
+    const target = await mountPanel(source);
+
+    await type(input(target, 'Video bitrate (kbit/s)')!, '24000');
+    button(target, 'Apply encoder')?.click();
+    await settle();
+
+    expect(update).not.toHaveBeenCalled();
+    expect(target.querySelector('[role="alert"]')?.textContent).toContain('the file is locked');
+  });
+
+  it('tells its owner when the settings were saved', async () => {
+    const onSaved = vi.fn();
+    const target = document.createElement('div');
+    document.body.appendChild(target);
+    app = mount(EncoderPanel, { target, props: { source: fakeSource(), onSaved } });
+    await settle();
+
+    await type(input(target, 'Video bitrate (kbit/s)')!, '24000');
+    button(target, 'Apply encoder')?.click();
+    await settle();
+
+    expect(onSaved).toHaveBeenCalledTimes(1);
+  });
+
   it('refuses a bitrate the backend would not take, before it is sent', async () => {
     let sent = 0;
     const source = fakeSource({

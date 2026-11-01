@@ -265,8 +265,10 @@ pub fn trim_clip(
             .map_err(|e| CommandError::io("creating the clips directory", dir, e))?;
     }
 
-    trim_lossless(bins, &clip.path, &dst, start_ms, end_ms)
-        .map_err(|e| CommandError::media("trimming the clip", e))?;
+    trim_lossless(bins, &clip.path, &dst, start_ms, end_ms).map_err(|e| {
+        discard_partial(&dst);
+        CommandError::media("trimming the clip", e)
+    })?;
 
     // The file exists from here on. Everything below can fail, and if it does the file stays: it is
     // what the user asked for, and deleting it to report a bookkeeping error would destroy the only
@@ -416,7 +418,7 @@ pub fn thumbnail(deps: &Deps<'_>, id: i64, at_ms: u64) -> Result<ThumbnailRef, C
     let dst = deps
         .paths
         .thumbnails_dir
-        .join(thumbnail_file_name(id, at_ms));
+        .join(thumbnail_file_name(id, clip.created_at_ms, at_ms));
     if dst.is_file() {
         return Ok(ThumbnailRef {
             clip_id: id,
@@ -558,14 +560,17 @@ pub fn save_screenshot(
             ),
         ));
     }
+    let bins = deps.binaries()?;
     let dst = free_output_path(
         deps.paths
             .clips_dir
             .join(format!("screenshot-{}.png", now_ms())),
     )?;
-    let bins = deps.binaries()?;
     replayed_media::edit::screenshot_png(bins, frame.width, frame.height, &frame.data, &dst)
-        .map_err(|e| CommandError::media("writing the screenshot", e))?;
+        .map_err(|e| {
+            discard_partial(&dst);
+            CommandError::media("writing the screenshot", e)
+        })?;
 
     // The file exists from here on; a bookkeeping failure must not delete it.
     let size_bytes = std::fs::metadata(&dst)
@@ -668,13 +673,14 @@ pub fn combine_clips(deps: &Deps<'_>, ids: &[i64]) -> Result<ClipDto, CommandErr
     }
 
     let paths: Vec<std::path::PathBuf> = clips.iter().map(|clip| clip.path.clone()).collect();
+    let bins = deps.binaries()?;
     let dst = free_output_path(
         deps.paths
             .clips_dir
             .join(format!("combine-{}.mp4", now_ms())),
     )?;
-    let bins = deps.binaries()?;
     replayed_media::edit::combine_lossless(bins, &paths, &dst).map_err(|e| {
+        discard_partial(&dst);
         CommandError::media(
             &format!(
                 "combining clips {}",
@@ -767,10 +773,13 @@ pub fn export_clip(deps: &Deps<'_>, id: i64, preset: &str) -> Result<ExportOutco
         deps.paths
             .clips_dir
             .join(format!("{stem}-{}.{}", preset.as_str(), preset.extension()));
-    let dst = free_output_path(candidate)?;
     let bins = deps.binaries()?;
+    let dst = free_output_path(candidate)?;
     replayed_media::export::export(bins, &clip.path, &dst, preset, clip.duration_ms).map_err(
-        |e| CommandError::media(&format!("exporting clip #{id} as {}", preset.as_str()), e),
+        |e| {
+            discard_partial(&dst);
+            CommandError::media(&format!("exporting clip #{id} as {}", preset.as_str()), e)
+        },
     )?;
 
     // Sized and probed from the file that was written: a re-encode may land a few frames either
@@ -902,12 +911,25 @@ pub fn trim_output_path(src: &Path, start_ms: u64, end_ms: u64) -> PathBuf {
     src.with_file_name(format!("{stem}.trim-{start_ms}-{end_ms}.{ext}"))
 }
 
-/// The first name derived from `candidate` that no file on disk already holds.
+/// The first name derived from `candidate` that no file on disk already holds, **claimed** by
+/// creating it empty.
 ///
 /// Bounded, and reaching the bound is an error rather than an overwrite: clobbering a previous
 /// trim would destroy a file the index may name.
+///
+/// The claim is the point of creating the file. Looking for a free name and writing to it later
+/// is a race between two commands that pick the same name, and the commands that run ffmpeg no
+/// longer take turns on the index's lock (see `AppState::with_deps_detached`): two identical
+/// trims, or two combines in the same millisecond, would both pick `x.trim-0-1000.mp4` and write
+/// it at once, and ffmpeg's `-y` would let the second destroy the first. `create_new` is atomic,
+/// so the loser steps to the next name. A command that does not go on to write the file has to
+/// give the claim back (see [`discard_partial`]).
 pub(super) fn free_output_path(candidate: PathBuf) -> Result<PathBuf, CommandError> {
-    if !candidate.exists() {
+    if let Some(dir) = candidate.parent() {
+        std::fs::create_dir_all(dir)
+            .map_err(|e| CommandError::io("creating the clips directory", dir, e))?;
+    }
+    if claim(&candidate)? {
         return Ok(candidate);
     }
     let stem = candidate
@@ -921,7 +943,7 @@ pub(super) fn free_output_path(candidate: PathBuf) -> Result<PathBuf, CommandErr
 
     for n in 2..1000u32 {
         let next = candidate.with_file_name(format!("{stem}-{n}.{ext}"));
-        if !next.exists() {
+        if claim(&next)? {
             return Ok(next);
         }
     }
@@ -935,9 +957,88 @@ pub(super) fn free_output_path(candidate: PathBuf) -> Result<PathBuf, CommandErr
     ))
 }
 
+/// Create `path` empty if nothing is there. `Ok(false)` means the name was taken.
+fn claim(path: &Path) -> Result<bool, CommandError> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(CommandError::io("creating the output file", path, e)),
+    }
+}
+
+/// Remove what a failed ffmpeg run left at `dst`: the empty file [`free_output_path`] claimed, or
+/// the half-written one ffmpeg put in its place.
+///
+/// ffmpeg does not clean up after itself, and a stream copy that timed out or died mid-write is
+/// a truncated file in the clips directory that no index row names: invisible to the library and
+/// the storage policy, and counted nowhere, so it only ever grows disk use. It is safe to delete
+/// because the name was claimed by this very call, so nothing else can have been written there.
+pub(super) fn discard_partial(dst: &Path) {
+    if let Err(err) = std::fs::remove_file(dst) {
+        if err.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(
+                "the partial output {} could not be removed: {err}",
+                dst.display()
+            );
+        }
+    }
+}
+
 /// The cache file name for one clip's thumbnail at one timestamp.
-pub fn thumbnail_file_name(clip_id: i64, at_ms: u64) -> String {
-    format!("clip-{clip_id}-{at_ms}.jpg")
+///
+/// **The id alone does not identify a clip.** SQLite hands the id of a deleted last row to the next
+/// insert, and the storage policy and the CLI delete clips without ever touching this cache, so a
+/// cache keyed by id alone served the previous clip's frame for a new clip that reused its id, for
+/// ever. The instant the row was written (`created_at_ms`, stamped by the store and never reused by
+/// a row that survives) is in the name, so a recycled id is a cache miss. The id stays the leading
+/// component, which is what [`remove_cached_thumbnails`] matches on.
+pub fn thumbnail_file_name(clip_id: i64, created_at_ms: i64, at_ms: u64) -> String {
+    format!("clip-{clip_id}-{at_ms}-{created_at_ms}.jpg")
+}
+
+/// Remove the cached thumbnails that no clip in the index owns. Returns how many went.
+///
+/// A thumbnail is kept only when its name carries the id *and* the creation instant of a clip that
+/// is still in the index, which is what [`thumbnail_file_name`] writes. Everything else with the
+/// cache's shape (`clip-*.jpg`) goes: the files of clips the storage policy or the CLI deleted
+/// behind the cache's back, and the files an older build wrote without the instant, which the
+/// current name never looks up. Run once when the shell opens; nothing else in the directory is
+/// touched.
+pub fn sweep_stale_thumbnails(dir: &Path, clips: &[Clip]) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let Some(body) = name
+            .strip_prefix("clip-")
+            .and_then(|rest| rest.strip_suffix(".jpg"))
+        else {
+            continue;
+        };
+        let mut parts = body.split('-');
+        let owned = match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(id), Some(_at), Some(created), None) => {
+                match (id.parse::<i64>(), created.parse::<i64>()) {
+                    (Ok(id), Ok(created)) => clips
+                        .iter()
+                        .any(|clip| clip.id == id && clip.created_at_ms == created),
+                    _ => false,
+                }
+            }
+            _ => false,
+        };
+        if !owned && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
+        }
+    }
+    removed
 }
 
 /// Remove every cached thumbnail belonging to `clip_id`. Returns how many went.
@@ -1759,9 +1860,11 @@ mod tests {
             f.paths.thumbnails_dir,
             "the cache, not the clips dir"
         );
+        let created = find_clip(&f.store, id).unwrap().created_at_ms;
         assert_eq!(
             path.file_name().unwrap().to_string_lossy(),
-            format!("clip-{id}-1000.jpg")
+            format!("clip-{id}-1000-{created}.jpg"),
+            "the name carries the clip's id, the frame and the instant the row was written"
         );
         let bytes = std::fs::read(&path).unwrap();
         assert_eq!(
@@ -1789,6 +1892,149 @@ mod tests {
         assert_eq!(
             std::fs::read_dir(&f.paths.thumbnails_dir).unwrap().count(),
             2
+        );
+    }
+
+    /// **A recycled clip id must not inherit the previous clip's thumbnail.**
+    ///
+    /// SQLite gives the id of a deleted last row to the next insert, and retention deletes clips
+    /// without touching the thumbnail cache. With the cache keyed by id alone the new clip was
+    /// answered `cached: true` with the old clip's frame.
+    #[test]
+    fn a_clip_that_reuses_a_deleted_clips_id_gets_its_own_thumbnail() {
+        let f = Fixture::new();
+        let (id, _src) = f.add_real_clip("first.mp4", 4);
+        let first = thumbnail(&f.deps(), id, 1_000).unwrap();
+        assert!(!first.cached);
+
+        // The retention path: the row and the file go, the cache is not told.
+        f.store.delete_clip_returning_path(id).unwrap();
+        // The clock's millisecond has to move, as it does between two real clips.
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        let (reused, _src) = f.add_real_clip("second.mp4", 4);
+        assert_eq!(
+            reused, id,
+            "the store reused the id: the premise of the test"
+        );
+
+        let second = thumbnail(&f.deps(), reused, 1_000).unwrap();
+
+        assert!(
+            !second.cached,
+            "the new clip was served the deleted clip's cached frame"
+        );
+        assert_ne!(second.path, first.path);
+    }
+
+    #[test]
+    fn the_sweep_keeps_the_thumbnails_of_live_clips_and_removes_the_rest() {
+        let f = Fixture::new();
+        let (id, _src) = f.add_real_clip("live.mp4", 4);
+        let live = thumbnail(&f.deps(), id, 1_000).unwrap();
+        let dir = &f.paths.thumbnails_dir;
+        let created = find_clip(&f.store, id).unwrap().created_at_ms;
+        // A deleted clip's frame, an older build's unstamped name, a recycled id's stale stamp, and a
+        // file that is not the cache's at all.
+        let orphan = dir.join(thumbnail_file_name(id + 50, 1, 0));
+        let unstamped = dir.join(format!("clip-{id}-2000.jpg"));
+        let recycled = dir.join(thumbnail_file_name(id, created - 1, 3_000));
+        let foreign = dir.join("notes.txt");
+        for path in [&orphan, &unstamped, &recycled, &foreign] {
+            std::fs::write(path, b"x").unwrap();
+        }
+
+        let clips = list_clips_raw(&f);
+        let removed = sweep_stale_thumbnails(dir, &clips);
+
+        assert_eq!(removed, 3);
+        assert!(
+            PathBuf::from(&live.path).is_file(),
+            "a live clip's frame stays"
+        );
+        assert!(
+            foreign.is_file(),
+            "a file that is not the cache's is not touched"
+        );
+        assert!(!orphan.exists() && !unstamped.exists() && !recycled.exists());
+    }
+
+    fn list_clips_raw(f: &Fixture) -> Vec<Clip> {
+        f.store.list_clips().unwrap()
+    }
+
+    /// **A failed ffmpeg run leaves no file behind.**
+    ///
+    /// ffmpeg does not remove its own half-written output, and nothing names it in the index, so it
+    /// sat in the clips directory for ever. The command also claims the output name before it runs
+    /// (see [`free_output_path`]), so the claim has to be given back too.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_trim_leaves_no_partial_file_in_the_clips_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        let (id, _src) = f.add_real_clip("whole.mp4", 4);
+        // An ffmpeg that writes half a file to its last argument and dies, as one killed by the
+        // timeout or a full disk does.
+        let fake = f._dir.path().join("fake-ffmpeg.sh");
+        std::fs::write(
+            &fake,
+            "#!/bin/sh\nfor last; do :; done\nprintf partial > \"$last\"\nexit 1\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bins = FfmpegBinaries {
+            ffmpeg: fake,
+            ffprobe: f.bins.ffprobe.clone(),
+        };
+        let deps = Deps {
+            bins: Some(&bins),
+            ..f.deps()
+        };
+        let before: Vec<_> = clips_dir_files(&f);
+
+        let err = trim_clip(&deps, id, 1_000, 2_000).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::Media);
+        assert_eq!(
+            clips_dir_files(&f),
+            before,
+            "the failed trim left a file in the clips directory"
+        );
+    }
+
+    #[cfg(unix)]
+    fn clips_dir_files(f: &Fixture) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(&f.paths.clips_dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Two commands that pick the same output name must not both write it.
+    ///
+    /// The ffmpeg commands no longer take turns on the index's lock, so "find a free name, write to
+    /// it later" is a race (ffmpeg's `-y` lets the second writer destroy the first). The name is
+    /// claimed when it is chosen.
+    #[test]
+    fn two_claims_of_one_output_name_get_two_names() {
+        let f = Fixture::new();
+        let candidate = f.paths.clips_dir.join("combine-1.mp4");
+
+        let first = free_output_path(candidate.clone()).unwrap();
+        let second = free_output_path(candidate.clone()).unwrap();
+
+        assert_eq!(first, candidate);
+        assert_ne!(
+            second, first,
+            "the second command was handed the first's file"
+        );
+        assert!(
+            first.is_file() && second.is_file(),
+            "both names are claimed on disk"
         );
     }
 
@@ -2076,7 +2322,7 @@ mod tests {
         let neighbour = f
             .paths
             .thumbnails_dir
-            .join(thumbnail_file_name(id + 100, 1_000));
+            .join(thumbnail_file_name(id + 100, 0, 1_000));
         std::fs::write(&neighbour, b"another clip's frame").unwrap();
 
         let outcome = delete_clip(&f.deps(), id).unwrap();
@@ -2137,7 +2383,7 @@ mod tests {
 
     #[test]
     fn the_thumbnail_cache_name_is_derived_from_the_clip_and_the_frame() {
-        assert_eq!(thumbnail_file_name(1, 0), "clip-1-0.jpg");
-        assert_eq!(thumbnail_file_name(12, 1_500), "clip-12-1500.jpg");
+        assert_eq!(thumbnail_file_name(1, 77, 0), "clip-1-0-77.jpg");
+        assert_eq!(thumbnail_file_name(12, 77, 1_500), "clip-12-1500-77.jpg");
     }
 }

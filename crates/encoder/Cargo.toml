@@ -23,10 +23,22 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Direct3D11",
     "Win32_Graphics_Dxgi_Common",
     "Win32_Media_MediaFoundation",
+    # `src/audio_link.rs`: which process owns the client end of the audio connection
+    # (`GetExtendedTcpTable`), so a stranger that dials the loopback port first is refused.
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_System_Com",
     "Win32_System_Ole",
+    # The tests that need a Quick Sync encoder skip in session 0 (an SSH login or a service), where
+    # Intel's MFTs cannot be created.
+    "Win32_System_RemoteDesktop",
     "Win32_System_Variant",
 ] }
+
+# `src/audio_link.rs`: the Unix-domain audio input asks the kernel which process connected
+# (`LOCAL_PEERPID` / `SO_PEERCRED`), so a stranger on the machine cannot be the audio input.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 tempfile.workspace = true

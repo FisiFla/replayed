@@ -73,7 +73,11 @@ export interface StorageStats {
 export interface ExportOutcome {
   /** The preset that produced it, by its wire name: `discord`, `vertical` or `gif`. */
   preset: string;
-  /** The file written, which the window offers to reveal. */
+  /**
+   * The file written. The window only *reports* it, in a notice that names the file and says
+   * it is beside the clip; there is no action that reveals an export (`reveal_clip` takes a
+   * library clip id, and an export is not in the library).
+   */
   path: string;
   size_bytes: number;
   /** The exported file's own length; a re-encode may shift it by a frame or two. */
@@ -273,6 +277,14 @@ export interface RecordingStatus {
   recorder_mode: string;
   /** Whether this recording carries a microphone track (`[mic] enabled`). */
   mic_enabled: boolean;
+  /**
+   * Why the recording ended on its own without failing (the captured window was closed, or a
+   * resize this mode cannot follow). Never set together with `error`: a closed game is the
+   * recording doing its job, not a fault.
+   */
+  ended: string | null;
+  /** How long the capture has delivered no frames, in ms, once that is long enough to say. */
+  stalled_for_ms: number | null;
 }
 
 /** One active audio endpoint, as `list_audio_devices` returns it. */
@@ -466,7 +478,21 @@ export type ErrorCode =
   | 'store'
   | 'media'
   | 'io'
-  | 'recording';
+  | 'recording'
+  | 'recording_active';
+
+/**
+ * What `prepare_for_update` did, as `UpdatePreparationDto` serialises it.
+ *
+ * `was_recording` is whether a recording was running when the call arrived; `stopped` is whether
+ * this call stopped and finalised it, which happens only when it was asked to (`stop_recording`
+ * true). A recording that is running and was not to be stopped is not an answer of this shape: it
+ * is the `recording_active` error.
+ */
+export interface UpdatePreparation {
+  was_recording: boolean;
+  stopped: boolean;
+}
 
 /** A structured command failure, as `CommandError` serialises it. */
 export interface CommandError {

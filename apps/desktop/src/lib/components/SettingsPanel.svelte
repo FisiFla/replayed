@@ -58,6 +58,8 @@
     gsiTargets?: GsiTarget[];
     /** Write that game's Game State Integration cfg into its detected folder. */
     onInstallGsi?: (game: GsiGame) => void;
+    /** The encoder section wrote settings, some of which this panel shows: read them again. */
+    onEncoderSaved?: () => void;
   }
 
   let {
@@ -71,6 +73,7 @@
     hotkeyInForce = null,
     gsiTargets = [],
     onInstallGsi = () => {},
+    onEncoderSaved = () => {},
   }: Props = $props();
 
   const RESOLUTIONS = [
@@ -165,18 +168,18 @@
   function applyCapture() {
     if (!fpsValid || fps === null) return;
     if (monitor === null || settings === null) return;
-    onApply({
-      fps,
-      output_size: outputSize,
-      mic_enabled: micEnabled,
-      ...captureUpdate(settings, {
+    onApply(
+      captureUpdate(settings, {
+        fps,
+        outputSize,
+        micEnabled,
         quality,
         monitor,
         window: windowTitle,
         micDevice,
         outputDevice,
       }),
-    });
+    );
   }
 
   /**
@@ -504,7 +507,10 @@
       </button>
     </div>
 
-    <EncoderPanel />
+    <EncoderPanel
+      onSaved={onEncoderSaved}
+      shared={{ fps: settings.fps, output_size: settings.output_size }}
+    />
 
     <div class="group" id="settings-automatic">
       <h3>Automatic recording</h3>
@@ -549,7 +555,11 @@
         opened, read or injected. The executable identifies the game, so each may appear once.
       </p>
       <ul class="watch">
-        {#each watchGames as game, index (game.exe)}
+        <!-- Not keyed by executable: a draft can hold the same one twice for a moment (adding
+             the exact name already listed), and a keyed each throws on a duplicate key before
+             the "watched twice" message below can say what is wrong. The rows hold no state of
+             their own, so position is all the identity they need. -->
+        {#each watchGames as game, index}
           <li>
             <span class="watch-name">{game.name}</span>
             <span class="mono muted">{game.exe}</span>
@@ -637,7 +647,7 @@
       {/each}
     </div>
 
-    <UpdaterPanel />
+    <UpdaterPanel {recording} />
     </div>
     </div>
   {/if}

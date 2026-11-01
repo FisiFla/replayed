@@ -21,7 +21,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 }));
 
 import { convertFileSrc, invoke } from '@tauri-apps/api/core';
-import { errorCode, errorMessage, isCommandError, tauriIpc } from './ipc';
+import { errorCode, errorMessage, isCommandError, prepareForUpdate, tauriIpc } from './ipc';
 import type { EncoderSettings } from './ipc';
 
 const mockedInvoke = vi.mocked(invoke);
@@ -131,6 +131,9 @@ describe('the command names', () => {
     expect(await wireName(() => tauriIpc.updateEncoderSettings(ENCODER_SETTINGS))).toBe(
       'update_encoder_settings',
     );
+    // Not on `ClipSource` (the screenshot harness fakes that, and has no updater), so it is
+    // reached through its own function.
+    expect(await wireName(() => prepareForUpdate(false))).toBe('prepare_for_update');
   });
 
   it('uses every command the Rust side registers, and invents none', async () => {
@@ -180,6 +183,7 @@ describe('the command names', () => {
       await wireName(() => tauriIpc.encoderStatus()),
       await wireName(() => tauriIpc.captureDisplays()),
       await wireName(() => tauriIpc.copyDiagnostics()),
+      await wireName(() => prepareForUpdate(false)),
     ];
 
     expect([...reached].sort()).toEqual([...registeredCommands()].sort());
@@ -247,12 +251,20 @@ describe('the argument keys', () => {
         tauriIpc.updateEncoderSettings(ENCODER_SETTINGS),
       ),
       capture_displays: await wireArgs(() => tauriIpc.captureDisplays()),
+      prepare_for_update: await wireArgs(() => prepareForUpdate(true)),
     };
 
     for (const [command, args] of Object.entries(sent)) {
       const declared = rustParameters(command);
       expect(Object.keys(args).sort(), `arguments for ${command}`).toEqual(declared.sort());
     }
+  });
+
+  it('sends stop_recording to prepare_for_update, as the flag the user agreed to', async () => {
+    // Snake_case like every command here, and the value is the user's answer, not a default:
+    // `false` asks "may I install?" and is refused while recording; `true` is "stop it first".
+    expect(await wireArgs(() => prepareForUpdate(false))).toEqual({ stop_recording: false });
+    expect(await wireArgs(() => prepareForUpdate(true))).toEqual({ stop_recording: true });
   });
 
   it('sends no arguments to the commands that take none', async () => {
@@ -308,6 +320,74 @@ describe('a command that fails', () => {
     });
   });
 
+  it('logs cancelling the folder picker as information, not as an error', async () => {
+    // "no folder was chosen" is the user's answer. At ERROR level it appeared under Health as
+    // a recent problem.
+    mockedInvoke.mockRejectedValueOnce({
+      code: 'invalid_input',
+      message: 'no folder was chosen, so the clips directory was not changed',
+    });
+
+    await expect(tauriIpc.chooseClipsDir()).rejects.toBeDefined();
+
+    expect(mockedInvoke).toHaveBeenLastCalledWith('log_from_frontend', {
+      level: 'info',
+      message: 'choose_clips_dir failed',
+      detail: 'no folder was chosen, so the clips directory was not changed',
+    });
+  });
+
+  it('keeps every other command’s invalid input an error', async () => {
+    mockedInvoke.mockRejectedValueOnce({ code: 'invalid_input', message: 'start is after end' });
+
+    await expect(tauriIpc.trimClip(1, 5, 2)).rejects.toBeDefined();
+
+    expect(mockedInvoke).toHaveBeenLastCalledWith('log_from_frontend', {
+      level: 'error',
+      message: 'trim_clip failed',
+      detail: 'start is after end',
+    });
+  });
+
+  it('says a failure that keeps repeating once, until the command answers again', async () => {
+    // `recording_status` is polled twice a second: a persistent failure used to write two
+    // error lines a second and push real errors out of the log's tail.
+    const failure = { code: 'internal', message: 'the recorder lock is poisoned' };
+    const logged = () =>
+      mockedInvoke.mock.calls.filter(
+        ([name, args]) =>
+          name === 'log_from_frontend' &&
+          (args as { message: string }).message === 'recording_status failed',
+      ).length;
+    mockedInvoke.mockClear();
+    // The failure is keyed by command, because `log_from_frontend` goes through `invoke` too
+    // and would otherwise use up a queued rejection meant for the status read.
+    let failing: { code: string; message: string } | null = failure;
+    mockedInvoke.mockImplementation(async (command: string) => {
+      if (command === 'recording_status' && failing !== null) throw failing;
+      return {};
+    });
+
+    try {
+      for (let i = 0; i < 3; i++) await expect(tauriIpc.recordingStatus()).rejects.toBeDefined();
+      expect(logged()).toBe(1);
+
+      // It answers, and then fails again: that is a new episode, and it is written.
+      failing = null;
+      await tauriIpc.recordingStatus();
+      failing = failure;
+      await expect(tauriIpc.recordingStatus()).rejects.toBeDefined();
+      expect(logged()).toBe(2);
+
+      // A different failure of the same command is news too.
+      failing = { ...failure, message: 'the recorder thread is gone' };
+      await expect(tauriIpc.recordingStatus()).rejects.toBeDefined();
+      expect(logged()).toBe(3);
+    } finally {
+      mockedInvoke.mockImplementation(async () => ({}));
+    }
+  });
+
   it('still rejects, so the caller can put it in front of the user as well', async () => {
     mockedInvoke.mockRejectedValueOnce('Command not found');
 
@@ -360,5 +440,26 @@ describe('error handling', () => {
 
   it('falls back to something readable for an object it does not know', () => {
     expect(errorMessage({ unexpected: true })).toBe('{"unexpected":true}');
+  });
+});
+
+describe('the recording_active refusal', () => {
+  it('is a command error the frontend recognises by its code', () => {
+    const refusal = { code: 'recording_active', message: 'a recording is running' };
+    expect(isCommandError(refusal)).toBe(true);
+    expect(errorCode(refusal)).toBe('recording_active');
+  });
+
+  it('is written to the log at info, not error: it is the question, not a fault', async () => {
+    // The health page lists the log's ERROR and WARN lines as problems; asking "may I stop the
+    // recording?" and being told yes-ask-the-user is the normal path of installing an update.
+    mockedInvoke.mockRejectedValueOnce({ code: 'recording_active', message: 'a recording is running' });
+    await expect(prepareForUpdate(false)).rejects.toMatchObject({ code: 'recording_active' });
+    await Promise.resolve();
+    expect(mockedInvoke).toHaveBeenCalledWith('log_from_frontend', {
+      level: 'info',
+      message: 'prepare_for_update failed',
+      detail: 'a recording is running',
+    });
   });
 });

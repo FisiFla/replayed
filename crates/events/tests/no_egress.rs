@@ -103,6 +103,11 @@ const EXEMPT: &[(&str, &str)] = &[
          and the accepted peer is checked to be loopback",
     ),
     (
+        "crates/encoder/src/audio_link.rs",
+        "the encoder's audio link: loopback TCP on Windows, a Unix socket elsewhere. The peer's \
+         process is authenticated against the ffmpeg child we spawned",
+    ),
+    (
         "crates/events/examples/gsi_demo",
         "an example that prints the command for a human to run; it is not part of the \
          application and makes no request of its own",

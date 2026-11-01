@@ -84,7 +84,16 @@ describe('the settings notice', () => {
 
 describe('the capture drafts', () => {
   const saved = settings();
-  const same = { quality: 'balanced', monitor: 0, window: '', micDevice: '', outputDevice: '' };
+  const same = {
+    fps: 60,
+    outputSize: '',
+    micEnabled: false,
+    quality: 'balanced',
+    monitor: 0,
+    window: '',
+    micDevice: '',
+    outputDevice: '',
+  };
 
   it('writes nothing for an untouched panel', () => {
     expect(captureUpdate(saved, same)).toEqual({});
@@ -96,6 +105,22 @@ describe('the capture drafts', () => {
       capture_monitor: 1,
       capture_window: 'League',
     });
+  });
+
+  it('sends the keys the Encoder section shares only when this group changed them', () => {
+    // The Encoder section saved 120 fps and 1440p after this group read the file; this group's
+    // drafts still say 60 and native. Applying a new quality here must not put those back.
+    const encoderSaved = settings({ fps: 60, output_size: '' });
+    expect(captureUpdate(encoderSaved, { ...same, quality: 'high' })).toEqual({ quality: 'high' });
+
+    expect(captureUpdate(saved, { ...same, fps: 120, outputSize: '1920x1080', micEnabled: true })).toEqual({
+      fps: 120,
+      output_size: '1920x1080',
+      mic_enabled: true,
+    });
+    // Back to native is a change too, and has to be sent as the empty string.
+    const sized = settings({ output_size: '1920x1080' });
+    expect(captureUpdate(sized, { ...same, outputSize: '' })).toEqual({ output_size: '' });
   });
 
   it('never overwrites a custom bitrate with the placeholder option', () => {
@@ -254,6 +279,29 @@ describe('a hotkey chord', () => {
     expect(chordProblem('Meta+K')).toContain('not a modifier');
     expect(chordProblem('Ctrl+Hovercraft')).toContain('not a key');
     expect(chordProblem('Ctrl+F25')).toContain('not a key');
+  });
+
+  it('refuses a bare letter or digit, which would be taken from every program', () => {
+    // RegisterHotKey with no modifier consumes the key desktop-wide: rebinding Save clip to Q
+    // would silently disable Q in the game and in chat.
+    expect(chordProblem('Q')).toContain('every program');
+    expect(chordProblem('5')).toContain('every program');
+    // With a modifier it is an ordinary chord, and a bare F-key stays allowed.
+    // The letter F is the one a function-key check could swallow: it is still a letter, and
+    // `Hotkey::parse` in `replayed-events` refuses it bare for the same reason.
+    expect(chordProblem('F')).toContain('every program');
+    expect(chordProblem(' k ')).toContain('every program');
+    // Shift alone does not save it: Shift+F is a capital F, taken from every chat box.
+    expect(chordProblem('Shift+F')).toContain('every program');
+    expect(chordProblem('shift+5')).toContain('Ctrl or Alt');
+    expect(chordProblem('Q')).toContain('Ctrl or Alt');
+    expect(chordProblem('Ctrl+Q')).toBeNull();
+    expect(chordProblem('Alt+Q')).toBeNull();
+    expect(chordProblem('Ctrl+Shift+Q')).toBeNull();
+    expect(chordProblem('Shift+F8')).toBeNull();
+    expect(chordProblem('Ctrl+F')).toBeNull();
+    expect(chordProblem('F9')).toBeNull();
+    expect(chordProblem('F24')).toBeNull();
   });
 
   it('writes the chord the way the backend stores it', () => {

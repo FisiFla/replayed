@@ -6,7 +6,7 @@
 //! closed connection. Nothing is logged here, because every byte is still attacker-controlled
 //! and the logging decision belongs to [`crate::gsi`].
 
-use crate::wire::{Framed, Head};
+use crate::wire::{find_head_end, parse_head, terminator_len, Framed, Head, MAX_HEAD_BYTES};
 use std::io::Read;
 
 /// The largest body accepted. A CS2 payload with `allplayers` is a few hundred KB and Dota 2's
@@ -36,6 +36,8 @@ pub enum Reject {
     TooLarge,
     /// Not HTTP, or not something this reader understands.
     Malformed,
+    /// A request a web page made (it carries `Sec-Fetch-*` headers). See [`frame`].
+    FromBrowser,
 }
 
 impl Reject {
@@ -46,6 +48,7 @@ impl Reject {
             Reject::LengthRequired => 411,
             Reject::TooLarge => 413,
             Reject::Malformed => 400,
+            Reject::FromBrowser => 403,
         }
     }
 }
@@ -58,8 +61,81 @@ impl std::fmt::Display for Reject {
             Reject::LengthRequired => "the body has no declared length",
             Reject::TooLarge => "the body is over the limit or shorter than it claims",
             Reject::Malformed => "the request is not HTTP this listener understands",
+            Reject::FromBrowser => "the request was made by a web page, not by the game",
         };
         f.write_str(text)
+    }
+}
+
+/// How far a buffer of bytes read so far has got towards being one request. See [`frame`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Framing {
+    /// More bytes are needed. `head_done` says whether the head has arrived: a connection that gives
+    /// up here has sent a truncated head (`400`) or a body shorter than it claimed (`413`).
+    Incomplete { head_done: bool },
+    /// Nothing about this can become a request: not HTTP, or a head that never ends.
+    Invalid,
+    /// A web page made this request. The game never sends `Sec-Fetch-*`.
+    Browser,
+    /// Everything [`read_request`] needs is in the buffer, so reading it will not touch the socket.
+    /// `body` is the range of the body within the buffer; it is empty when the head alone settles
+    /// the answer (wrong method, no length, too large), because [`read_request`] refuses those
+    /// before it reads a body.
+    Complete { body: std::ops::Range<usize> },
+}
+
+/// Decide, from the bytes read so far and without blocking, whether they are one whole request.
+///
+/// This is what lets the listener keep a slow or stalled peer away from its readers. A reader
+/// that read from the socket held a thread for as long as the peer cared to dawdle, and a
+/// handful of peers that sent nothing made the game's own POSTs wait. The listener now collects
+/// the bytes itself, without blocking, and hands a reader only a request that is already whole:
+/// reading it is a copy out of memory, so no reader ever waits on the network.
+///
+/// A request is [`Framing::Complete`] as soon as the head settles the answer even if the body is
+/// not here: [`read_request`] refuses a wrong method, a wrong target, a chunked body, a missing
+/// or oversized `Content-Length` from the head alone, without reading the body, and so does this.
+pub fn frame(buf: &[u8]) -> Framing {
+    let Some(end) = find_head_end(buf) else {
+        return if buf.len() > MAX_HEAD_BYTES {
+            Framing::Invalid
+        } else {
+            Framing::Incomplete { head_done: false }
+        };
+    };
+    if end > MAX_HEAD_BYTES {
+        return Framing::Invalid;
+    }
+    let body_start = end + terminator_len(&buf[end..]);
+    let Ok(head) = parse_head(&buf[..end]) else {
+        return Framing::Invalid;
+    };
+    // The headers a script cannot set: every fetch a browser makes carries them, no game does.
+    if head
+        .headers
+        .iter()
+        .any(|(name, _)| name.starts_with("sec-fetch-"))
+    {
+        return Framing::Browser;
+    }
+    let settled_by_head = Framing::Complete {
+        body: body_start..body_start,
+    };
+    if head.method() != Some("POST") || head.chunked() {
+        return settled_by_head;
+    }
+    match head.content_length() {
+        Some(length) if length <= MAX_BODY_BYTES as u64 => {
+            let end = body_start + length as usize;
+            if buf.len() >= end {
+                Framing::Complete {
+                    body: body_start..end,
+                }
+            } else {
+                Framing::Incomplete { head_done: true }
+            }
+        }
+        _ => settled_by_head,
     }
 }
 
@@ -198,18 +274,102 @@ mod tests {
     }
 
     #[test]
+    fn framing_waits_for_the_head_then_for_the_body_and_never_reads_past_the_length() {
+        let raw = b"POST /gsi HTTP/1.1\r\nContent-Length: 7\r\n\r\n{\"a\":1}";
+        // Every proper prefix is incomplete, and says whether the head had arrived.
+        for cut in 0..raw.len() {
+            let head_len = raw.len() - 7;
+            assert_eq!(
+                frame(&raw[..cut]),
+                Framing::Incomplete {
+                    head_done: cut >= head_len
+                },
+                "{cut} bytes"
+            );
+        }
+        let whole = frame(raw);
+        assert_eq!(
+            whole,
+            Framing::Complete {
+                body: raw.len() - 7..raw.len()
+            }
+        );
+        // Bytes past the declared body (a pipelined next request) are not part of this one.
+        let mut more = raw.to_vec();
+        more.extend_from_slice(b"POST /gsi HTTP/1.1\r\n");
+        assert_eq!(frame(&more), whole);
+    }
+
+    #[test]
+    fn a_head_that_settles_the_answer_is_complete_without_its_body() {
+        // The same cases `read_request` refuses before it reads a body: a reader handed these
+        // must not wait for bytes that will never come.
+        for raw in [
+            "GET /gsi HTTP/1.1\r\nContent-Length: 500\r\n\r\n".to_string(),
+            "POST /gsi HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n".to_string(),
+            "POST /gsi HTTP/1.1\r\nHost: x\r\n\r\n".to_string(),
+            format!(
+                "POST /gsi HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                MAX_BODY_BYTES + 1
+            ),
+        ] {
+            assert!(
+                matches!(frame(raw.as_bytes()), Framing::Complete { .. }),
+                "{raw:?}"
+            );
+            // And reading it from memory answers without blocking, whatever the answer is.
+            assert!(read_request(&mut Cursor::new(raw.as_bytes().to_vec()), "/gsi").is_err());
+        }
+    }
+
+    #[test]
+    fn something_that_is_not_http_is_invalid_and_a_head_that_never_ends_is_too() {
+        assert_eq!(frame(b"garbage\r\n\r\n"), Framing::Invalid);
+        assert_eq!(frame(b"POST /gsi\r\n\r\n"), Framing::Invalid);
+        let mut raw = b"POST /gsi HTTP/1.1\r\n".to_vec();
+        raw.extend(vec![b'X'; 64 * 1024]);
+        assert_eq!(frame(&raw), Framing::Invalid);
+        // A head that is simply not finished yet is not invalid.
+        assert_eq!(
+            frame(b"POST /gsi HTTP/1.1\r\nHost: 127."),
+            Framing::Incomplete { head_done: false }
+        );
+    }
+
+    #[test]
+    fn a_request_a_web_page_made_is_recognised_by_the_headers_a_script_cannot_set() {
+        for header in [
+            "Sec-Fetch-Site: cross-site",
+            "sec-fetch-mode: no-cors",
+            "Sec-Fetch-Dest: empty",
+        ] {
+            let raw = format!("POST /gsi HTTP/1.1\r\n{header}\r\nContent-Length: 2\r\n\r\n{{}}");
+            assert_eq!(frame(raw.as_bytes()), Framing::Browser, "{header}");
+            // Even before the body has arrived: there is no reason to wait for it.
+            let head_only =
+                format!("POST /gsi HTTP/1.1\r\n{header}\r\nContent-Length: 2000\r\n\r\n");
+            assert_eq!(frame(head_only.as_bytes()), Framing::Browser);
+        }
+        // `Origin` alone is not enough to refuse: a native client may send one.
+        let raw = b"POST /gsi HTTP/1.1\r\nOrigin: null\r\nContent-Length: 2\r\n\r\n{}";
+        assert!(matches!(frame(raw), Framing::Complete { .. }));
+    }
+
+    #[test]
     fn the_statuses_the_gate_answers_with_are_the_ones_it_documents() {
         assert_eq!(Reject::Malformed.status(), 400);
         assert_eq!(Reject::NotFound.status(), 404);
         assert_eq!(Reject::MethodNotAllowed.status(), 405);
         assert_eq!(Reject::LengthRequired.status(), 411);
         assert_eq!(Reject::TooLarge.status(), 413);
+        assert_eq!(Reject::FromBrowser.status(), 403);
         for reject in [
             Reject::Malformed,
             Reject::NotFound,
             Reject::MethodNotAllowed,
             Reject::LengthRequired,
             Reject::TooLarge,
+            Reject::FromBrowser,
         ] {
             // Every refusal explains itself, since a user debugging an install sees these in the log.
             assert!(!reject.to_string().is_empty());

@@ -14,17 +14,43 @@
    * The states are the ones a person can act on, and none of them is a promise the code
    * cannot keep:
    *
-   * - **up to date** — the endpoint answered and there is nothing newer;
+   * - **up to date** — the endpoint answered and there is nothing newer, and the panel says so;
    * - **an update is offered** — its version, its date and its notes, and two buttons;
+   * - **a recording is in the way** — the shell refused to install over a running recording, so
+   *   the panel asks whether to stop it: nothing is stopped or downloaded until the user says so;
+   * - **a recording is in the way** — the shell refused to install over a running recording, and
+   *   the panel asks whether to stop it: nothing is stopped or downloaded until the user says so;
    * - **downloading** — the bytes so far, and the fact that the signature is being checked;
    * - **installed** — the application must be restarted to finish, and it says so.
    */
-  import { checkForUpdate, formatUpdateDate, type UpdateOffer } from '../updater';
+  import { checkForUpdate, formatUpdateDate, prepareToInstall, type UpdateOffer } from '../updater';
   import { errorMessage } from '../ipc';
   import { formatBytes } from '../time';
+  import type { RecordingStatus } from '../types';
+
+  interface Props {
+    /**
+     * The engine's live counters, as the window polls them; `null` until the first answer.
+     *
+     * Only a hint, to say beside the buttons that installing will ask about the recording. An
+     * update cannot be installed under a running recording (the install exits the process
+     * without stopping the recorder), but whether one is running is the shell's answer at the
+     * click (`prepare_for_update`), not this reading, which may be half a second stale.
+     */
+    recording: RecordingStatus | null;
+  }
+
+  let { recording }: Props = $props();
 
   /** What the panel is doing right now. */
-  type Phase = 'idle' | 'checking' | 'offered' | 'downloading' | 'installed';
+  type Phase =
+    | 'idle'
+    | 'checking'
+    | 'upToDate'
+    | 'offered'
+    | 'confirmStop'
+    | 'downloading'
+    | 'installed';
 
   let phase = $state<Phase>('idle');
   /** The update the endpoint offered, while one is on offer. */
@@ -38,6 +64,8 @@
   /** True while a request is in flight; the buttons are held while it is. */
   let busy = $state(false);
 
+  /** Whether the window's last reading says a recording is running. A hint, not the gate. */
+  const recordingHint = $derived(recording !== null && recording.running);
   const day = $derived(offer === null ? '' : formatUpdateDate(offer.date));
   const progress = $derived(
     total === null ? formatBytes(downloaded) : `${formatBytes(downloaded)} of ${formatBytes(total)}`,
@@ -56,7 +84,9 @@
     try {
       const found = await checkForUpdate();
       if (found === null) {
-        phase = 'idle';
+        // Said, not just implied: after "Checking…" flashes by, an unchanged panel reads the
+        // same as a click that did nothing or an endpoint that could not be reached.
+        phase = 'upToDate';
       } else {
         offer = found;
         phase = 'offered';
@@ -74,17 +104,30 @@
   /**
    * Download the offered update and install it.
    *
+   * The shell is asked first (`prepareToInstall`), because the installer ends this process and
+   * a recording running at that moment is lost. If one is running the shell refuses, nothing is
+   * touched, and the panel asks the user (`confirmStop`); `stopRecording` is their yes. Any
+   * other failure of that step ends the attempt: an install never goes ahead over an answer
+   * that was not a clear "ready".
+   *
    * The download is verified against the pinned signing key before anything is installed;
    * a mismatch fails the install and nothing is run.
    */
-  async function install(): Promise<void> {
+  async function install(stopRecording = false): Promise<void> {
     if (offer === null) return;
     busy = true;
     error = null;
-    downloaded = 0;
-    total = null;
-    phase = 'downloading';
+    // Said in the message if the download then fails: the recording is already gone by then.
+    let stopped = false;
     try {
+      if ((await prepareToInstall(stopRecording)) === 'recording_active') {
+        phase = 'confirmStop';
+        return;
+      }
+      stopped = stopRecording;
+      downloaded = 0;
+      total = null;
+      phase = 'downloading';
       await offer.install((done, size) => {
         downloaded = done;
         total = size;
@@ -92,10 +135,18 @@
       phase = 'installed';
     } catch (err) {
       error = errorMessage(err);
+      if (stopped) {
+        error += ' The recording was stopped for this update and is not running; start it again from the recorder bar.';
+      }
       phase = 'offered';
     } finally {
       busy = false;
     }
+  }
+
+  /** The user said no to stopping the recording: back to the offer, with nothing done. */
+  function declineStop(): void {
+    phase = 'offered';
   }
 
   /** Leave the update alone: the offer is released and the panel goes back to idle. */
@@ -133,13 +184,38 @@
     {:else}
       <p class="muted footnote">This release carries no notes.</p>
     {/if}
-    <div class="actions">
-      <button type="button" class="primary" onclick={() => void install()} disabled={busy}>
-        Download and install
-      </button>
-      <button type="button" onclick={() => void dismiss()} disabled={busy}>Not now</button>
-    </div>
+    {#if phase === 'confirmStop'}
+      <!-- The same two-step shape as the storage panel's removal: the question replaces the
+           button that raised it, and "Cancel" puts the offer back untouched. -->
+      <p class="chosen" role="status">
+        A recording is running, and installing an update closes replayed. Stop the recording and
+        install? The session is saved first, as with the Stop button, but the replay buffer is
+        not kept.
+      </p>
+      <div class="actions">
+        <button type="button" class="danger" onclick={() => void install(true)} disabled={busy}>
+          Stop recording and install
+        </button>
+        <button type="button" onclick={declineStop} disabled={busy}>Cancel</button>
+      </div>
+    {:else}
+      <div class="actions">
+        <button type="button" class="primary" onclick={() => void install()} disabled={busy}>
+          Download and install
+        </button>
+        <button type="button" onclick={() => void dismiss()} disabled={busy}>Not now</button>
+      </div>
+      {#if recordingHint}
+        <p class="muted footnote" role="status">
+          A recording is running. Installing closes replayed, so it will ask you before it
+          stops the recording; nothing is stopped until you say so.
+        </p>
+      {/if}
+    {/if}
   {:else}
+    {#if phase === 'upToDate'}
+      <p class="saved" role="status">You are on the latest version.</p>
+    {/if}
     <p class="muted footnote">
       Nothing here checks for updates on its own. Pressing the button makes one request, to
       this project's own release page on GitHub, and nothing else in replayed ever talks to the

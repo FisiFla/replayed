@@ -88,19 +88,36 @@ if ($Worker) {
         $env:PATH = "$cargoBin;$env:PATH"
     }
 
-    Set-Location -LiteralPath $Repo
-    $cargoArgs = @('xtask', 'verify', '--seconds', "$Seconds", '--report', $Report)
-    if ($DevSoftwareEncoder) {
-        $cargoArgs += '--dev-software-encoder'
+    # The marker is how the waiting shell knows the run is over, so it is written on *every*
+    # way out of this block: the harness's own verdict (0 = every check that ran passed) when
+    # cargo ran, and a non-zero code with the reason in the report when anything threw first
+    # (cargo not on PATH, a checkout that is not there). Under `Stop`, a terminating error
+    # used to skip the marker, and the outer shell then polled for the whole of
+    # `-WaitSeconds` before blaming nobody being logged on.
+    $exitCode = 1
+    try {
+        Set-Location -LiteralPath $Repo
+        $cargoArgs = @('xtask', 'verify', '--seconds', "$Seconds", '--report', $Report)
+        if ($DevSoftwareEncoder) {
+            $cargoArgs += '--dev-software-encoder'
+        }
+
+        Write-Host "verify: running cargo $($cargoArgs -join ' ') in session $((Get-Process -Id $PID).SessionId)"
+        & cargo @cargoArgs
+        $exitCode = $LASTEXITCODE
+    } catch {
+        $exitCode = 1
+        $reason = "the worker failed before the harness produced a verdict: $($_.Exception.Message)"
+        Write-Host "verify: $reason"
+        if (-not (Test-Path -LiteralPath $Report)) {
+            New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Report) | Out-Null
+            Set-Content -LiteralPath $Report -Encoding utf8 -Value @(
+                '# verify: the harness did not run', '', $reason)
+        }
+    } finally {
+        New-Item -ItemType Directory -Force -Path (Split-Path -Parent $Report) | Out-Null
+        Set-Content -LiteralPath "$Report.exit" -Value $exitCode -Encoding ascii
     }
-
-    Write-Host "verify: running cargo $($cargoArgs -join ' ') in session $((Get-Process -Id $PID).SessionId)"
-    & cargo @cargoArgs
-    $exitCode = $LASTEXITCODE
-
-    # The marker is how the waiting shell knows the run is over; the number in it is the
-    # harness's own verdict (0 = every check that ran passed).
-    Set-Content -LiteralPath "$Report.exit" -Value $exitCode -Encoding ascii
     exit $exitCode
 }
 
@@ -145,9 +162,23 @@ try {
     Start-ScheduledTask -TaskName $taskName
     Write-Host "verify: '$taskName' started; waiting for the report (up to $WaitSeconds s)"
 
-    $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $started = Get-Date
+    $deadline = $started.AddSeconds($WaitSeconds)
+    $ended = $false
     while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $marker)) {
         Start-Sleep -Seconds 5
+        # Fail fast: a task that is back to `Ready` without a marker has ended without
+        # writing one (it never started, or it was killed), and waiting out the clock for it
+        # only delays the same answer. The marker is looked at first, so a worker that has
+        # just finished is not mistaken for one that died. The grace period is the time the
+        # scheduler takes to move the task out of `Ready` after it was started.
+        if (-not (Test-Path -LiteralPath $marker) -and ((Get-Date) - $started).TotalSeconds -gt 20) {
+            $state = (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue).State
+            if ($state -eq 'Ready' -and -not (Test-Path -LiteralPath $marker)) {
+                $ended = $true
+                break
+            }
+        }
     }
 
     if (Test-Path -LiteralPath $marker) {
@@ -162,15 +193,24 @@ try {
         } else {
             Write-Host "verify: the harness wrote no report; see the run's own output above."
         }
+    } elseif ($ended) {
+        $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        $result = if ($info) { '0x{0:X}' -f $info.LastTaskResult } else { 'unknown' }
+        Write-Error ("verify: the task '$taskName' ended without writing its marker (last task " +
+            "result $result). Nobody being logged on to this machine, or a task that could not " +
+            "be started, looks like this; so does the worker being killed.")
     } else {
-        Write-Error ("verify: no report after $WaitSeconds s. The usual cause is that nobody " +
-            "is logged on to this machine right now (a task with -LogonType Interactive " +
-            "cannot run without a session), or that the checkout does not build. Check " +
-            "`Get-ScheduledTaskInfo -TaskName $taskName` and the task's history.")
+        Write-Error ("verify: no report after $WaitSeconds s, and the task is still running. The " +
+            "harness may simply be slow (a cold release build is); the task is stopped below " +
+            "so that nothing is left capturing.")
     }
 } finally {
     # Always: the task exists only for this one run. A leftover task would be a second,
-    # silent thing capturing on this machine.
+    # silent thing capturing on this machine. It is *stopped* first: unregistering a task
+    # removes its definition but does not end an instance that is already running, so a wait
+    # that expired on a slow harness used to leave the worker capturing the desktop until the
+    # task's own time limit (`-WaitSeconds` + 900 s).
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
 }
 

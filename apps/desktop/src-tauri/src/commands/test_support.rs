@@ -115,7 +115,7 @@ impl Fixture {
     /// the column exists; equal values could not tell the two clocks apart.
     ///
     /// The segments and the recorded file live in different directories, as in the real layout (the
-    /// recorder's `session_file_path` writes the concatenation into a sessions output directory).
+    /// recorder's `session_file_for_dir` writes the concatenation into a sessions output directory).
     pub(crate) fn add_finished_session(&self, seconds: u32, media_epoch_ms: i64) -> (i64, PathBuf) {
         // Inside the same temporary root the fixture owns; `AppPaths` does not publish the app-data
         // directory itself.
