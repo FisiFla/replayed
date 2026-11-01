@@ -106,6 +106,30 @@ impl ProbeReport {
     }
 }
 
+/// The text of `ffmpeg -encoders`, or the reason it is not one.
+///
+/// An ffmpeg that is corrupt, blocked by antivirus or missing a DLL starts, exits non-zero and
+/// prints nothing on stdout. Read as a listing, that is an empty one, and every candidate comes
+/// out as "not advertised" followed by "no hardware encoder on this machine can encode a frame":
+/// a misdiagnosis of the machine, copied into a verify report, with the real cause (ffmpeg
+/// itself is broken) never shown. A failed run, or an empty listing, is an error instead.
+fn encoder_listing(status: &str, success: bool, stdout: &[u8], stderr: &[u8]) -> Result<String> {
+    if !success {
+        let first = String::from_utf8_lossy(stderr)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("(nothing on stderr)")
+            .trim()
+            .to_string();
+        anyhow::bail!("ffmpeg itself failed ({status}): {first}");
+    }
+    let text = String::from_utf8_lossy(stdout).into_owned();
+    if text.trim().is_empty() {
+        anyhow::bail!("ffmpeg succeeded but listed no encoders at all");
+    }
+    Ok(text)
+}
+
 /// Run the probe: `ffmpeg -encoders` for what the build carries, then a one-frame smoke
 /// test for each advertised candidate.
 pub fn probe(bin: &FfmpegBinaries) -> Result<ProbeReport> {
@@ -113,7 +137,13 @@ pub fn probe(bin: &FfmpegBinaries) -> Result<ProbeReport> {
         .args(["-hide_banner", "-encoders"])
         .output()
         .with_context(|| format!("running {}", bin.ffmpeg.display()))?;
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = encoder_listing(
+        &out.status.to_string(),
+        out.status.success(),
+        &out.stdout,
+        &out.stderr,
+    )
+    .with_context(|| format!("{} -encoders", bin.ffmpeg.display()))?;
 
     let mut rows = Vec::with_capacity(CANDIDATES.len());
     for name in CANDIDATES {
@@ -136,4 +166,43 @@ pub fn probe(bin: &FfmpegBinaries) -> Result<ProbeReport> {
         ffmpeg: bin.ffmpeg.clone(),
         rows,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_failing_ffmpeg_is_reported_as_ffmpeg_failing_not_as_no_hardware_encoder() {
+        // Non-zero exit, nothing on stdout: a corrupt or blocked sidecar. It used to read as an
+        // empty listing, so every vendor printed "not advertised".
+        let err = encoder_listing(
+            "exit code: 0xc0000135",
+            false,
+            b"",
+            b"\nThe code execution cannot proceed because avcodec-61.dll was not found.\n",
+        )
+        .expect_err("a failed ffmpeg is not a listing")
+        .to_string();
+        assert!(err.contains("ffmpeg itself failed"), "got: {err}");
+        assert!(err.contains("0xc0000135"), "the status is shown: {err}");
+        assert!(
+            err.contains("avcodec-61.dll"),
+            "the first stderr line is shown: {err}"
+        );
+    }
+
+    #[test]
+    fn a_successful_ffmpeg_with_no_listing_is_an_error_too() {
+        let err = encoder_listing("exit status: 0", true, b" \n", b"")
+            .expect_err("an empty listing is not an answer")
+            .to_string();
+        assert!(err.contains("no encoders"), "got: {err}");
+    }
+
+    #[test]
+    fn a_real_listing_passes_through() {
+        let text = encoder_listing("exit status: 0", true, b" V....D h264_nvenc\n", b"").unwrap();
+        assert!(text.contains("h264_nvenc"));
+    }
 }

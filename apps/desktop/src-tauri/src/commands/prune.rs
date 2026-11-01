@@ -321,7 +321,7 @@ mod tests {
         let f = Fixture::new();
         let id = add_dead_row(&f, "dead.mp4");
         std::fs::create_dir_all(&f.paths.thumbnails_dir).unwrap();
-        let thumb = f.paths.thumbnails_dir.join(thumbnail_file_name(id, 0));
+        let thumb = f.paths.thumbnails_dir.join(thumbnail_file_name(id, 0, 0));
         std::fs::write(&thumb, b"jpeg").unwrap();
 
         let outcome = prune_missing(&f.deps()).unwrap();

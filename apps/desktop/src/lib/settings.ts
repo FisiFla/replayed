@@ -43,12 +43,16 @@ export function monitorIndex(text: string): number | null {
 
 /**
  * The capture update for the drafts: only what differs from what is saved, so applying an
- * untouched panel writes nothing and a `custom` bitrate is never overwritten by a preset the
- * user did not pick.
+ * untouched panel writes nothing, a `custom` bitrate is never overwritten by a preset the
+ * user did not pick, and a key another section owns as well is not written back from a stale
+ * copy.
  */
 export function captureUpdate(
   saved: SettingsDto,
   draft: {
+    fps: number;
+    outputSize: string;
+    micEnabled: boolean;
     quality: string;
     monitor: number;
     window: string;
@@ -57,6 +61,13 @@ export function captureUpdate(
   },
 ): SettingsUpdate {
   const update: SettingsUpdate = {};
+  // `fps` and `output_size` are shared with the Encoder section, which writes the same keys
+  // through its own command. Sent only when this group changed them, an Apply here for a new
+  // microphone cannot put back a frame rate the Encoder section saved after this group last read
+  // the file.
+  if (draft.fps !== saved.fps) update.fps = draft.fps;
+  if (draft.outputSize !== saved.output_size) update.output_size = draft.outputSize;
+  if (draft.micEnabled !== saved.mic_enabled) update.mic_enabled = draft.micEnabled;
   if (draft.quality !== saved.quality && draft.quality !== 'custom') update.quality = draft.quality;
   if (draft.monitor !== saved.capture_monitor) update.capture_monitor = draft.monitor;
   if (draft.window.trim() !== saved.capture_window) update.capture_window = draft.window.trim();
@@ -177,6 +188,13 @@ export function automaticWarning(draft: { autoRecord: boolean; saveSession: bool
  * `replayed_events::hotkey::Hotkey::parse` on the way in, and this mirrors its vocabulary so a
  * typo is answered before a round trip. The shape is modifiers in any order (Ctrl, Alt, Shift),
  * then exactly one key: `F1`–`F24` or a single letter or digit.
+ *
+ * A letter or digit needs Ctrl or Alt. The chord is registered for the whole desktop session, and
+ * a bare `Q` or `5` would be taken from every other program too: the game never sees the key,
+ * and neither does chat or a text field, with nothing to say why. Shift does not count: `Shift+F`
+ * is how a capital F is typed, so it would swallow every capital F in chat. A F-key is allowed
+ * bare or with Shift — it is what a dedicated clip key looks like, and nothing types with it.
+ * (Mirrors `Hotkey::parse`, which has no Win modifier.)
  */
 export function chordProblem(chord: string): string | null {
   const text = chord.trim();
@@ -193,7 +211,13 @@ export function chordProblem(chord: string): string | null {
     return 'A chord needs a keypress too, like Ctrl+F8.';
   }
   if (/^f([1-9]|1[0-9]|2[0-4])$/.test(key)) return null;
-  if (/^[a-z0-9]$/.test(key)) return null;
+  if (/^[a-z0-9]$/.test(key)) {
+    return parts.includes('ctrl') || parts.includes('alt')
+      ? null
+      : `"${text}" would be taken from every program on this PC, the game included, because ${
+          parts.length === 0 ? 'a bare' : 'Shift plus a'
+        } letter or digit is what you type. Add Ctrl or Alt (like Ctrl+${key.toUpperCase()}), or use an F-key.`;
+  }
   return `"${key}" is not a key: use one letter or digit, or F1 to F24.`;
 }
 

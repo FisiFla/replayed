@@ -1,7 +1,8 @@
 //! Session commands: timeline, matches, extraction and deletion.
 
 use super::clips::{
-    free_output_path, index_new_clip, inherit_metadata, session_artifact_ok, validate_range,
+    discard_partial, free_output_path, index_new_clip, inherit_metadata, session_artifact_ok,
+    validate_range,
 };
 use super::*;
 use replayed_media::edit::trim_lossless;
@@ -440,14 +441,22 @@ pub fn extract_clip(
         ));
     };
 
-    let dst = free_output_path(trim_output_path(&src, start_ms, end_ms))?;
-    if let Some(dir) = dst.parent() {
-        std::fs::create_dir_all(dir)
-            .map_err(|e| CommandError::io("creating the clips directory", dir, e))?;
-    }
+    // In the **clips directory**, not beside the session file. The two are the same place only in the
+    // default layout: a configured `sessions_dir` can live anywhere, and a clip written there was
+    // outside the library, so the window could neither play it (the asset scope is the clips
+    // directory) nor delete it (the delete refuses a file outside the library, after removing the
+    // row), and the storage policy never saw it.
+    let named = trim_output_path(&src, start_ms, end_ms);
+    let dst = free_output_path(
+        deps.paths
+            .clips_dir
+            .join(named.file_name().unwrap_or_default()),
+    )?;
 
-    trim_lossless(bins, &src, &dst, start_ms, end_ms)
-        .map_err(|e| CommandError::media("extracting the clip from the session", e))?;
+    trim_lossless(bins, &src, &dst, start_ms, end_ms).map_err(|e| {
+        discard_partial(&dst);
+        CommandError::media("extracting the clip from the session", e)
+    })?;
 
     // The new row's `started_at` is the clip's position on the session's media timeline, which the
     // session's markers are measured on, so a clip extracted at a marker sits at that marker. The
@@ -888,6 +897,58 @@ mod tests {
             1,
             "and it is in the library, not merely on disk"
         );
+    }
+
+    /// **An extracted clip lands in the clips directory, wherever the session file is.**
+    ///
+    /// It used to be written beside the session file, which is the library only in the default
+    /// layout. With a `sessions_dir` elsewhere the clip was outside the library: the window could
+    /// not play it, and deleting it dropped the row and then refused to unlink the file.
+    #[test]
+    fn a_clip_extracted_from_a_session_elsewhere_lands_in_the_clips_directory_and_can_be_deleted() {
+        let f = Fixture::new();
+        // The session's recorded file lives outside the library, as a configured sessions_dir allows.
+        let elsewhere = tempfile::tempdir().unwrap();
+        let src = elsewhere.path().join("session-7.mp4");
+        write_test_video(&f.bins, &src, 4);
+        let id = f
+            .store
+            .start_session(
+                Some("Dota 2"),
+                replayed_store::SESSION_MODE_SESSION,
+                WALL_START_MS,
+                &elsewhere.path().join("session-7").to_string_lossy(),
+                0,
+            )
+            .unwrap();
+        f.store
+            .end_session(
+                id,
+                WALL_START_MS + 4_000,
+                Some(&src.to_string_lossy()),
+                std::fs::metadata(&src).unwrap().len() as i64,
+                4_000,
+            )
+            .unwrap();
+
+        let clip = extract_clip(&f.deps(), id, 1_000, 2_000).expect("the extract");
+
+        let path = PathBuf::from(&clip.path);
+        assert_eq!(
+            path.parent().unwrap(),
+            f.paths.clips_dir,
+            "written beside the session file instead of into the library"
+        );
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .flatten()
+                .all(|e| e.file_name().to_string_lossy() == "session-7.mp4"),
+            "nothing was written next to the session file"
+        );
+        let outcome = delete_clip(&f.deps(), clip.id).expect("the clip can be deleted");
+        assert!(outcome.row_deleted && outcome.file_removed, "{outcome:?}");
+        assert!(!path.exists());
     }
 
     #[test]

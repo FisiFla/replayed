@@ -69,13 +69,39 @@
     if (validation.ok) onExtract(validation.range);
   }
 
+  /**
+   * The session's length, as a number of its own.
+   *
+   * The `session` prop is a new object after every library refresh (`toSessionViews` rebuilds
+   * every row), so an effect that read `session.durationMs` itself would run again each time
+   * even though the length had not moved — a clip hotkey, a favourite toggle or an extraction
+   * all refresh the library, and each would snap the user's handles back to the whole session
+   * and the cursor to 0 mid-edit. A `$derived` number only notifies when the number changes,
+   * which is the one thing the reset below is about.
+   */
+  const length = $derived(session.durationMs);
+
   // A change of axis resets both, so neither can be left sitting past the end of a shorter
-  // recording. Reads only the session's length, so it cannot re-trigger itself.
+  // recording. Reads only `length`, so it runs when the session's length changes and at no
+  // other time — not on a refresh that brought the same length back, and not by itself.
   $effect(() => {
-    const length = session.durationMs;
     range = { startMs: 0, endMs: length };
     cursorMs = 0;
   });
+
+  /**
+   * Whether the delete button is armed. Deleting a session removes its row, its scratch
+   * segments and the concatenated file, none of which comes back; the clips already cut from it
+   * survive, the rest of the recording does not. The session list asks twice before it does
+   * that, and so does this page: a second click on the same spot would otherwise be the whole
+   * of the safeguard, next to a Favourite button that is harmless to hit.
+   */
+  let confirmingDelete = $state(false);
+
+  function confirmDelete() {
+    confirmingDelete = false;
+    onDelete();
+  }
 </script>
 
 <section class="detail">
@@ -94,10 +120,23 @@
         <Icon name="star" size={14} />
         {session.favourite ? 'Un-favourite' : 'Favourite'}
       </button>
-      <button type="button" class="danger" onclick={onDelete}>
-        <Icon name="trash-2" size={14} />
-        Delete session
-      </button>
+      {#if confirmingDelete}
+        <button type="button" class="danger" disabled={busy} onclick={confirmDelete}>
+          <Icon name="trash-2" size={14} />
+          Confirm delete
+        </button>
+        <button type="button" onclick={() => (confirmingDelete = false)}>Cancel</button>
+      {:else}
+        <button
+          type="button"
+          class="danger"
+          disabled={busy}
+          onclick={() => (confirmingDelete = true)}
+        >
+          <Icon name="trash-2" size={14} />
+          Delete session
+        </button>
+      {/if}
     </div>
   </header>
 

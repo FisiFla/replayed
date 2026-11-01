@@ -19,6 +19,7 @@
     describeConfig,
     describeFrames,
     describeHotkey,
+    describeRecorderNotice,
     formatDrift,
     formatRate,
     recordingLabel,
@@ -128,6 +129,10 @@
         <strong>The recorder stopped.</strong>
         {status.error}
       </p>
+    {/if}
+
+    {#if describeRecorderNotice(status) !== null}
+      <p class="verdict">{describeRecorderNotice(status)}</p>
     {/if}
 
     {#if status !== null}

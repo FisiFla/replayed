@@ -19,6 +19,38 @@ happens only when the user presses the button. Nothing else in the application r
 network. What it downloads is checked against the signing key this build was made with
 before it is installed.
 
+## What enforces it
+
+- **Source guard.** `scripts/check-forbidden-apis.sh` greps our Rust, our scripts and the vendored
+  crates for the names of the forbidden APIs (injection, hooks, reading or writing another process,
+  input synthesis) and for Windows feature groups a crate has no business with. It also bans a
+  `.set_focus(` call in our own code (see below). Window enumeration is allowed in the capture
+  backend and nowhere else.
+- **Binary guard.** `scripts/check-forbidden-apis.sh --binary <exe>` runs `scripts/check-pe-imports.py`
+  over the *built* executable: its import table and delay-load table, and a scan for the names of
+  functions that would be looked up at run time. The allowlist (`scripts/pe-imports-allowlist.txt`)
+  is empty by design, so any match fails. This is what sees a dependency that calls a forbidden API
+  without our source ever naming it. CI runs it on the Windows build and the release workflow runs
+  it on the binary that goes into the installer.
+- **No synthetic input from the window toolkit.** The binary guard found `SendInput` in the shell's
+  import table through two dependencies: `tao`'s `Window::set_focus` (it presses a synthetic Alt key
+  when the system will not raise the window) and `muda`'s predefined Copy/Paste menu items (they
+  send Ctrl+C/V). Both crates are vendored and patched in `apps/desktop/src-tauri/vendor/`
+  (procedure in its `README.md`). Do not call `set_focus`; raise the window with
+  `apps/desktop/src-tauri/src/window_focus.rs`, which uses `SetForegroundWindow` and then
+  `FlashWindowEx`. A window the system will not raise stays where it is.
+- **Game APIs stay read-only.** The League presence check is one `GET /liveclientdata/gamestats`
+  through the same loopback client, pinned to Riot's root certificate, as the event poller; the
+  GSI listener only receives. Neither writes to a game. The listener refuses a request a browser
+  made (it carries `Sec-Fetch-*` headers, which the game never sends) and keeps the game's own
+  requests in a lane that a stranger's traffic cannot fill; the design is in `SECURITY.md`.
+- **The CLI's console handler** (`apps/replayed-cli/src/shutdown.rs`) is `SetConsoleCtrlHandler` for
+  the process's own console, so Ctrl+C or closing the window finalises the recording. It sets a flag.
+  It touches no other process, installs no hook and synthesises no input.
+- **The audio link authenticates the ffmpeg child by reading the system TCP table**
+  (`GetExtendedTcpTable`), which opens no process and creates no handle to the game or anything
+  else (`crates/encoder/src/audio_link.rs`).
+
 Tested anti-cheats: none systematically yet — tracked in the release checklist. This project is not
 affiliated with any game or anti-cheat vendor; use at your own risk.
 

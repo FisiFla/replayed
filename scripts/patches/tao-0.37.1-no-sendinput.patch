@@ -1,0 +1,34 @@
+--- a/src/platform_impl/windows/window.rs
++++ b/src/platform_impl/windows/window.rs
+@@ -1516,28 +1516,10 @@
+   if SetForegroundWindow(handle).as_bool() {
+     return;
+   }
+-
+-  // In some situations, calling SetForegroundWindow could not bring up the window,
+-  // This is a little hack which can "steal" the foreground window permission.
+-  // We only call this function in the window creation, so it should be fine.
+-  // See: https://stackoverflow.com/questions/10740346/setforegroundwindow-only-working-while-visual-studio-is-open
+-  let alt_sc = MapVirtualKeyW(u32::from(VK_MENU.0), MAPVK_VK_TO_VSC);
+-
+-  let mut inputs: [INPUT; 2] = mem::zeroed();
+-  inputs[0].r#type = INPUT_KEYBOARD;
+-  inputs[0].Anonymous.ki.wVk = VK_LMENU as _;
+-  inputs[0].Anonymous.ki.wScan = alt_sc as _;
+-  inputs[0].Anonymous.ki.dwFlags = KEYEVENTF_EXTENDEDKEY;
+ 
+-  inputs[1].r#type = INPUT_KEYBOARD;
+-  inputs[1].Anonymous.ki.wVk = VK_LMENU as _;
+-  inputs[1].Anonymous.ki.wScan = alt_sc as _;
+-  inputs[1].Anonymous.ki.dwFlags = KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP;
+-
+-  // Simulate a key press and release
+-  SendInput(&inputs, mem::size_of::<INPUT>() as _);
+-
+-  let _ = SetForegroundWindow(handle);
++  // replayed: the upstream fallback synthesised an Alt key press with `SendInput` to steal the
++  // foreground permission. That is input synthesis, which this project never does, so the
++  // fallback is gone: a window that cannot take the foreground stays where it is.
+ }
+ 
+ pub(crate) unsafe fn set_skip_taskbar(hwnd: HWND, skip: bool) -> Result<(), ExternalError> {

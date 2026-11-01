@@ -21,22 +21,58 @@
 
   let { error, notice, onDismissError, onDismissNotice }: Props = $props();
 
-  // Each message gets its own timer, restarted when the text changes.
+  /**
+   * Whether the pointer is over a toast, or focus is inside it.
+   *
+   * A message that vanishes while it is being read, or while its Dismiss button is being
+   * reached for by keyboard, is out of the user's control (WCAG 2.2.1): the export notice is
+   * the only place that says where the exported file went. So the timer runs only while the
+   * toast is left alone, and starts again from the full time when it is.
+   */
+  let noticeHeld = $state(false);
+  let errorHeld = $state(false);
+
+  // Each message gets its own timer, restarted when the text changes or the hold ends.
   $effect(() => {
-    if (notice === null) return;
+    if (notice === null) {
+      // The toast went away under the pointer, so no `mouseleave` will come.
+      noticeHeld = false;
+      return;
+    }
+    if (noticeHeld) return;
     const timer = setTimeout(onDismissNotice, NOTICE_MS);
     return () => clearTimeout(timer);
   });
   $effect(() => {
-    if (error === null) return;
+    if (error === null) {
+      errorHeld = false;
+      return;
+    }
+    if (errorHeld) return;
     const timer = setTimeout(onDismissError, ERROR_MS);
     return () => clearTimeout(timer);
   });
+
+  /** Focus moving between the toast's own controls is still focus inside it. */
+  function leftToast(event: FocusEvent): boolean {
+    const next = event.relatedTarget;
+    return !(next instanceof Node && event.currentTarget instanceof Node && event.currentTarget.contains(next));
+  }
 </script>
 
 <div class="toasts" data-region="toasts">
   {#if error !== null}
-    <div class="banner error" role="alert">
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="banner error"
+      role="alert"
+      onmouseenter={() => (errorHeld = true)}
+      onmouseleave={() => (errorHeld = false)}
+      onfocusin={() => (errorHeld = true)}
+      onfocusout={(event) => {
+        if (leftToast(event)) errorHeld = false;
+      }}
+    >
       <Icon name="circle-alert" size={16} />
       <span class="text"><strong>Error.</strong> {error}</span>
       <button type="button" onclick={onDismissError}>Dismiss</button>
@@ -44,7 +80,17 @@
   {/if}
 
   {#if notice !== null}
-    <div class="banner notice" role="status">
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+    <div
+      class="banner notice"
+      role="status"
+      onmouseenter={() => (noticeHeld = true)}
+      onmouseleave={() => (noticeHeld = false)}
+      onfocusin={() => (noticeHeld = true)}
+      onfocusout={(event) => {
+        if (leftToast(event)) noticeHeld = false;
+      }}
+    >
       <Icon name="info" size={16} />
       <span class="text">{notice}</span>
       <button type="button" onclick={onDismissNotice}>Dismiss</button>

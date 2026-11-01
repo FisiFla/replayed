@@ -60,10 +60,10 @@ the only way the microphone path can run off Windows, because there is no non-Wi
 microphone backend and a stub selected implicitly would be worse than an error. It prints
 `NOTHING REAL IS CAPTURED` before it starts.
 
-Observed (excerpts of real runs):
+Observed (excerpts of real runs; the first line's closing note read "the scratch cap does not apply" in the build that was run, and the code now says "the RAM cap does not apply"):
 
 ```
-INFO replayed_recorder: session #1 opened (session): segments in .../sessions/session-1790211072 (the scratch cap does not apply)
+INFO replayed_recorder: session #1 opened (session): segments in .../sessions/session-1790211072 (the RAM cap does not apply)
 INFO replayed_recorder: hotkey pressed: media=4000ms wall=7030ms (drift 3030ms); waiting for post-roll
 INFO replayed_recorder::index: indexed clip #1 (media t=2000ms, 3187ms, 1023170 bytes, libx264): .../clips/clip-1790211080.mp4
 INFO replayed_recorder: session #1 finalised: .../sessions/session-1790211072.mp4 (8051ms, 2122859 bytes) concatenated from 9 segment(s); 2132516 bytes of temporary segments removed
@@ -114,14 +114,21 @@ INFO replayed_recorder::index: storage policy: deleted 1 clip(s) and 1 session(s
   segments are unreadable); *not verified* against a real full disk.
 * **A crash mid-session** leaves a running row and a directory of segments. The next start
   concatenates them into the file the session would have written, closes the row with the
-  real size, and removes the segments; a session that cannot be finalised is reported and
+  real size, and removes the segments. The segment being written when the process died is
+  usually unreadable; recovery drops that truncated tail (it walks back from the newest segment
+  to the first one ffprobe can open) and joins the rest, rather than failing for good on it. A
+  session that is recovered is owned by the process that finds it: recovery runs only while this
+  process holds `recorder.lock`, so a second front-end cannot "recover" a session that is still
+  being recorded; a session that cannot be finalised is reported and
   retried at every start; a directory no row names is reported and never deleted.
 
 ## 4. Honest limitations
 
-1. **Buffer-mode session rows share one scratch directory.** Their `size_bytes` is "the bytes
-   the ring holds", so two buffer sessions can count the same segments. Full-session rows are
-   exact (their own directory).
+1. **A buffer-mode session row owns no files.** The replay buffer lives in RAM and the scratch
+   directory is shared and configurable, so the row names no directory (retention can never
+   delete the configured `[buffer] scratch_dir` through it) and its `size_bytes` stays 0, because
+   it is a claim about disk and the ring occupies none; the bytes the ring holds go to the log.
+   Full-session rows are exact: they have a directory of their own under `sessions/`.
 2. **The 4K sustained-rate issue is closed** ([issue #1](https://github.com/FisiFla/replayed/issues/1),
    closed): the zero-copy path sustains 59.6 of 60 fps with no dropped frames at 3.1–4.0% of
    one core (ledger §13, §15). A full session

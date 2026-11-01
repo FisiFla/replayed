@@ -99,45 +99,88 @@ fn advertised_encoders(bin: &FfmpegBinaries) -> Result<Vec<String>> {
 /// What a smoke test said: whether the encoder encoded a frame, or ffmpeg's reason why not.
 type SmokeResult = Result<(), String>;
 
-/// Encoder name to smoke-test result. A `Mutex`, not a lock-free map: a probe runs once per
-/// encoder per process.
-type SmokeCache = Mutex<Vec<(&'static str, SmokeResult)>>;
+/// The encoders that have passed a smoke test. A `Mutex`, not a lock-free map: a probe runs once
+/// per encoder per process.
+type SmokeCache = Mutex<Vec<&'static str>>;
 
-/// Smoke-test results for this process, keyed by encoder name.
+/// Encoders that passed their smoke test in this process, keyed by encoder name.
 ///
-/// Whether this machine can initialise an encoder cannot change while the process runs, so
-/// startup does not pay for the same ffmpeg child twice. One process resolves one ffmpeg binary,
-/// so the encoder name alone is the key.
+/// **Only successes are kept.** Whether an encoder *can* work is not settled by one failure: a
+/// probe fails for reasons that pass (a GPU that is asleep or switching on a hybrid laptop, NVENC
+/// sessions held by another application, a driver reset, an ffmpeg child that was killed). The
+/// application is a tray program that lives for weeks, so a failure that was remembered was a
+/// failure for as long as it ran: the app started at login with the discrete GPU powered down,
+/// the probe failed once, and every recording after that was refused or fell to a worse vendor
+/// until the user quit and started it again. A success is safe to remember (an encoder that
+/// encoded a frame will start again), and a failure is simply probed again by the next recording.
+/// One process resolves one ffmpeg binary, so the encoder name alone is the key.
 static SMOKE_RESULTS: OnceLock<SmokeCache> = OnceLock::new();
 
-/// [`smoke_test_encoder`], memoised for the process lifetime.
+/// [`smoke_test_encoder`], with a success remembered for the process lifetime.
+fn smoke_test_cached(bin: &FfmpegBinaries, encoder: &'static str) -> Result<(), String> {
+    let results = SMOKE_RESULTS.get_or_init(|| Mutex::new(Vec::new()));
+    remember_successes(results, encoder, || smoke_test_encoder(bin, encoder))
+}
+
+/// Run `probe` unless `encoder` is already known to work, and remember the result only if it
+/// passed.
 ///
 /// The lock is never held across the child (a probe can take seconds). A poisoned lock is
 /// recovered rather than panicking on the failure path; the worst case is one probe run twice.
-fn smoke_test_cached(bin: &FfmpegBinaries, encoder: &'static str) -> Result<(), String> {
-    let results = SMOKE_RESULTS.get_or_init(|| Mutex::new(Vec::new()));
-
-    let cached = results
+fn remember_successes(
+    cache: &SmokeCache,
+    encoder: &'static str,
+    probe: impl FnOnce() -> SmokeResult,
+) -> SmokeResult {
+    let known = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .find(|(name, _)| *name == encoder)
-        .map(|(_, result)| result.clone());
-    if let Some(result) = cached {
-        return result;
+        .contains(&encoder);
+    if known {
+        return Ok(());
     }
 
-    let result = smoke_test_encoder(bin, encoder);
-    results
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push((encoder, result.clone()));
+    let result = probe();
+    if result.is_ok() {
+        cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(encoder);
+    }
     result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed probe is probed again, because the failure may have been the moment and not the
+    /// machine; a passed one is not, because an encoder that encoded a frame will start again.
+    #[test]
+    fn only_a_passed_smoke_test_is_remembered() {
+        use std::cell::Cell;
+        let cache: SmokeCache = Mutex::new(Vec::new());
+        let runs = Cell::new(0);
+        let ask = |outcome: SmokeResult| {
+            remember_successes(&cache, "h264_nvenc", || {
+                runs.set(runs.get() + 1);
+                outcome
+            })
+        };
+
+        assert!(ask(Err("GPU asleep".into())).is_err());
+        assert!(
+            ask(Ok(())).is_ok(),
+            "the failure was not remembered: the encoder was asked again and now works"
+        );
+        assert_eq!(runs.get(), 2, "both attempts really ran the probe");
+
+        assert!(
+            ask(Err("must not run".into())).is_ok(),
+            "a success is remembered"
+        );
+        assert_eq!(runs.get(), 2, "and the third call did not run the probe");
+    }
 
     #[test]
     fn an_unknown_vendor_name_fails_without_probing_ffmpeg() {

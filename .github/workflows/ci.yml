@@ -26,7 +26,9 @@
 #   - the whole Rust workspace test suite, with the software-encoder feature the suite
 #     needs;
 #   - `cargo fmt --check`, so the tree keeps the shape `cargo fmt` gives it;
-#   - `cargo clippy` over the workspace and over the desktop shell, with warnings fatal;
+#   - `cargo clippy` over the workspace and over the desktop shell, with warnings fatal, once
+#     with the test-only encoder features (as the tests build) and once in the production
+#     configuration (as the release builds: `--lib --bins`, no features);
 #   - `cargo check` *and* `cargo clippy` of the cross-checkable crates for
 #     `x86_64-pc-windows-msvc`: type / API / ownership checking and linting of the
 #     Windows-only code, from macOS. Neither links, so no MSVC toolchain is required,
@@ -78,13 +80,26 @@
 #     and the desktop shell included, which cannot be cross-checked from macOS. This is
 #     the only job that executes the Windows code.
 #   - `supply-chain` (ubuntu-latest): `cargo deny` over both workspaces, the anti-cheat
-#     API guard, the npm audit and the secret scan.
+#     API guard and the tests of the guards and release scripts, the npm audit (blocking at
+#     `moderate`, see the step) and the secret scan. Each step runs even when an earlier one
+#     failed, so one red check does not hide another.
 #   - `package` (macos-latest): a real bundle — the ffmpeg sidecar fetched and
 #     checksum-verified, the frontend built, Tauri bundling — and then the assertion
 #     that what came out carries the *pinned* sidecar, not merely a file with the right
 #     name.
 #   - `package-windows` (windows-latest): the NSIS installer, built and inspected but
-#     never published (docs/packaging.md §5.7).
+#     never published (docs/packaging.md §5.7). The inspection includes the anti-cheat
+#     BINARY guard: the executable inside the installer is read and its import table must
+#     name no function that injects, hooks or synthesises input.
+#
+# Every cargo command is `--locked`: the two `Cargo.lock` files are what `cargo deny` audited,
+# and without the flag cargo quietly re-resolves a stale one, so CI would test (and the release
+# would ship) a dependency set nobody reviewed. Every job has a `timeout-minutes`: a hung
+# Windows job otherwise holds a runner for the six-hour default.
+#
+# The `push` trigger is the default branch only; every other branch is tested through its
+# pull request. The release workflow requires a successful `push` (or `workflow_dispatch`)
+# run of this workflow on the commit being tagged before it builds anything.
 #
 # ---------------------------------------------------------------------------
 # ACTION PINS
@@ -105,7 +120,12 @@
 name: CI
 
 on:
+  # Pushes to the default branch only. Every other branch is covered by its pull request, and an
+  # unfiltered `push` ran the whole suite twice for a branch with an open PR (once for the push,
+  # once for the PR) and once more for every tag. The release workflow's gate asks for a
+  # successful `push` run on the tagged commit, which a merge to `main` produces.
   push:
+    branches: [main]
   pull_request:
   # Also runnable by hand, which is how the Windows installer job below is exercised
   # without opening a PR.
@@ -129,6 +149,7 @@ jobs:
   test:
     name: Tests, Windows cross-check and frontend
     runs-on: macos-latest
+    timeout-minutes: 75
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -200,7 +221,7 @@ jobs:
         # (0xc0000005). With it, the test drives the sources its own documentation says
         # it drives, and the real path stays available to a person on real hardware
         # through `REPLAYED_REAL_SOURCES=1`.
-        run: cargo test --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders
+        run: cargo test --locked --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders
 
       - name: Windows cross-check (cross-checkable crates only)
         # Type / API / ownership checking of the Windows-only code from macOS. The
@@ -216,7 +237,7 @@ jobs:
         # `EncodeConfig::for_tests_software` does not exist, so `crates/encoder/tests/
         # stream_output.rs` cannot be checked either.
         run: >-
-          cargo check
+          cargo check --locked
           -p replayed-capture -p replayed-encoder -p replayed-events
           -p replayed-replay -p replayed-media -p xtask
           --features replayed-encoder/test-encoders
@@ -266,7 +287,7 @@ jobs:
         # The desktop crate is its own workspace, so run its tests from its manifest
         # directory — after the frontend build above has produced apps/desktop/dist.
         working-directory: apps/desktop/src-tauri
-        run: cargo test
+        run: cargo test --locked
 
       - name: Clippy (fatal)
         # Warnings are fatal, and no lint is switched off on the command line.
@@ -288,8 +309,21 @@ jobs:
         # without it — an integration test is its own crate, and `cfg(test)` does not
         # reach the library it links.
         run: |
-          cargo clippy --workspace --all-targets --features replayed-encoder/test-encoders,replayed-cli/test-encoders -- -D warnings
-          cd apps/desktop/src-tauri && cargo clippy --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets --features replayed-encoder/test-encoders,replayed-cli/test-encoders -- -D warnings
+          cd apps/desktop/src-tauri && cargo clippy --locked --all-targets -- -D warnings
+
+      - name: Clippy (production configuration)
+        # Every other cargo step here turns on `replayed-encoder/test-encoders` and
+        # `replayed-cli/test-encoders`, and the shipped binary is built without them. Code
+        # behind `cfg(not(feature = "test-encoders"))` (the recorder's and the CLI's
+        # production arms, which refuse a synthetic source) is therefore compiled out of every
+        # step above: a clippy error or a logic slip in it would stay green until the release
+        # build. This lints the libraries and binaries — not the tests, which need the
+        # feature — exactly as the release builds them. `--lib --bins` also keeps a
+        # dev-dependency's feature from being unified back in.
+        run: |
+          cargo clippy --locked --workspace --lib --bins -- -D warnings
+          cd apps/desktop/src-tauri && cargo clippy --locked -- -D warnings
 
       - name: Clippy (Windows target; cross-checkable crates only)
         # The crates the cross-check above covers, *linted* instead of merely
@@ -308,7 +342,7 @@ jobs:
         # `frame_gaps` dead-code finding was found. This step is the fast pre-check
         # for the crates that *can* be checked from here.
         run: >-
-          cargo clippy
+          cargo clippy --locked
           -p replayed-capture -p replayed-encoder -p replayed-events
           -p replayed-replay -p replayed-media -p xtask
           --features replayed-encoder/test-encoders
@@ -328,7 +362,7 @@ jobs:
         # machine nobody runs is a machine nobody believes. The report is uploaded
         # below so the run is inspectable after the fact.
         continue-on-error: true
-        run: cargo xtask verify --dev-software-encoder --seconds 30
+        run: cargo --locked xtask verify --dev-software-encoder --seconds 30
 
       - name: Upload the verification report
         if: always()
@@ -346,6 +380,7 @@ jobs:
   windows:
     name: Windows tests (no GPU)
     runs-on: windows-latest
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
@@ -374,7 +409,7 @@ jobs:
           # was doing would be lost with everything else. The file is uploaded below
           # whatever happens.
           REPLAYED_TEST_LOG: ${{ github.workspace }}\target\self_test_clip.log
-        run: cargo test --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders
+        run: cargo test --locked --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders
       - name: Upload the self-test's log
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -389,7 +424,7 @@ jobs:
           npm run build
       - name: Desktop shell Rust tests
         working-directory: apps/desktop/src-tauri
-        run: cargo test
+        run: cargo test --locked
       - name: Clippy (workspace)
         # The host target here *is* `x86_64-pc-windows-msvc`, so this lints the
         # `#[cfg(windows)]` code of every crate — the store, the recorder and the CLI
@@ -397,14 +432,15 @@ jobs:
         # SQLite needs an MSVC C toolchain. The same rules as the macOS job: warnings
         # are fatal and no lint is switched off on the command line. The feature flag
         # is the one the test suite above uses, for the reason given there.
-        run: cargo clippy --workspace --all-targets --features replayed-encoder/test-encoders,replayed-cli/test-encoders -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets --features replayed-encoder/test-encoders,replayed-cli/test-encoders -- -D warnings
       - name: Clippy (desktop shell)
         working-directory: apps/desktop/src-tauri
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --locked --all-targets -- -D warnings
 
   supply-chain:
     name: Dependency audit and secret scan
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -412,28 +448,56 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
+      # Every step below runs even when an earlier one failed (`!cancelled()`): the job is red
+      # if any of them is, but a failing audit does not hide a leaked secret behind it. The
+      # secret scan used to come after `npm audit` and was skipped whenever the audit was red.
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        if: ${{ !cancelled() }}
         with:
           command: check
           manifest-path: Cargo.toml
       - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        if: ${{ !cancelled() }}
         with:
           command: check
           manifest-path: apps/desktop/src-tauri/Cargo.toml
           arguments: --config deny.toml
       - name: Anti-cheat API guard
+        if: ${{ !cancelled() }}
         run: scripts/check-forbidden-apis.sh
+      - name: Tests for the guards and the release scripts
+        # The guards are the policy, so they are tested like code: the source guard against a
+        # fixture tree (including the self-name bypass it used to have), the import-table
+        # checker against PE images built byte by byte, and the release scripts (version
+        # agreement, update manifest, minisign verification) against real tool output. Python
+        # in isolated mode, so nothing in the working directory can shadow the standard library.
+        if: ${{ !cancelled() }}
+        run: |
+          python3 -I -m unittest discover -s scripts -p 'test_*.py'
+          bash scripts/test-check-forbidden-apis.sh
       - name: npm audit
         # Both audits, not just the production ones. `--omit=dev` excluded exactly the
         # packages that *execute during CI* — vite, vitest, playwright, esbuild,
         # svelte-check, @tauri-apps/cli — and a compromised build-time dependency is the
         # realistic npm supply-chain threat: it runs with the workflow's own credentials
-        # and can rewrite what CI then builds. npm's default audit level is `low` and
-        # `npm audit` exits non-zero on any finding at or above it, so no
-        # `--audit-level` is needed. Both audits are clean today, so this costs nothing.
+        # and can rewrite what CI then builds.
+        #
+        # The level is `moderate`: a moderate, high or critical advisory in either tree fails
+        # the job. The bare `npm audit` this replaces fails at `low` and went red on main for
+        # two advisories no one can fix: GHSA-gcqx-w48m-w2h4, a prototype-pollution bug in
+        # `deepmerge`'s `mergeObject()`, reached only through `@sveltejs/vite-plugin-svelte`
+        # (a build-time dependency whose input is this repository's own Vite config) and
+        # reported with "No fix available". A red check that cannot be turned green is a check
+        # people learn to ignore, which is worse than a threshold that says what it blocks.
+        #
+        # There is no allowlist and no `|| true`: nothing is excused, `low` is simply below the
+        # bar, and the two lows are listed in the job log on every run. If the advisory is ever
+        # rated moderate, or a fix ships, this step says so by failing.
+        if: ${{ !cancelled() }}
         working-directory: apps/desktop
-        run: npm audit
+        run: npm audit --audit-level=moderate
       - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        if: ${{ !cancelled() }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # The scanner is pinned, deliberately, instead of taking the action's default. The
@@ -463,6 +527,7 @@ jobs:
   package:
     name: Bundle (sidecars, frontend, Tauri)
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -495,7 +560,7 @@ jobs:
         # `--target` is not optional here. sidecars.toml pins a Windows entry only, so asking for
         # the host's fails with "no sidecar entry for aarch64-apple-darwin" — which is what this
         # step did on its first run.
-        run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+        run: cargo --locked xtask sidecars fetch --target x86_64-pc-windows-msvc
 
       - name: Stage the host pair for the check bundle
         # `sidecars:check` (and the bundle itself) need the *host* pair —
@@ -526,7 +591,7 @@ jobs:
         # This bundle is checked, never shipped, so an unsigned updater artifact is exactly
         # right here; the release workflow signs the real one.
         working-directory: apps/desktop
-        run: npm run tauri -- build --bundles app --no-sign
+        run: npm run tauri -- build --bundles app --no-sign -- --locked
 
       - name: Check the bundle carries the pinned sidecar
         # The bundle must carry the *pinned* ffmpeg, not merely a file called "ffmpeg":
@@ -600,6 +665,7 @@ jobs:
       || github.event_name == 'workflow_dispatch'
       || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: windows-latest
+    timeout-minutes: 75
     steps:
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -627,24 +693,27 @@ jobs:
 
       - name: Fetch the ffmpeg sidecars
         # Pinned and checksum-verified (sidecars.toml); bundling refuses to run without them.
-        run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+        run: cargo --locked xtask sidecars fetch --target x86_64-pc-windows-msvc
 
       - name: Install the frontend dependencies
         working-directory: apps/desktop
         run: npm ci
 
       - name: Build the NSIS installer
-        # The CLI is called directly, not through `npm run tauri --`: PowerShell strips the
-        # `--` and the flags are lost (docs/packaging.md §3). The `nsis` target comes from
-        # tauri.windows.conf.json.
+        # `shell: bash`, because PowerShell strips the `--` that separates the CLI's flags from
+        # cargo's (docs/packaging.md §3); everything after the second `--` is passed to
+        # `cargo build`, which is how `--locked` reaches it. The `nsis` target comes from
+        # tauri.windows.conf.json. This is the same command, character for character, the
+        # release workflow runs.
         #
         # `--no-sign`: `bundle.createUpdaterArtifacts` is on, so this build also produces
         # the updater's artifact and wants to sign it with the release key — a secret this
         # job must not have, since it runs on pull requests from forks. The installer this
         # job produces is checked and never published, so an unsigned updater artifact is
         # exactly right here; the release workflow signs the real one.
+        shell: bash
         working-directory: apps/desktop
-        run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc --no-sign
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --no-sign -- --locked
 
       - name: Check the installer exists and carries the sidecars
         # Lists the NSIS archive with 7-Zip (preinstalled on the runner); does not run it.
@@ -660,4 +729,27 @@ jobs:
               Write-Host $listing
               throw "the installer does not contain $name"
             }
+          }
+
+      - name: Anti-cheat guard on the executable the installer ships
+        # The binary half of docs/anti-cheat.md, on the file a user would run. The source
+        # guard (supply-chain job) reads our code; a dependency that calls `SendInput` never
+        # appears in it. The import table of what ships does, and so does the string scan for
+        # a name looked up at run time. The installer is unpacked with 7-Zip and the
+        # `replayed.exe` inside it is read. The sidecar `ffmpeg.exe` / `ffprobe.exe` are
+        # third-party binaries and are not checked here. The release workflow runs the same
+        # step before it publishes.
+        shell: pwsh
+        run: |
+          $dir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
+          $exe = Get-ChildItem -Path $dir -Filter '*-setup.exe' | Select-Object -First 1
+          $out = Join-Path $env:RUNNER_TEMP 'installer-contents'
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+          & 7z x -y "-o$out" $exe.FullName | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z could not unpack the installer" }
+          $exes = @(Get-ChildItem -Path $out -Recurse -Filter 'replayed.exe' -File)
+          if ($exes.Count -ne 1) { throw "expected one replayed.exe in the installer, found $($exes.Count)" }
+          & bash scripts/check-forbidden-apis.sh --binary $exes[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "the executable the installer ships names a forbidden Windows API (docs/anti-cheat.md)"
           }

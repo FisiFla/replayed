@@ -67,7 +67,7 @@ const settings: SettingsDto = {
 const recording: RecordingStatus = {
   running: false, frames: 0, segments: 0, bytes: 0, span_ms: 0, dropped: 0, dropped_audio: 0,
   skipped: 0, fps: 0, configured_fps: 60, effective_fps: 0, drift_ms: 0, clips: 0, error: null,
-  watching_games: true, matched_game: null, recorder_mode: 'buffer', mic_enabled: false,
+  watching_games: true, matched_game: null, recorder_mode: 'buffer', mic_enabled: false, ended: null, stalled_for_ms: null,
 };
 const encoderSettings: EncoderSettings = {
   vendor: 'auto', codec: 'h264', bitrate_kbps: 20000, fps: 60, output_size: '', adapt_fps: true,

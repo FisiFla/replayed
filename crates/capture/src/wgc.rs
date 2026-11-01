@@ -20,16 +20,36 @@
 //! that event does nothing but set a flag and wake the condvar the wait is on. The wait therefore
 //! ends when the pool says a frame is there, not a millisecond later.
 //!
+//! # A capture that changes under us
+//!
+//! WGC keeps delivering surfaces of the size its pool was built for, whatever the captured thing
+//! becomes, so every one of these used to be silent: a resized window or a display mode change
+//! recorded a crop or a padding, a closed window looked like an idle one, and a driver reset ended
+//! the session. Each is now noticed and handled:
+//!
+//! - **Resize / display mode change.** Every frame's `ContentSize` is compared with the pool's size
+//!   ([`classify_frame`]). On a change a new pool and capture session are built at the new size
+//!   (not `Recreate` on the old pool, which was measured to leave a static window with no frame;
+//!   see [`Session::recreate_pool`]), the frame that announced it (a crop or a padding, not a
+//!   picture) is closed unread, and the new size is offered to the caller through
+//!   [`CaptureBackend::take_size_change`] before any frame of it is returned. The pump's frame-size
+//!   guard stays as the fail-closed backstop for a caller that does not ask.
+//! - **Closed, removed target.** `GraphicsCaptureItem.Closed` is registered; once it fires,
+//!   `next_frame` returns [`CaptureLost::TargetClosed`] instead of `Ok(None)` for ever.
+//! - **Quiet target.** A minimised window, or a screen with nothing changing, delivers no frames
+//!   and is not an error. The quiet is timed ([`StallWatch`]), logged when it starts and when it
+//!   ends, and readable through [`CaptureBackend::stalled_for`].
+//! - **Lost graphics device** (a driver reset or update). The session is torn down and rebuilt on
+//!   a new device every [`DEVICE_RETRY_INTERVAL`] for [`DEVICE_RETRIES`] attempts; frames are
+//!   `Ok(None)` meanwhile, so a TDR costs seconds of video and not the recording. After that it is
+//!   [`CaptureLost::DeviceLost`].
+//!
 //! # Known gaps
 //!
-//! - A display mode change mid-capture normally needs `Direct3D11CaptureFramePool::Recreate`,
-//!   which this backend does not call. It copies whatever size the incoming texture is
-//!   (re-creating its staging texture when that changes) while [`WgcCapture::size`] keeps
-//!   reporting the capture item's size. If the two diverge the CLI refuses the frame and names
-//!   both sizes rather than feeding ffmpeg a differently sized frame.
-//! - Monitor and window selection (`[capture]`) has never run on Windows; it is type-checked
-//!   only. A captured window resized mid-capture hits the same size-divergence gap, and a
-//!   minimised one stops delivering frames.
+//! - A rebuilt device is a new `ID3D11Device`. The capture's textures (zero-copy handover) are
+//!   born on it, so an encoder that was bound to the old device sees a lost device of its own.
+//! - Monitor and window selection (`[capture]`) is verified on one machine only; see
+//!   `docs/verification-status.md`.
 //! - The display list ([`crate::displays`]) and the refresh rates in it have never run on
 //!   Windows either; they are type-checked only. The rules that decide what counts as a real
 //!   rate are tested on every host, but what the API answers on a given machine is not.
@@ -43,8 +63,16 @@ use crate::target::{
     indexed_displays, ordered_monitors, pick_monitor, pick_window, CaptureTarget, DisplayInfo,
     DisplayMode,
 };
-use crate::{clock_base, take_or_wait, CaptureBackend, Frame, FrameSignal, PixelFormat};
+use crate::wasapi::ApartmentOwner;
+use crate::watch::{
+    classify_frame, is_device_lost_code, FrameGeometry, Liveness, RetryBudget, RetryStep,
+    StallWatch, DEVICE_RETRIES, DEVICE_RETRY_INTERVAL,
+};
+use crate::{
+    clock_base, take_or_wait, CaptureBackend, CaptureLost, Frame, FrameSignal, PixelFormat,
+};
 use anyhow::{bail, Context, Result};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -128,8 +156,28 @@ pub struct WgcCapture {
     /// Separate from `session`, which is built in [`Self::new`] because the item size must be known
     /// before the encoder is configured, between construction and `start`.
     started: bool,
-    /// Whether this thread's COM apartment was taken by us and must be given back.
+    /// Whether the apartment of the thread that built the backend was taken by us and must be given back.
     com_owned: bool,
+    /// The thread that took the apartment, recorded so it is only ever given back there.
+    ///
+    /// `CoUninitialize` balances the `CoInitializeEx` of *the calling thread*. The backend is built
+    /// and started on the thread that starts a recording and then moved to the recorder thread, which
+    /// reads frames and stops it, so the giving back usually is not on the thread that took it. A
+    /// `CoUninitialize` there would unbalance that thread's apartment instead.
+    apartment: Option<ApartmentOwner>,
+    /// A change of geometry the caller has not been told about yet (see [`CaptureBackend::take_size_change`]).
+    pending_size: Option<(u32, u32)>,
+    /// How long it has been since a frame arrived.
+    stall: StallWatch,
+    /// Set while the graphics device is being rebuilt after a loss; `session` is `None` meanwhile.
+    recovery: Option<Recovery>,
+}
+
+/// A lost graphics device, being rebuilt.
+struct Recovery {
+    budget: RetryBudget,
+    /// Why the device was thought lost, kept for the error if it is not coming back.
+    reason: String,
 }
 
 /// The ring of textures a session hands to an encoder that asked for them.
@@ -228,10 +276,18 @@ struct Session {
     /// the encoder still reads it.
     handover: Option<Handover>,
     /// Held deliberately: the pool and session capture this item, and dropping our reference while
-    /// they run is not documented as safe. Nothing below `start` reads it.
-    _item: GraphicsCaptureItem,
-    /// Closed by `stop`; kept for the lifetime of the capture otherwise.
+    /// they run is not documented as safe. Also where the `Closed` registration is taken back from.
+    item: GraphicsCaptureItem,
+    /// The latch the wait blocks on, kept to give a rebuilt pool the same arrival handler.
+    signal: Arc<FrameSignal>,
+    /// Set by the item's `Closed` handler: the window was closed or the display removed.
+    closed: Arc<AtomicBool>,
+    /// The token the item gave for the `Closed` registration, so it can be taken back.
+    closed_token: i64,
+    /// Closed when the session goes (see the `Drop` impl); kept for the lifetime of the capture otherwise.
     capture: GraphicsCaptureSession,
+    /// A resize the owner has not collected yet (see [`WgcCapture::next_frame`]).
+    resized: Option<(u32, u32)>,
     /// Re-created when the frame size or format changes (resolution switch).
     staging: Option<Staging>,
     /// The capture's clock, and the frame pool's presentation times on it.
@@ -286,6 +342,10 @@ impl WgcCapture {
             signal: Arc::new(FrameSignal::new()),
             started: false,
             com_owned: false,
+            apartment: None,
+            pending_size: None,
+            stall: StallWatch::new(Instant::now()),
+            recovery: None,
         };
         this.start_session()?;
         Ok(this)
@@ -293,27 +353,49 @@ impl WgcCapture {
 
     /// Take this thread's COM apartment and build the WGC session on it.
     fn start_session(&mut self) -> Result<()> {
-        self.com_owned = init_com()?;
-        match Session::new(&self.target, Arc::clone(&self.signal)) {
-            Ok(mut session) => {
-                self.size = session.size;
-                // Carry the caller's answer into the session: the encoder is configured, and asks, between
-                // construction and `start`, before this session existed.
-                session.deliver_textures(self.want_textures);
-                tracing::info!(
-                    width = self.size.0,
-                    height = self.size.1,
-                    "the capture item measures these physical pixels"
-                );
-                self.session = Some(session);
-                Ok(())
+        if !self.com_owned {
+            self.com_owned = init_com()?;
+            if self.com_owned {
+                self.apartment = Some(ApartmentOwner::here());
             }
+        }
+        match self.build_session() {
+            Ok(()) => Ok(()),
             Err(e) => {
                 // No frame was captured, so give the apartment back rather than leave the thread in one nobody owns.
                 self.release_com();
                 Err(e)
             }
         }
+    }
+
+    /// Build the device, item, pool and session, and make them the backend's.
+    ///
+    /// Shared by the first start and by the rebuild after a lost device. A session that comes out
+    /// at another size than the last one (a display that came back in a different mode) is a size
+    /// change like any other, and is reported the same way.
+    fn build_session(&mut self) -> Result<()> {
+        let mut session = Session::new(&self.target, Arc::clone(&self.signal))?;
+        if self.size != (0, 0) && session.size != self.size {
+            tracing::info!(
+                from = ?self.size,
+                to = ?session.size,
+                "the rebuilt capture is a different size from the one before it"
+            );
+            self.pending_size = Some(session.size);
+        }
+        self.size = session.size;
+        // Carry the caller's answer into the session: the encoder is configured, and asks, between
+        // construction and `start`, before this session existed.
+        session.deliver_textures(self.want_textures);
+        tracing::info!(
+            width = self.size.0,
+            height = self.size.1,
+            "the capture item measures these physical pixels"
+        );
+        self.session = Some(session);
+        self.stall.restart(Instant::now());
+        Ok(())
     }
 
     /// The capture item's size in physical pixels (see the `size` field).
@@ -326,10 +408,116 @@ impl WgcCapture {
     }
 
     fn release_com(&mut self) {
-        if self.com_owned {
-            // SAFETY: `start_session` took the apartment on this thread.
-            unsafe { CoUninitialize() };
-            self.com_owned = false;
+        if !self.com_owned {
+            return;
+        }
+        self.com_owned = false;
+        if let Some(owner) = self.apartment.take() {
+            if !owner.is_here() {
+                // The apartment belongs to the thread that took it, and `CoUninitialize` has to run
+                // there. That the backend is stopped on the recorder thread is the ordinary case, not
+                // a fault (every WGC object here is agile, and the recorder thread needs no apartment
+                // of its own to call them), so this is a note and not an error: what is left behind
+                // is one reference on a long-lived thread's apartment, where the alternative is to
+                // uninitialise an apartment that is not ours.
+                tracing::debug!(
+                    opened_on = %owner,
+                    released_from = %ApartmentOwner::here(),
+                    "the WGC backend's COM apartment is not being given back from this thread: it \
+                     belongs to the thread that started the capture"
+                );
+                return;
+            }
+        }
+        // This gives back only this thread's reference. The process's multithreaded apartment is held
+        // open by `init_com` for the life of the process, because letting it go with the last
+        // reference unloads `GraphicsCapture.dll` under its own worker threads, which are still
+        // winding down after the session was closed (see `platform::keep_mta_alive`).
+        // SAFETY: `start_session` took the apartment on this thread (checked just above).
+        unsafe { CoUninitialize() };
+    }
+
+    /// The reason the graphics device is thought lost, if `error` says so or the device itself does.
+    ///
+    /// Two sources, because they fail differently: a call that returns one of the lost-device
+    /// HRESULTS says so itself (and the `windows` error can be buried several `context` layers
+    /// down), while a copy or a `Map` can fail with a code that names only the symptom, and the
+    /// device's own removed reason is what tells it from an ordinary failure.
+    fn device_lost_reason(&self, error: &anyhow::Error) -> Option<String> {
+        let coded = error.chain().any(|cause| {
+            cause
+                .downcast_ref::<windows::core::Error>()
+                .is_some_and(|e| is_device_lost_code(e.code().0))
+        });
+        let removed = self.session.as_ref().and_then(|session| {
+            // SAFETY: the device is alive for as long as the session is.
+            unsafe { session.device.GetDeviceRemovedReason() }
+                .err()
+                .map(|e| e.code())
+        });
+        if coded || removed.is_some() {
+            Some(match removed {
+                Some(code) => format!("{error:#} (the device's removed reason is {code:?})"),
+                None => format!("{error:#}"),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Handle a failure from the session: a lost device starts a rebuild, anything else is the error.
+    ///
+    /// Returns `Ok(())` when the failure was absorbed, in which case the caller reports "no frame".
+    fn absorb(&mut self, error: anyhow::Error) -> Result<()> {
+        if error.downcast_ref::<CaptureLost>().is_some() {
+            return Err(error);
+        }
+        let Some(reason) = self.device_lost_reason(&error) else {
+            return Err(error);
+        };
+        tracing::warn!(
+            attempts = DEVICE_RETRIES,
+            every_ms = DEVICE_RETRY_INTERVAL.as_millis() as u64,
+            "the graphics device was lost ({reason}); rebuilding the capture, no frames until it is back"
+        );
+        // Dropped first: the old session holds the old device, and a rebuild must not meet it.
+        self.session = None;
+        self.recovery = Some(Recovery {
+            budget: RetryBudget::new(DEVICE_RETRIES, DEVICE_RETRY_INTERVAL),
+            reason,
+        });
+        Ok(())
+    }
+
+    /// One step of rebuilding after a lost device. `Ok(())` means "carry on, no frame yet".
+    ///
+    /// Never blocks longer than `timeout` (or a short minimum, so a zero timeout is not a busy
+    /// loop): the caller is the pump, which has other work.
+    fn recover(&mut self, timeout: Duration) -> Result<()> {
+        let Some(recovery) = self.recovery.as_mut() else {
+            return Ok(());
+        };
+        match recovery.budget.poll(Instant::now()) {
+            RetryStep::Wait(remaining) => {
+                std::thread::sleep(remaining.min(timeout.max(Duration::from_millis(10))));
+                Ok(())
+            }
+            RetryStep::Try => {
+                let attempt = recovery.budget.attempts();
+                match self.build_session() {
+                    Ok(()) => {
+                        tracing::info!(attempt, "the graphics device is back; capture resumed");
+                        self.recovery = None;
+                    }
+                    Err(e) => tracing::debug!(attempt, "rebuilding the capture failed: {e:#}"),
+                }
+                Ok(())
+            }
+            RetryStep::GiveUp => {
+                let attempts = recovery.budget.attempts();
+                let reason = std::mem::take(&mut recovery.reason);
+                Err(CaptureLost::DeviceLost { attempts, reason }.into())
+            }
         }
     }
 }
@@ -344,6 +532,8 @@ impl CaptureBackend for WgcCapture {
         if self.session.is_none() {
             self.start_session()?;
         }
+        // The time between building the session and starting it is not the target's quiet.
+        self.stall.restart(Instant::now());
         self.started = true;
         Ok(())
     }
@@ -355,9 +545,17 @@ impl CaptureBackend for WgcCapture {
     /// copy is the handover of a frame the pool has, and everything else is the wait for one to
     /// arrive. The wait's own clock reads (nanoseconds) are left out of both. See
     /// [`crate::FrameTimings`].
+    ///
+    /// A target that is gone is an error ([`CaptureLost::TargetClosed`]), not a frame that has not
+    /// arrived yet. A resize is not an error and not a frame: the call returns `Ok(None)` and the
+    /// change is waiting in [`CaptureBackend::take_size_change`].
     fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
         if !self.started {
             bail!("WGC capture is not started");
+        }
+        if self.recovery.is_some() {
+            self.recover(timeout)?;
+            return Ok(None);
         }
         let session = self
             .session
@@ -367,8 +565,14 @@ impl CaptureBackend for WgcCapture {
         // The pool is asked for a frame first, because a frame it already holds costs nothing to
         // take; when it has none, the wait blocks until the pool's own `FrameArrived` handler
         // says one is there. Nothing polls in between.
-        let (frame, waited) = take_or_wait(
+        let taken = take_or_wait(
             &mut || {
+                // Before the pool is asked: a closed item's pool answers "nothing" for ever, and
+                // that answer is the one this check exists to stop trusting. The item's `Closed`
+                // handler wakes the wait, so this is reached as soon as it fires.
+                if session.is_closed() {
+                    return Err(CaptureLost::TargetClosed.into());
+                }
                 let before = Instant::now();
                 let polled = session.poll_frame();
                 copied += before.elapsed();
@@ -376,30 +580,36 @@ impl CaptureBackend for WgcCapture {
             },
             &self.signal,
             timeout,
-        )?;
+        );
+        // Whatever the outcome, the session's geometry is what the backend reports from here, and a
+        // resize it found is the caller's to be told about.
+        self.size = session.size;
+        if let Some(resized) = session.resized.take() {
+            self.pending_size = Some(resized);
+        }
         self.copying += copied;
+        let (frame, waited) = match taken {
+            Ok(taken) => taken,
+            Err(e) => {
+                self.absorb(e)?;
+                return Ok(None);
+            }
+        };
         self.waiting += waited;
+        let now = Instant::now();
+        let liveness = match frame {
+            Some(_) => self.stall.frame(now),
+            None => self.stall.idle(now),
+        };
+        self.note_liveness(liveness);
         Ok(frame)
     }
 
     fn stop(&mut self) -> Result<()> {
         self.started = false;
-        if let Some(session) = self.session.take() {
-            // Close the session before the pool, the order every WGC sample uses, and report a refusal from
-            // either rather than pretending it stopped.
-            if let Err(e) = session.capture.Close() {
-                tracing::warn!("closing the WGC capture session failed: {e}");
-            }
-            // Take the arrival handler back before the pool goes. The pool holds the handler and
-            // the handler holds the signal the wait is on: a pool closed with the handler still
-            // registered is a pool whose worker thread may raise it once more.
-            if let Err(e) = session.pool.RemoveFrameArrived(session.arrival) {
-                tracing::warn!("removing the WGC frame-arrival handler failed: {e}");
-            }
-            if let Err(e) = session.pool.Close() {
-                tracing::warn!("closing the WGC frame pool failed: {e}");
-            }
-        }
+        self.recovery = None;
+        // Dropped, which closes everything in the order WGC wants (see `Session::drop`).
+        self.session = None;
         self.release_com();
         Ok(())
     }
@@ -423,10 +633,20 @@ impl CaptureBackend for WgcCapture {
     }
 
     fn native_size(&self) -> (u32, u32) {
-        // Invariant owed to the caller: this is the size of every frame `next_frame` produces, since
-        // both come from the capture item (the pool is created with `item.Size()`). The rawvideo pipe
-        // is declared from it, so a mismatch is fatal; see `copy_out` and the CLI's frame guard.
+        // Invariant owed to the caller: this is the size of every frame `next_frame` produces. The
+        // pool is created with the item's size and rebuilt whenever a frame says the content has
+        // another (`Session::poll_frame`), and a frame that disagrees is never returned. It changes
+        // only together with a report from `take_size_change`. The rawvideo pipe is declared from
+        // it, so a mismatch is fatal; see `copy_out` and the CLI's frame guard.
         self.size
+    }
+
+    fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        self.pending_size.take()
+    }
+
+    fn stalled_for(&self) -> Option<Duration> {
+        self.stall.stalled_for(Instant::now())
     }
 
     /// Close everything the frame pool holds without reading a pixel back; see [`Session::discard_pending`].
@@ -441,18 +661,64 @@ impl CaptureBackend for WgcCapture {
         if !self.started {
             bail!("WGC capture is not started");
         }
+        // Nothing to drain while the device is being rebuilt; `next_frame` drives the rebuild.
+        if self.recovery.is_some() {
+            return Ok(0);
+        }
         let session = self
             .session
             .as_ref()
             .context("WGC capture has no session (already stopped)")?;
+        if session.is_closed() {
+            return Err(CaptureLost::TargetClosed.into());
+        }
         // `&Session`: a read of the pool, not a change to the session; frames are released through their own handles.
-        session.discard_pending()
+        match session.discard_pending() {
+            Ok(discarded) => {
+                // A frame the pool had is a frame that arrived, kept or not.
+                if discarded > 0 {
+                    let liveness = self.stall.frame(Instant::now());
+                    self.note_liveness(liveness);
+                }
+                Ok(discarded)
+            }
+            Err(e) => {
+                self.absorb(e)?;
+                Ok(0)
+            }
+        }
+    }
+}
+
+impl WgcCapture {
+    /// Say in the log that the capture went quiet, or that it stopped being quiet.
+    ///
+    /// Once each, at the transition: a minimised window is quiet for as long as it stays so, and
+    /// a line per poll would bury everything else in the log.
+    fn note_liveness(&self, liveness: Liveness) {
+        match liveness {
+            Liveness::Unchanged => {}
+            Liveness::Stalled(quiet) => tracing::warn!(
+                quiet_secs = quiet.as_secs_f64(),
+                target = ?self.target,
+                "the capture has delivered no frame; the recording is of an unchanging picture. A \
+                 minimised window presents nothing while it is minimised, and a screen with \
+                 nothing changing presents nothing either. If neither is so, the target may not be \
+                 capturable"
+            ),
+            Liveness::Resumed(quiet) => tracing::info!(
+                quiet_secs = quiet.as_secs_f64(),
+                "the capture is delivering frames again"
+            ),
+        }
     }
 }
 
 impl Drop for WgcCapture {
     fn drop(&mut self) {
-        // A backend dropped without `stop` must still shut the capture down and give the COM apartment back.
+        // A backend dropped without `stop` must still shut the capture down (the session's own `Drop`
+        // closes the capture session and the pool and takes back the handlers) and give the COM
+        // apartment back.
         self.session = None;
         self.release_com();
     }
@@ -472,47 +738,27 @@ impl Session {
             Ok(name) => tracing::info!(display = %name, ?target, "capturing"),
             Err(e) => tracing::debug!("the capture item has no display name: {e}"),
         }
-        let winrt_device = winrt_device(&device)?;
+        let winrt = winrt_device(&device)?;
 
-        let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
-            &winrt_device,
-            // The encoder pipe is BGRA8; the pool must produce the same layout.
-            DirectXPixelFormat::B8G8R8A8UIntNormalized,
-            BUFFER_COUNT,
-            item_size,
-        )
-        .context("Direct3D11CaptureFramePool::CreateFreeThreaded")?;
-        // The pool says when a frame has arrived, and this is the only thing that acts on it: set
-        // the flag and wake the wait. The handler runs on the pool's own worker thread (a
-        // free-threaded pool has no dispatcher queue), so it must be cheap and must not block.
+        let (pool, arrival, capture) = open_pool(&winrt, &item, item_size, &signal)?;
+        // The item says when what it captures is gone: a window closed, a display unplugged. Before
+        // this the pool just went quiet, and a quiet pool is what an idle screen looks like.
         //
-        // It holds the signal and nothing else, so there is no cycle back to the pool: the pool
-        // holds the handler, the handler holds the signal, and the signal holds nothing.
-        let handler_signal = Arc::clone(&signal);
-        let handler: TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> =
+        // Same shape as the arrival handler, for the same reasons: it runs on a thread of WinRT's
+        // choosing, so it sets a flag and wakes the wait and does nothing else; and it holds only the
+        // flag and the signal, so the item holding the handler cannot form a cycle.
+        let closed = Arc::new(AtomicBool::new(false));
+        let closed_flag = Arc::clone(&closed);
+        let closed_signal = Arc::clone(&signal);
+        let closed_handler: TypedEventHandler<GraphicsCaptureItem, IInspectable> =
             TypedEventHandler::new(move |_sender, _args| -> windows::core::Result<()> {
-                handler_signal.arrive();
+                closed_flag.store(true, Ordering::Release);
+                closed_signal.arrive();
                 Ok(())
             });
-        // The handler is not kept: the pool holds its own reference to the delegate, and the
-        // delegate type is not `Send`, so a session that kept one could not be sent.
-        let arrival = pool
-            .FrameArrived(&handler)
-            .context("Direct3D11CaptureFramePool::FrameArrived")?;
-        let capture = pool
-            .CreateCaptureSession(&item)
-            .context("Direct3D11CaptureFramePool::CreateCaptureSession")?;
-        // Both are best effort: they need newer interface revisions than the capture itself and fail
-        // harmlessly (a missing cursor, or the yellow border Windows 11 draws for untrusted apps).
-        if let Err(e) = capture.SetIsCursorCaptureEnabled(true) {
-            tracing::debug!("cursor capture could not be enabled: {e}");
-        }
-        if let Err(e) = capture.SetIsBorderRequired(false) {
-            tracing::debug!("the capture border could not be disabled: {e}");
-        }
-        capture
-            .StartCapture()
-            .context("GraphicsCaptureSession::StartCapture")?;
+        let closed_token = item
+            .Closed(&closed_handler)
+            .context("GraphicsCaptureItem::Closed")?;
         tracing::info!(width = size.0, height = size.1, "WGC capture started");
 
         Ok(Self {
@@ -521,8 +767,12 @@ impl Session {
             pool,
             arrival,
             size,
-            _item: item,
+            signal,
+            item,
+            closed,
+            closed_token,
             capture,
+            resized: None,
             staging: None,
             handover: None,
             clock: crate::CaptureClock::new(),
@@ -536,8 +786,46 @@ impl Session {
             // `TryGetNextFrame` reports "no frames ready" as S_OK with a null frame, which this binding
             // turns into `Error::empty()` (HRESULT still S_OK). Anything else is a genuine failure.
             Err(e) if is_frame_unavailable(&e) => return Ok(None),
-            Err(e) => bail!("Direct3D11CaptureFramePool::TryGetNextFrame failed: {e}"),
+            // Kept as the cause, not formatted into a message: `device_lost_reason` looks for the
+            // HRESULT in the chain to tell a lost device from an ordinary failure.
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context("Direct3D11CaptureFramePool::TryGetNextFrame failed"))
+            }
         };
+
+        // What the frame is, before anything is copied out of it: the pool hands out surfaces of the
+        // size it was built for whatever the captured thing has become, and `ContentSize` is the only
+        // place the truth is. A frame that is not of the size the backend reports is never returned.
+        let content = frame
+            .ContentSize()
+            .context("Direct3D11CaptureFrame::ContentSize")?;
+        let texture = self.surface_size(&frame)?;
+        match classify_frame((content.Width, content.Height), texture, self.size) {
+            FrameGeometry::Current => {}
+            FrameGeometry::Resized(to) => {
+                let from = self.size;
+                // Whether or not the rebuild works, this frame is a crop or a padding and is released.
+                let rebuilt = self.recreate_pool(to);
+                let closed = frame.Close();
+                rebuilt?;
+                closed.context("closing a WGC frame of the old size")?;
+                tracing::info!(
+                    from = ?from,
+                    to = ?to,
+                    "the captured content changed size; the frame pool was rebuilt at the new size"
+                );
+                return Ok(None);
+            }
+            FrameGeometry::Stale | FrameGeometry::Empty => {
+                // Queued by the pool before it was rebuilt, or a minimised window with no area:
+                // nothing to copy, and the pool is not to be rebuilt for either.
+                frame
+                    .Close()
+                    .context("closing a WGC frame that is not copied")?;
+                return Ok(None);
+            }
+        }
 
         // The frame's real capture time: the moment the compositor presented it, which the pool
         // stamps on every frame in 100-nanosecond units. The moment the frame is asked for is later
@@ -577,7 +865,9 @@ impl Session {
                 Ok(frame) => frame,
                 Err(e) if is_frame_unavailable(&e) => break,
                 Err(e) => {
-                    bail!("Direct3D11CaptureFramePool::TryGetNextFrame failed while draining: {e}")
+                    return Err(anyhow::Error::new(e).context(
+                        "Direct3D11CaptureFramePool::TryGetNextFrame failed while draining",
+                    ))
                 }
             };
             // SAFETY: `frame` is a live `Direct3D11CaptureFrame` from this session's own frame pool, owned
@@ -589,6 +879,64 @@ impl Session {
             discarded += 1;
         }
         Ok(discarded)
+    }
+
+    /// The size of the frame's own surface, which is the size the pool was built for.
+    fn surface_size(&self, frame: &Direct3D11CaptureFrame) -> Result<(u32, u32)> {
+        let surface: IDirect3DSurface =
+            frame.Surface().context("Direct3D11CaptureFrame::Surface")?;
+        let access: IDirect3DDxgiInterfaceAccess = surface.cast()?;
+        // SAFETY: `access` is the frame's own surface; `GetInterface` is the documented way to reach the
+        // underlying D3D11 texture from it.
+        let texture: ID3D11Texture2D = unsafe { access.GetInterface() }?;
+        let mut desc = D3D11_TEXTURE2D_DESC::default();
+        // SAFETY: `desc` is a valid out-parameter for this texture.
+        unsafe { texture.GetDesc(&mut desc) };
+        Ok((desc.Width, desc.Height))
+    }
+
+    /// Rebuild the frame pool for content of another size, and record the change for the owner.
+    ///
+    /// A **new pool and a new capture session** on the same device and item, made before the old
+    /// ones are let go, and not `Direct3D11CaptureFramePool::Recreate` on the pool that is there.
+    /// Both halves of that were measured on the box rather than assumed:
+    ///
+    /// - The frame that announced the change is a crop or a padding and is thrown away, so it was the
+    ///   only picture of the new size there was. A target that does not repaint (a window nobody is
+    ///   touching) presents nothing more, and a `Recreate`d pool sat empty until it did. Starting a
+    ///   session presents the current picture once, which is that frame, whole.
+    /// - A second `CreateCaptureSession` on the same pool, the way to start one after a `Recreate`,
+    ///   is refused (`0x8000FFFF`): a pool has one session for its life.
+    ///
+    /// The old pool's queued frames go with it, so nothing at the old size can be returned after
+    /// this. The staging texture and the handover ring are keyed by size and rebuild themselves on
+    /// the first frame that disagrees with them.
+    fn recreate_pool(&mut self, to: (u32, u32)) -> Result<()> {
+        let size = SizeInt32 {
+            Width: i32::try_from(to.0).context("the new capture width does not fit a SizeInt32")?,
+            Height: i32::try_from(to.1)
+                .context("the new capture height does not fit a SizeInt32")?,
+        };
+        // Wrapped afresh rather than kept from `new`: the WinRT device wrapper is not `Send`, and a
+        // session that held one could not move with the backend to the recorder's thread. It is a
+        // view of the same D3D11 device, so nothing is lost by making it again.
+        let winrt = winrt_device(&self.device)?;
+        let (pool, arrival, capture) = open_pool(&winrt, &self.item, size, &self.signal)?;
+        // The new ones are in place; retire the old ones in the order `Drop` uses.
+        let old = Retired {
+            pool: std::mem::replace(&mut self.pool, pool),
+            arrival: std::mem::replace(&mut self.arrival, arrival),
+            capture: std::mem::replace(&mut self.capture, capture),
+        };
+        old.close();
+        self.size = to;
+        self.resized = Some(to);
+        Ok(())
+    }
+
+    /// Whether the item has said what it captures is gone (see the `Closed` handler in [`Self::new`]).
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
     }
 
     /// Stage-copy the frame's D3D11 texture into CPU-visible memory as BGRA8.
@@ -763,6 +1111,121 @@ impl Session {
             .map(|(_, _, texture)| texture.clone())
             .context("staging texture vanished")
     }
+}
+
+/// A pool, its arrival registration and its capture session, on their way out.
+struct Retired {
+    pool: Direct3D11CaptureFramePool,
+    arrival: i64,
+    capture: GraphicsCaptureSession,
+}
+
+impl Retired {
+    /// Shut them down in the order WGC wants, reporting a refusal from any rather than
+    /// pretending it stopped.
+    fn close(self) {
+        // Close the session before the pool, the order every WGC sample uses.
+        if let Err(e) = self.capture.Close() {
+            tracing::warn!("closing the WGC capture session failed: {e}");
+        }
+        // Take the arrival handler back before the pool goes. The pool holds the handler and the
+        // handler holds the signal the wait is on: a pool closed with the handler still
+        // registered is a pool whose worker thread may raise it once more.
+        if let Err(e) = self.pool.RemoveFrameArrived(self.arrival) {
+            tracing::warn!("removing the WGC frame-arrival handler failed: {e}");
+        }
+        if let Err(e) = self.pool.Close() {
+            tracing::warn!("closing the WGC frame pool failed: {e}");
+        }
+    }
+}
+
+impl Drop for Session {
+    /// Shut the capture down, whether or not `stop` was called.
+    ///
+    /// The one place this is done, so that a backend dropped without `stop` (a panic on the way, an
+    /// early return) cannot skip it and leave a registered handler and an open pool behind.
+    fn drop(&mut self) {
+        // The item's `Closed` handler is taken back like the arrival one: the item outlives this
+        // session in anyone else's hands, and its handler holds the signal.
+        if let Err(e) = self.item.RemoveClosed(self.closed_token) {
+            tracing::warn!("removing the WGC item-closed handler failed: {e}");
+        }
+        // `Session` has a `Drop` of its own, so its fields cannot be moved out; clones of the
+        // WinRT references (a reference-count bump each) are what `Retired` takes.
+        Retired {
+            pool: self.pool.clone(),
+            arrival: self.arrival,
+            capture: self.capture.clone(),
+        }
+        .close();
+    }
+}
+
+/// A frame pool for `item` at `size`, the registration that wakes `signal` when a frame arrives
+/// on it, and a capture session on it, started.
+///
+/// Shared by [`Session::new`] and by the rebuild after a resize ([`Session::recreate_pool`]), so
+/// the two cannot differ in how a pool is made.
+fn open_pool(
+    winrt: &IDirect3DDevice,
+    item: &GraphicsCaptureItem,
+    size: SizeInt32,
+    signal: &Arc<FrameSignal>,
+) -> Result<(Direct3D11CaptureFramePool, i64, GraphicsCaptureSession)> {
+    let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
+        winrt,
+        // The encoder pipe is BGRA8; the pool must produce the same layout.
+        DirectXPixelFormat::B8G8R8A8UIntNormalized,
+        BUFFER_COUNT,
+        size,
+    )
+    .context("Direct3D11CaptureFramePool::CreateFreeThreaded")?;
+    // The pool says when a frame has arrived, and this is the only thing that acts on it: set
+    // the flag and wake the wait. The handler runs on the pool's own worker thread (a
+    // free-threaded pool has no dispatcher queue), so it must be cheap and must not block.
+    //
+    // It holds the signal and nothing else, so there is no cycle back to the pool: the pool
+    // holds the handler, the handler holds the signal, and the signal holds nothing.
+    let handler_signal = Arc::clone(signal);
+    let handler: TypedEventHandler<Direct3D11CaptureFramePool, IInspectable> =
+        TypedEventHandler::new(move |_sender, _args| -> windows::core::Result<()> {
+            handler_signal.arrive();
+            Ok(())
+        });
+    // The handler is not kept: the pool holds its own reference to the delegate, and the
+    // delegate type is not `Send`, so a session that kept one could not be sent.
+    let arrival = pool
+        .FrameArrived(&handler)
+        .context("Direct3D11CaptureFramePool::FrameArrived")?;
+    let capture = start_capture_session(&pool, item)?;
+    Ok((pool, arrival, capture))
+}
+
+/// A capture session on the pool, with the cursor shown and no border, started.
+///
+/// Starting is what makes WGC present the target's current picture once: a session that has been
+/// started gets a frame even from a window that never repaints again, and that first frame is the
+/// reason this is its own function (see [`Session::recreate_pool`]).
+fn start_capture_session(
+    pool: &Direct3D11CaptureFramePool,
+    item: &GraphicsCaptureItem,
+) -> Result<GraphicsCaptureSession> {
+    let capture = pool
+        .CreateCaptureSession(item)
+        .context("Direct3D11CaptureFramePool::CreateCaptureSession")?;
+    // Both are best effort: they need newer interface revisions than the capture itself and fail
+    // harmlessly (a missing cursor, or the yellow border Windows 11 draws for untrusted apps).
+    if let Err(e) = capture.SetIsCursorCaptureEnabled(true) {
+        tracing::debug!("cursor capture could not be enabled: {e}");
+    }
+    if let Err(e) = capture.SetIsBorderRequired(false) {
+        tracing::debug!("the capture border could not be disabled: {e}");
+    }
+    capture
+        .StartCapture()
+        .context("GraphicsCaptureSession::StartCapture")?;
+    Ok(capture)
 }
 
 /// `TryGetNextFrame` signals "no frames ready" with S_OK plus a null frame, which this binding

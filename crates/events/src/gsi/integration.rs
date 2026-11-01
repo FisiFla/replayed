@@ -1,8 +1,11 @@
 //! The token, and the `gamestate_integration_replayed.cfg` the user installs.
 //!
-//! The app generates the file and the user installs it; the app never writes into game
-//! installation directories. Everything here produces text (a token and a file's contents) and
-//! the caller decides where to leave it. No code path here touches a game directory.
+//! The app generates the file; installing it is the desktop shell's job, and the shell does write
+//! into the game's `cfg` directory (after checking the path is inside the installation, see
+//! below). This crate never does: everything here produces text (a token and a file's contents)
+//! and the caller decides where to leave it, so no code path *here* touches a game directory.
+//! What the install leaves behind (the file, with the token in it) is described under "What
+//! installing the file costs".
 //!
 //! Valve's `"auth" { "token" "<value>" }` block is echoed back by the game inside the JSON body
 //! under `"auth"` as a string field; GSI sends no `Authorization` header. So the gate in
@@ -168,14 +171,39 @@ fn restrict_to_owner(path: &Path) {
 fn restrict_to_owner(_path: &Path) {}
 
 /// The data blocks Counter-Strike subscribes to.
+///
+/// `player_id` is what puts `steamid` (and the name) in the `player` block; without it the block
+/// can carry stats and no identity, and the derivation cannot tell the user's scoreboard from the
+/// teammate they are spectating after dying. It is also the block whose absence marks a file
+/// installed before it was added: see [`cs2_cfg_is_current`].
 const CS2_BLOCKS: &[(&str, &str)] = &[
     ("provider", "1"),
     ("map", "1"),
     ("round", "1"),
     ("bomb", "1"),
+    ("player_id", "1"),
     ("player_state", "1"),
     ("player_match_stats", "1"),
 ];
+
+/// Whether an installed Counter-Strike `.cfg` has every data block this version subscribes to.
+///
+/// A file written by an older build lacks `player_id`, and nothing re-writes a file once the user
+/// has installed it, so the shell calls this on the file it finds and offers a refresh when the
+/// answer is `false`. It looks for each rendered `"name" "value"` pair rather than the bare name,
+/// because a comment or the token could contain the name and a half-quoted line is a file the game
+/// ignores. The port and token are not compared: those are per-session and the shell owns that
+/// check.
+pub fn cs2_cfg_is_current(installed: &str) -> bool {
+    let lines: Vec<Vec<&str>> = installed
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("//"))
+        .map(|line| line.split('"').skip(1).step_by(2).collect())
+        .collect();
+    CS2_BLOCKS
+        .iter()
+        .all(|(name, value)| lines.iter().any(|q| q.as_slice() == [*name, *value]))
+}
 
 /// The data blocks Dota 2 subscribes to.
 const DOTA_BLOCKS: &[(&str, &str)] = &[
@@ -207,7 +235,7 @@ pub fn integration_cfg_dota(port: u16, token: &str) -> String {
 /// The `uri` names the path the game posts to, which is the path the listener serves that
 /// game on: each game has a path of its own, so the token in this file is only good for
 /// this game. `dota` picks the game's data blocks — Dota 2 subscribes `player` and `hero`,
-/// Counter-Strike subscribes `player_state` and `player_match_stats`.
+/// Counter-Strike subscribes `player_id`, `player_state` and `player_match_stats`.
 pub fn integration_cfg_for(port: u16, path: &str, token: &str, dota: bool) -> String {
     let (game, install_path, data) = if dota {
         (
@@ -375,6 +403,7 @@ mod tests {
             ("map", "1"),
             ("round", "1"),
             ("bomb", "1"),
+            ("player_id", "1"),
             ("player_state", "1"),
             ("player_match_stats", "1"),
         ] {
@@ -434,6 +463,41 @@ mod tests {
             }
             assert!(matches!(line.matches('"').count(), 2 | 4), "{line:?}");
         }
+    }
+
+    #[test]
+    fn an_installed_cfg_missing_a_block_is_not_current() {
+        let token = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"; // gitleaks:allow
+        let text = integration_cfg(45671, token);
+        assert!(
+            cs2_cfg_is_current(&text),
+            "the file this build writes is current"
+        );
+
+        // What an older build wrote: the same file without `player_id`.
+        let old: String = text
+            .lines()
+            .filter(|line| !line.contains("player_id"))
+            .map(|line| format!("{line}\n"))
+            .collect();
+        assert!(!cs2_cfg_is_current(&old), "an old file lacks the new block");
+
+        // The name inside a comment is not a subscription, and neither is the wrong value.
+        let commented = old.replace("\"data\"", "// \"player_id\" \"1\"\n    \"data\"");
+        assert!(
+            !cs2_cfg_is_current(&commented),
+            "a comment subscribes to nothing"
+        );
+        assert!(
+            !cs2_cfg_is_current(&text.replace(
+                &format!("\"player_id\"{}", pad("player_id", "1")),
+                "\"player_id\" \"0\""
+            )),
+            "a block switched off is not subscribed"
+        );
+
+        // A different port and token do not make a file stale: that is a different check.
+        assert!(cs2_cfg_is_current(&integration_cfg(1, "ab")));
     }
 
     #[test]

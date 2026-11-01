@@ -37,14 +37,22 @@
 //! `buffer --self-test-clip-after <SECONDS>` is a diagnostic, not a feature: it waits until the
 //! ring holds a full window, calls the same [`Recorder::clip_now`] the hotkey calls (once), and
 //! stops. No keyboard or mouse input is sent, simulated or injected anywhere in this crate and
-//! nothing enumerates windows; the trigger is an in-process call on the engine's media-time path,
-//! and it produces the hotkey's own log lines.
+//! this crate enumerates no windows (the capture backend does, only to find `[capture] window`
+//! when one is configured, and the self-test's log says which); the trigger is an in-process call
+//! on the engine's media-time path, and it produces the hotkey's own log lines.
+//!
+//! # Quitting
+//!
+//! Ctrl+C, Ctrl+Break, closing the console and SIGTERM stop the recorder and exit `0` (see
+//! [`shutdown`]): a clip in flight is finished and a full session is written out. Press Ctrl+C a
+//! second time to quit at once.
 
 // Test bodies may unwrap and may chunk by a constant; production code may do neither.
 // Scoped to the test build of this crate, so it cannot hide either in shipped code.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::chunks_exact_to_as_chunks))]
 
 pub mod config;
+pub mod shutdown;
 
 use anyhow::{bail, Context, Result};
 use config::Config;
@@ -56,6 +64,7 @@ use replayed_recorder::event_driver::{act_on_burst, start_event_sources, EventSo
 #[cfg(feature = "test-encoders")]
 use replayed_recorder::STUB_CAPTURE_SIZE;
 use replayed_recorder::{Recorder, RecorderConfig, RecorderOptions, RecordingMode, Sources};
+use shutdown::Shutdown;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -105,9 +114,12 @@ options:
         wall time and drift, then the written clip), and stop. The clip hotkey
         remains the shipping mechanism; this flag is an *additional* trigger.
 
-        It sends, simulates and injects no keyboard or mouse input, and it does
-        not enumerate windows. It exists so that a machine whose anti-cheat
-        treats synthetic input as hostile can still have its clip path verified.
+        It sends, simulates and injects no keyboard or mouse input, and enumerates
+        no windows itself: the capture backend looks windows up only when
+        `[capture] window` names one, and the run's log says whether that applies.
+        It exists so that a machine whose anti-cheat treats synthetic input as
+        hostile can still have its clip path verified. Interrupting it (Ctrl+C)
+        stops the recorder cleanly and exits with an error, since no clip was taken.
   --dev-software-encoder
         Only in builds carrying the `test-encoders` feature (never a release
         build): use libx264 instead of a GPU hardware encoder, for pipeline
@@ -268,23 +280,43 @@ pub fn describe_displays(displays: &[replayed_capture::DisplayInfo]) -> Vec<Stri
 }
 
 /// The `buffer` subcommand, as `main.rs` calls it: flags from the process's own arguments.
+///
+/// Installs the process's Ctrl+C / console-close / SIGTERM handling (see [`shutdown`]) before
+/// anything starts, so that a quit stops the recorder and the process exits `0`, instead of
+/// being killed with a clip half-written and a session never finalised.
 pub fn run_buffer() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(2).collect();
     let parsed = parse_buffer_args(&args)?;
-    run_buffer_with(BufferOptions {
-        app_dir: app_data_dir(),
-        self_test_clip_after: parsed.self_test_clip_after,
-        dev_software_encoder: parsed.dev_software_encoder,
-        mode: parsed.mode,
-        stub_sources: parsed.stub_sources,
-    })
+    let shutdown = Shutdown::new();
+    shutdown.install()?;
+    let result = run_buffer_with_shutdown(
+        BufferOptions {
+            app_dir: app_data_dir(),
+            self_test_clip_after: parsed.self_test_clip_after,
+            dev_software_encoder: parsed.dev_software_encoder,
+            mode: parsed.mode,
+            stub_sources: parsed.stub_sources,
+        },
+        &shutdown,
+    );
+    // Whatever the outcome, the recorder has stopped by now: release a console-close handler
+    // that is waiting for exactly that.
+    shutdown.mark_finished();
+    result
 }
 
 /// The `buffer` subcommand: capture, encode, segment ring, hotkey, clip.
 ///
 /// Split from [`run_buffer`] so an integration test can drive the whole command in-process with
-/// its own data directory; the self-test trigger must be reachable from a test.
+/// its own data directory; the self-test trigger must be reachable from a test. Nothing raises a
+/// shutdown here: use [`run_buffer_with_shutdown`] to be able to stop it.
 pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
+    run_buffer_with_shutdown(opts, &Shutdown::new())
+}
+
+/// [`run_buffer_with`], stoppable: once `shutdown` is requested the loop stops the recorder
+/// (finishing a clip already in flight, closing a session) and returns `Ok(())`.
+pub fn run_buffer_with_shutdown(opts: BufferOptions, shutdown: &Shutdown) -> Result<()> {
     let app_dir = opts.app_dir;
     let cfg_path = app_dir.join("config.toml");
     let cfg = if cfg_path.is_file() {
@@ -314,6 +346,9 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     // engine may have measured that this machine cannot hold the configured rate and be pacing
     // lower (see `RecorderStatus::effective_fps`).
     let (pre_seconds, post_seconds) = (buffer.pre_seconds, buffer.post_seconds);
+    // Read before `capture` moves into the recorder: whether the capture backend will look for a
+    // window by name, which the self-test says in its log rather than claiming it enumerates none.
+    let capture_window_set = capture.target().window.is_some();
     let policy = Policy::new(&events, pre_seconds)?;
     // `--mode` overrides the file, and the resolved value is what the CLI logs and what the
     // engine is told: decided once here, never re-derived below.
@@ -322,6 +357,17 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
 
     let bin = FfmpegBinaries::discover(None)?;
     let hotkey = replayed_events::hotkey::Hotkey::parse(&hotkeys.clip)?;
+    // The chord is claimed BEFORE the recorder starts, and that order is the point.
+    // `Recorder::start` runs crash recovery over the data directory, which closes, finalises or
+    // deletes any session row still open, and nothing tells it that the owner is alive. The usual
+    // reason the chord cannot be registered is that another replayed (the desktop app on the same
+    // `config.toml`, or a second CLI) is running and recording; a refusal that came *after* the
+    // start had already "recovered" that run's live session out from under it.
+    //
+    // `listen` fails loudly when the chord cannot be registered (held by another application, or
+    // the desktop app on the same `config.toml`); a buffer run with a silently dead hotkey is not
+    // worth starting.
+    let hotkeys = hotkey::listen(hotkey).context("installing the clip hotkey")?;
     // The event sources need the application data directory too (GSI token, generated cfg file),
     // and the recorder takes it by value below.
     let data_dir = app_dir.clone();
@@ -360,6 +406,10 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
             game: None,
         },
     )?;
+
+    // A press during startup (which can take seconds: encoder probe, capture open) was made before
+    // there was anything to clip; it must not turn into a clip the moment the loop starts.
+    while hotkeys.try_recv().is_ok() {}
 
     // From here the engine is capturing, or with `[games] auto_record` on, armed and waiting for a
     // game. This line is the CLI's own (the hotkey is what only it knows). The chord printed is the
@@ -413,13 +463,8 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         None => start_event_sources(&data_dir, &events),
     };
 
-    // The hotkey listener is installed in both modes: it is part of the shipping startup path, and
-    // self-test mode must not be a different program. Self-test just never reads it.
-    //
-    // `listen` fails loudly when the chord cannot be registered (held by another application, or
-    // the desktop app on the same `config.toml`); a buffer run with a silently dead hotkey is not
-    // worth starting.
-    let hotkeys = hotkey::listen(hotkey).context("installing the clip hotkey")?;
+    // The hotkey listener was installed above, in both modes: it is part of the shipping startup path,
+    // and self-test mode must not be a different program. Self-test just never reads it.
 
     // The verification-only trigger (`--self-test-clip-after`): an in-process call to the same
     // media-time trigger the hotkey drives, never synthesised input.
@@ -430,27 +475,31 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
                  does not exist yet — the self-test waits for a watched game to start"
             );
         }
-        return self_test_clip(&recorder, after_seconds, pre_seconds, post_seconds);
+        return self_test_clip(
+            &recorder,
+            after_seconds,
+            pre_seconds,
+            post_seconds,
+            capture_window_set,
+            shutdown,
+        );
     }
 
     // The driver loop. Every path out of it stops the recorder, which flushes the encoder, closes
-    // the capture session and (in session mode) writes the session file.
+    // the capture session and (in session mode) writes the session file: an error, the engine
+    // stopping on its own, and a requested shutdown (Ctrl+C, closing the console), which is the
+    // way a person actually quits and returns `Ok`.
     loop {
+        if shutdown.is_requested() {
+            tracing::info!(
+                "shutting down: stopping the recorder (press Ctrl+C again to quit at once)"
+            );
+            return recorder.stop().context("stopping the recorder on shutdown");
+        }
+
         if hotkey::wait_for_press(&hotkeys, HOTKEY_POLL) {
             if let Err(err) = recorder.clip_now() {
-                // A recorder armed for game detection has nothing to clip until a game starts: a state, not a
-                // failure.
-                if recorder.is_armed() && !recorder.is_running() {
-                    tracing::info!(
-                        "nothing is being recorded yet ({err:#}); the hotkey takes a clip \
-                         once a watched game starts"
-                    );
-                } else {
-                    // The engine logs what went wrong; stopping first flushes the encoder and closes the capture
-                    // session before the process gives up.
-                    let _ = recorder.stop();
-                    return Err(err.context("taking a clip"));
-                }
+                note_failure(&recorder, "the hotkey could not take a clip", &err);
             }
         } else {
             std::thread::sleep(HOTKEY_POLL);
@@ -461,14 +510,7 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
         // so a quiet game cannot make the hotkey wait.
         while let Ok(event) = sources.events.try_recv() {
             if let Err(err) = act_on_burst(&recorder, event, &sources.events, &policy) {
-                // No recording exists to clip or mark; a game event arriving then is not a reason to stop
-                // watching for a game.
-                if recorder.is_armed() && !recorder.is_running() {
-                    tracing::info!("the event is not recorded: {err:#}");
-                    continue;
-                }
-                let _ = recorder.stop();
-                return Err(err);
+                note_failure(&recorder, "the game event could not be acted on", &err);
             }
         }
 
@@ -481,6 +523,48 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
     }
 }
 
+/// What a failed clip or event means for the driver loop.
+#[derive(Debug, PartialEq, Eq)]
+enum FailureKind {
+    /// Armed for a game that has not started: there is no recording to clip or mark. A state,
+    /// not a failure.
+    NotRecordingYet,
+    /// A recording exists and one request against it failed.
+    Transient,
+    /// Neither recording nor armed: the engine has stopped, and the loop's own check is about to
+    /// say why.
+    EngineStopped,
+}
+
+fn classify_failure(running: bool, armed: bool) -> FailureKind {
+    match (running, armed) {
+        (false, true) => FailureKind::NotRecordingYet,
+        (false, false) => FailureKind::EngineStopped,
+        (true, _) => FailureKind::Transient,
+    }
+}
+
+/// Log a clip or event that failed, and carry on.
+///
+/// The loop used to stop the recorder and exit on any such error, which threw away the whole
+/// in-memory ring for one transient fault (a clip write error, a marker the index would not take,
+/// a splice that failed) while the player was in a game, with the console behind it: the next
+/// press did nothing, because the process was gone, and the user learnt of it after the match.
+/// The desktop shell's `EventDriver` warns and keeps recording for the same calls, and so does this.
+///
+/// It never decides the engine is finished: the loop's own check (`is_running` / `is_armed`) does
+/// that, and exits with the engine's reason when it really has stopped.
+fn note_failure(recorder: &Recorder, what: &str, err: &anyhow::Error) {
+    match classify_failure(recorder.is_running(), recorder.is_armed()) {
+        FailureKind::NotRecordingYet => tracing::info!(
+            "nothing is being recorded yet ({err:#}); a clip or event is taken once a watched \
+             game starts"
+        ),
+        FailureKind::Transient => tracing::warn!("{what}: {err:#}; still recording"),
+        FailureKind::EngineStopped => tracing::warn!("{what}: {err:#}"),
+    }
+}
+
 /// The verification-only self-test trigger: wait for a full window, take one clip, stop.
 ///
 /// * the wait is on the ring's media timeline (`span_ms`), the clock the trigger uses, and is
@@ -488,31 +572,48 @@ pub fn run_buffer_with(opts: BufferOptions) -> Result<()> {
 /// * the trigger is [`Recorder::clip_now`], the hotkey's own call, so the trigger line
 ///   (`hotkey pressed: media=... wall=... (drift ...ms)`) and the `wrote ...` line are exactly
 ///   the hotkey's;
-/// * nothing here sends, simulates or injects a keyboard or mouse event, or enumerates windows.
+/// * nothing here sends, simulates or injects a keyboard or mouse event. It does not enumerate
+///   windows itself; the capture backend does, but only when `[capture] window` names one
+///   (`capture_window_set`), and the log line says which.
 ///
 /// Afterwards the recorder is stopped and the process exits with the clip's own outcome, which
-/// makes the run scriptable.
+/// makes the run scriptable. A shutdown requested before the clip was taken stops the recorder
+/// cleanly and is an **error**: the diagnostic's job is to produce a clip, and a script reading
+/// the exit code must not take "interrupted" for "verified".
 fn self_test_clip(
     recorder: &Recorder,
     after_seconds: u64,
     pre_seconds: u64,
     post_seconds: u64,
+    capture_window_set: bool,
+    shutdown: &Shutdown,
 ) -> Result<()> {
     let need_ms = self_test_need_ms(after_seconds, pre_seconds, post_seconds);
     tracing::info!(
         "self-test: one clip will be taken once the ring holds {need_ms}ms of media \
          (--self-test-clip-after {after_seconds}s, at least {pre_seconds}s pre + \
-         {post_seconds}s post); no keyboard or mouse input is sent, simulated or injected, \
-         and no window is enumerated"
+         {post_seconds}s post); no keyboard or mouse input is sent, simulated or injected{}",
+        if capture_window_set {
+            ", and the only windows enumerated are by the capture backend, to find the \
+             [capture] window you configured"
+        } else {
+            ", and no window is enumerated ([capture] window is not set)"
+        }
     );
 
     loop {
+        if shutdown.is_requested() {
+            recorder
+                .stop()
+                .context("stopping the recorder on shutdown")?;
+            bail!("the self-test was interrupted before it took its clip");
+        }
         let span_ms = recorder.status().span_ms;
         if span_ms >= need_ms {
             tracing::info!("self-test: the ring holds {span_ms}ms of media; taking the clip");
             break;
         }
-        if !recorder.is_running() {
+        if self_test_engine_gone(recorder.is_running(), recorder.is_armed()) {
             // The engine stopped on its own and kept the reason in its status.
             recorder.stop()?;
             bail!("the recorder stopped while the self-test was waiting for {need_ms}ms of media");
@@ -527,6 +628,16 @@ fn self_test_clip(
     // Flush the encoder and close the capture session before exiting, so the exit code comes from
     // the engine's own shutdown and not from a drop().
     recorder.stop()
+}
+
+/// Whether the self-test's wait is over because the engine has stopped for good.
+///
+/// With `[games] auto_record` on the recorder is *armed* and not running until a watched game
+/// starts, and the self-test logs that it waits for one; treating "not running" as "stopped" bailed
+/// on the first iteration with a message that misdescribed the state. The driver loop makes the
+/// same distinction.
+fn self_test_engine_gone(running: bool, armed: bool) -> bool {
+    !running && !armed
 }
 
 fn app_data_dir() -> PathBuf {
@@ -591,7 +702,10 @@ fn migrate_legacy_data_dir(base: &Path, dir: &Path) {
     };
     let mut moved: Vec<String> = Vec::new();
     let mut left: Vec<String> = Vec::new();
-    for entry in entries.flatten() {
+    // The entries that make the new directory "used" go last (see `migration_order`).
+    let mut entries: Vec<_> = entries.flatten().collect();
+    entries.sort_by_key(|entry| migration_order(&entry.file_name()));
+    for entry in entries {
         let name = entry.file_name();
         let target_name: OsString = if name.as_os_str() == OsStr::new(LEGACY_INDEX) {
             OsString::from(INDEX)
@@ -635,6 +749,23 @@ fn migrate_legacy_data_dir(base: &Path, dir: &Path) {
             legacy.display(),
             left.join(", ")
         );
+    }
+}
+
+/// The position of a legacy entry in the order the migration moves them: the entries whose
+/// presence in the new directory means "this build has been used" move **last**.
+///
+/// The guard at the top of [`migrate_legacy_data_dir`] returns early once the new directory holds
+/// an index or a `config.toml`. The old directory is read in whatever order the filesystem lists
+/// it, so the index could move first, then `clips` fail to move (a handle open inside it, a virus
+/// scan), and the next start would see the new index, return early and never retry: the
+/// doc comment's "the next start tries again" held only for failures before the first of those two
+/// moved. Moving them last keeps the guard false until everything else has moved.
+fn migration_order(name: &std::ffi::OsStr) -> u8 {
+    if name == "localplay.db" || name == "config.toml" {
+        1
+    } else {
+        0
     }
 }
 
@@ -776,6 +907,43 @@ mod tests {
     }
 
     #[test]
+    fn the_entries_that_mark_the_new_directory_as_used_move_last() {
+        // `config.toml` and the index make the early-return guard fire on the next start, so a move
+        // that fails after they have moved is never retried. Whatever order the filesystem lists
+        // them in, they must come after every other entry.
+        let mut names: Vec<std::ffi::OsString> =
+            ["localplay.db", "clips", "config.toml", "sessions"]
+                .iter()
+                .map(Into::into)
+                .collect();
+        names.sort_by_key(|name| migration_order(name));
+        let last_two: Vec<_> = names[2..].iter().map(|n| n.to_string_lossy()).collect();
+        assert!(last_two.contains(&"localplay.db".into()), "{names:?}");
+        assert!(last_two.contains(&"config.toml".into()), "{names:?}");
+        assert!(names[..2].iter().all(|n| n == "clips" || n == "sessions"));
+    }
+
+    #[test]
+    fn a_failed_clip_or_event_does_not_end_the_run_unless_the_engine_has_stopped() {
+        // Armed and waiting for a game: no recording to clip, a state.
+        assert_eq!(classify_failure(false, true), FailureKind::NotRecordingYet);
+        // Recording: one request failed, and the ring is worth more than one failed clip.
+        assert_eq!(classify_failure(true, false), FailureKind::Transient);
+        assert_eq!(classify_failure(true, true), FailureKind::Transient);
+        // Neither: the engine has stopped, which the loop's own check turns into the exit.
+        assert_eq!(classify_failure(false, false), FailureKind::EngineStopped);
+    }
+
+    #[test]
+    fn the_self_test_keeps_waiting_while_the_recorder_is_armed_for_a_game() {
+        // `games.auto_record`: armed, not running. The self-test logs that it waits for a watched
+        // game, so it must; it used to bail on the first iteration.
+        assert!(!self_test_engine_gone(false, true));
+        assert!(!self_test_engine_gone(true, false));
+        assert!(self_test_engine_gone(false, false));
+    }
+
+    #[test]
     fn the_buffer_flags_default_to_the_shipping_behaviour() {
         // No flags: the hotkey path is unchanged, the self-test is not armed, the mode comes from the
         // file and the real sources are used. The case a user runs.
@@ -900,7 +1068,13 @@ mod tests {
         let help = help();
         assert!(help.contains("--self-test-clip-after"));
         assert!(help.contains("no keyboard or mouse input"));
-        assert!(help.contains("not enumerate windows"));
+        assert!(
+            help.split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("enumerates no windows itself"),
+            "the help says what the flag does not do, and does not claim more than is true"
+        );
         // And the mode flags are documented where a user looks for them.
         assert!(help.contains("--mode <buffer|session>"));
         assert!(help.contains("--dev-stub-sources"));

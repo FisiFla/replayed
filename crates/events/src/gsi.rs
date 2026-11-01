@@ -1,9 +1,15 @@
 //! CS2 / Dota 2: Valve Game State Integration.
 //!
 //! A listener on `127.0.0.1` that consumes the JSON the game POSTs, derives events and hands
-//! them to a driver. The user installs the generated `gamestate_integration_replayed.cfg`
-//! into the game's `cfg` directory; the application never writes there ([`integration`]
-//! produces the text only).
+//! them to a driver. The generated `gamestate_integration_replayed.cfg` has to be in the
+//! game's `cfg` directory for the game to post at all. **This crate never writes there**
+//! ([`integration`] produces the text only, and nothing in this crate opens a file in a game
+//! folder); the desktop shell's "install" action does, at the user's request, and so the
+//! file (and the token in it) stays in the Steam library after replayed is uninstalled until
+//! the user deletes it. A game still configured to post to a port nobody serves is harmless;
+//! a different process that later binds that port would receive the game state and the token.
+//! The token is per-install and the port is chosen per session (see below), which is what
+//! limits that exposure.
 //!
 //! Three constraints:
 //!
@@ -28,19 +34,20 @@
 //!
 //! # The accept loop never blocks on a connection
 //!
-//! A peer that opens a connection and then says nothing holds a reader for the whole
-//! request deadline. The loop used to serve one connection at a time, so a handful of such
-//! connections kept the game's own POSTs from being accepted at all: the recorder kept
-//! running and the feature it exists for was silent, which is a denial of service that looks
-//! exactly like a game that is not playing. The loop now accepts and hands the connection to
-//! one of [`WORKERS`] readers, and the queue in front of them ([`MAX_QUEUED`]) is the
-//! in-flight bound: past it, the connection is answered `429` unread.
+//! A peer that opens a connection and then says nothing must not keep the game's own POSTs
+//! from being served: the recorder would keep running and the feature it exists for would be
+//! silent, a denial of service that looks exactly like a game that is not playing. The
+//! listener therefore collects each connection's request itself, without blocking, and gives
+//! a reader ([`WORKERS`] of them) only a request that is already whole; the game's requests,
+//! recognised by the token they carry, wait in a lane of their own and are not charged to the
+//! budget for anonymous traffic. The design, and what it does and does not defend against, is
+//! written out on `serve`.
 //!
-//! The readers fold the payloads into the tracker in the order the connections were
-//! accepted. A payload that arrives after a later one is dropped rather than folded in: the
-//! baseline would move backwards, and the next delta would be reported as a jump. That
-//! needs two of the game's own POSTs to be in flight at once, which the game does not do —
-//! it waits for the answer — so it is a corner rather than a habit.
+//! The readers fold the payloads into the tracker in the order the requests were completed. A
+//! payload that arrives after a later one is dropped rather than folded in: the baseline would
+//! move backwards, and the next delta would be reported as a jump. That needs two of the game's
+//! own POSTs to be in flight at once, which the game does not do (it waits for the answer), so
+//! it is a corner rather than a habit.
 //!
 //! # What the token does not protect against
 //!
@@ -83,65 +90,81 @@ pub mod payload;
 
 pub use derive::{Game, Tracker};
 pub use integration::{
-    game_path, generate_token, integration_cfg, integration_cfg_dota, load_or_create_token,
-    CS2_APP_ID, DEFAULT_PATH, DOTA2_APP_ID, TOKEN_BYTES,
+    cs2_cfg_is_current, game_path, generate_token, integration_cfg, integration_cfg_dota,
+    load_or_create_token, CS2_APP_ID, DEFAULT_PATH, DOTA2_APP_ID, TOKEN_BYTES,
 };
 pub use payload::{AuthToken, GsiSnapshot};
 
 use crate::wire::write_response;
 use crate::{EventSink, GameEvent};
 use anyhow::{bail, Context, Result};
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{ErrorKind, Read};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, TrySendError};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
 
-/// How long one request may take to arrive and be read. A game POSTs a small body to loopback,
-/// so 2 s is generous and bounds a stalled connection.
+/// How long one request may take to arrive in full. A game POSTs a small body to loopback and
+/// the whole request is on the wire within milliseconds, so 2 s is generous. A connection still
+/// incomplete after this is answered `400` (or `413` if its head arrived and its body did not)
+/// and closed. It costs the listener nothing but a slot in [`MAX_PENDING`] while it waits: no
+/// reader is ever held by it (see "The accept loop never blocks on a connection").
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// The most connections served in one [`RATE_WINDOW`]. A game POSTs a handful of times a
-/// second (CS2 throttles to 0.1 s at busiest); anything past this is not the game and is
-/// answered `429` unread, so a local process hammering the port cannot keep the
-/// single-threaded accept loop busy or flood the log.
+/// The most requests *that do not carry the game's token* served in one [`RATE_WINDOW`]. A
+/// peer without the token is not the game; past this its requests are answered `429` unread.
+///
+/// Requests that carry the token for their path are not counted: the budget exists to bound
+/// what an anonymous local process or web page can make the recorder spend, and charging the
+/// game's own POSTs to it let that process spend the game's share. See "Starving the game".
 pub const MAX_REQUESTS_PER_WINDOW: u32 = 100;
 
 /// The length of the fixed window [`MAX_REQUESTS_PER_WINDOW`] is counted in.
 pub const RATE_WINDOW: Duration = Duration::from_secs(1);
 
-/// The most wall-clock time one request may take in total. [`REQUEST_TIMEOUT`] bounds each
-/// read, which a peer trickling one byte at a time resets forever; this bounds the sum.
-///
-/// Two seconds, not five: the game answers in milliseconds over loopback, and this is also
-/// the longest a trickling peer can hold one of the [`WORKERS`] readers, which is a reader the
-/// game's own POST then has to wait for.
-pub const REQUEST_DEADLINE: Duration = Duration::from_secs(2);
+/// The most wall-clock time one request may take to arrive in total: the same bound as
+/// [`REQUEST_TIMEOUT`], kept as its own name because a trickling peer resets any per-read timeout
+/// forever and only a total deadline stops it.
+pub const REQUEST_DEADLINE: Duration = REQUEST_TIMEOUT;
 
-/// How many connections are read and answered at once.
-///
-/// The accept loop must never block on a connection. A peer that trickles one byte at a time
-/// would otherwise hold the loop for the whole request deadline — a hundred such
-/// connections, and the game's own POSTs are not accepted for minutes — and the recorder
-/// would keep running, silently, while the feature it exists for is dead. Four readers is
-/// plenty for one client posting a handful of times a second, and few enough that a flood
-/// of connections cannot become a flood of threads.
+/// How many connections are answered at once. Readers only ever see a request that is already
+/// whole in memory, so a reader's work is a parse and a lock, not a wait on a peer; four is
+/// plenty for one client posting a handful of times a second.
 pub const WORKERS: usize = 4;
 
-/// How many accepted connections may wait for a reader.
+/// How many whole requests may wait for a reader, per lane (the game's, and everyone else's).
 ///
-/// This is the in-flight bound: a reader plus a queue of this many is the most the listener
-/// will hold at once, and the next connection is answered `429` unread. Without it, a
-/// process opening sockets as fast as it can would make the recorder hold thousands of
-/// them.
+/// This is the in-flight bound on work, not on connections: a full lane answers the next request
+/// `429`. Without it, a process sending complete requests as fast as it can would make the
+/// recorder queue thousands of them.
 pub const MAX_QUEUED: usize = 4;
 
-/// How often the accept loop checks its stop flag: a sleep, not a spin.
+/// How many connections still sending their request the listener holds at once.
+///
+/// Connections that have not finished their request wait here, in the listener's own thread,
+/// with no reader attached. When it is full, the next connection takes the place of the most
+/// idle one (see `evict`), so a peer that opens sockets and says nothing can fill this but
+/// cannot keep the game's connection out of it. Bounded because each can hold up to a request's
+/// worth of bytes.
+pub const MAX_PENDING: usize = 16;
+
+/// How often the accept loop checks its stop flag while nothing is connected: a sleep, not a
+/// spin.
 const ACCEPT_SLICE: Duration = Duration::from_millis(25);
+
+/// How often the intake looks again while at least one connection is still sending.
+const INTAKE_SLICE: Duration = Duration::from_millis(2);
+
+/// The most connections taken from the listener in one pass, so a flood cannot keep the loop
+/// from looking at the connections it already holds.
+const ACCEPTS_PER_PASS: usize = 64;
+
+/// The most bytes taken from one connection in one pass, for the same reason.
+const READ_PER_PASS: usize = 64 * 1024;
 
 /// A fixed-window request counter: [`MAX_REQUESTS_PER_WINDOW`] per [`RATE_WINDOW`].
 #[derive(Debug)]
@@ -158,7 +181,7 @@ impl RateLimiter {
         }
     }
 
-    /// Whether a connection arriving at `now` may be served.
+    /// Whether a request arriving at `now` may be served.
     fn allow(&mut self, now: Instant) -> bool {
         if now.saturating_duration_since(self.window_start) >= RATE_WINDOW {
             self.window_start = now;
@@ -169,25 +192,6 @@ impl RateLimiter {
         }
         self.count += 1;
         true
-    }
-}
-
-/// A reader that fails once [`REQUEST_DEADLINE`] has passed in total, re-arming the socket's
-/// read timeout with the time left before every read.
-struct DeadlineReader<'a> {
-    stream: &'a mut TcpStream,
-    deadline: Instant,
-}
-
-impl std::io::Read for DeadlineReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(ErrorKind::TimedOut.into());
-        }
-        self.stream
-            .set_read_timeout(Some(left.min(REQUEST_TIMEOUT)))?;
-        self.stream.read(buf)
     }
 }
 
@@ -515,12 +519,104 @@ pub fn spawn(config: GsiConfig, sink: EventSink) -> Result<GsiListener> {
     })
 }
 
-/// One accepted connection, and the order it was accepted in.
+/// One whole request, handed to a reader.
 struct Job {
     stream: TcpStream,
-    /// The accept order. The tracker is folded in this order, so a payload that arrives
-    /// after a later one is dropped rather than moving the baseline backwards.
+    /// Every byte the connection sent up to the end of its request (`frame` said it was complete),
+    /// so reading it touches no socket.
+    request: Vec<u8>,
+    /// The order the requests were completed in. The tracker is folded in this order, so a
+    /// payload that arrives after a later one is dropped rather than moving the baseline
+    /// backwards.
     seq: u64,
+}
+
+/// Which queue a request waits in. This decides only the order of service and which budget the
+/// request is charged to; whether it is believed is decided by the token gate in `serve_one`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lane {
+    /// Carries the token for the path it posted to: very likely the game.
+    Trusted,
+    /// Anything else.
+    Anonymous,
+}
+
+#[derive(Default)]
+struct QueueState {
+    trusted: VecDeque<Job>,
+    anonymous: VecDeque<Job>,
+    closed: bool,
+}
+
+/// Two bounded queues in front of the readers. The readers take the game's lane first, and the
+/// bound on each lane is its own, so an anonymous peer filling its lane leaves the game's
+/// untouched.
+struct Queue {
+    state: Mutex<QueueState>,
+    ready: Condvar,
+}
+
+impl Queue {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(QueueState::default()),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Queue `job`, or hand it back when its lane is full or the queue is closed.
+    fn push(&self, lane: Lane, job: Job) -> Result<(), Job> {
+        let mut state = lock(&self.state);
+        if state.closed {
+            return Err(job);
+        }
+        let queue = match lane {
+            Lane::Trusted => &mut state.trusted,
+            Lane::Anonymous => &mut state.anonymous,
+        };
+        if queue.len() >= MAX_QUEUED {
+            return Err(job);
+        }
+        queue.push_back(job);
+        drop(state);
+        self.ready.notify_one();
+        Ok(())
+    }
+
+    /// The next job, the game's lane first; `None` once the queue is closed and empty.
+    fn pop(&self) -> Option<Job> {
+        let mut state = lock(&self.state);
+        loop {
+            if let Some(job) = state.trusted.pop_front() {
+                return Some(job);
+            }
+            if let Some(job) = state.anonymous.pop_front() {
+                return Some(job);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self
+                .ready
+                .wait(state)
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        }
+    }
+
+    fn close(&self) {
+        lock(&self.state).closed = true;
+        self.ready.notify_all();
+    }
+}
+
+/// A connection whose request is still arriving. It is held by the listener's own thread and read
+/// without blocking: no reader waits on it.
+struct Pending {
+    stream: TcpStream,
+    buf: Vec<u8>,
+    arrived: Instant,
+    /// The peer has closed its side. What it sent is all there will be.
+    eof: bool,
 }
 
 /// What the listener keeps between connections.
@@ -530,7 +626,7 @@ struct State {
     tracker: Tracker,
     /// How many requests of each kind the listener has seen.
     counters: Counters,
-    /// The accept order of the last payload folded into the tracker.
+    /// The completion order of the last payload folded into the tracker.
     last_seq: u64,
 }
 
@@ -544,27 +640,63 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// The accept loop and its readers.
+/// The accept loop, the intake and the readers.
 ///
-/// The loop accepts and hands the connection to a reader; it never reads a request itself,
-/// so a peer that trickles one byte at a time cannot keep the game's POSTs from being
-/// accepted. The readers are [`WORKERS`] threads over a queue of [`MAX_QUEUED`], and the
-/// queue's being full is the in-flight bound: the next connection is answered `429` unread.
+/// # Starving the game
+///
+/// Everything the game's POST has to get through is reachable by any process on the machine, and
+/// by any web page in the user's browser (`POST` with `text/plain` is a CORS simple request: no
+/// preflight, and `mode: 'no-cors'` hides the failure from the page). An earlier version spent
+/// its readers on whoever connected first. Eight sockets that connected and said nothing held
+/// all four readers and the whole queue for two seconds, and more than a hundred connections a
+/// second used up a global counter charged before anything was read; either way the game was
+/// answered `429` and nothing in the UI said why. The recorder kept running, and the feature it
+/// exists for looked exactly like a game that is not playing.
+///
+/// The shape now is:
+///
+/// 1. **No reader waits on a peer.** This thread accepts and collects each connection's bytes
+///    without blocking ([`Pending`]). A connection is handed to a reader only once
+///    [`http::frame`] says its request is whole, so a reader's work is a parse out of memory.
+///    Sockets that send nothing, or send a head and stall, cost a slot in [`MAX_PENDING`] and
+///    nothing else; at [`REQUEST_TIMEOUT`] they are answered and closed.
+/// 2. **The pending set cannot be filled.** When it is full a new connection takes the place of
+///    the most idle one (`evict`); the connection that has already sent bytes is never the
+///    victim while an idle one exists. The game's request is normally in the socket before
+///    `accept` returns, and it is read in the same pass.
+/// 3. **The budget is charged by outcome, not by arrival.** A whole request is classified
+///    ([`lane_of`]): one that carries the token for its path goes in the game's lane, which has
+///    its own bound and is served first, and is not counted by the limiter. Everything else is
+///    charged to [`MAX_REQUESTS_PER_WINDOW`] and waits in the anonymous lane. A peer without
+///    the token can use up its own budget and its own lane; it cannot reach the game's.
+/// 4. **Requests a web page made are refused outright.** Every fetch a browser makes carries
+///    `Sec-Fetch-*` headers, which a script cannot set or remove and which no game sends
+///    ([`http::Framing::Browser`]). They are answered `403` as soon as the head is in,
+///    token or not, and take no budget. A browser too old to send them falls under 3.
+///
+/// What this does not change: the token is still checked in constant time, in full, by the
+/// reader, before the body is parsed. Lane selection looks for the token as the value of a
+/// `"token"` key at either end of the body ([`payload::carries_token`]); it decides only which
+/// queue a request waits in, so fooling it without the token buys nothing, and a peer that has
+/// the token can already forge events (see "What the token does not protect against"). What
+/// it cannot defend against is a local process with enough CPU to starve the machine, which no
+/// listener can: that is a denial of service against the whole PC, not against this feature.
+///
+/// The readers fold the payloads into the tracker in the order the requests were completed.
 fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Arc<AtomicBool>) {
-    let (jobs, queue) = sync_channel::<Job>(MAX_QUEUED);
-    let queue = Arc::new(Mutex::new(queue));
+    let queue = Arc::new(Queue::new());
     let state = Arc::new(Mutex::new(State::default()));
 
     let mut readers = Vec::with_capacity(WORKERS);
     for n in 0..WORKERS {
-        let queue = Arc::clone(&queue);
+        let worker_queue = Arc::clone(&queue);
         let state = Arc::clone(&state);
         let config = config.clone();
         let sink = sink.clone();
         let flag = Arc::clone(stop);
         let reader = std::thread::Builder::new()
             .name(format!("replayed-gsi-{n}"))
-            .spawn(move || read_loop(&queue, &config, &sink, &state, &flag))
+            .spawn(move || read_loop(&worker_queue, &config, &sink, &state, &flag))
             .with_context(|| format!("spawning the GSI reader thread {n}"));
         match reader {
             Ok(handle) => readers.push(handle),
@@ -572,7 +704,7 @@ fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Arc
                 // Without a reader there is nothing to answer with, so the listener stops
                 // rather than accepting connections it cannot serve.
                 tracing::warn!("the GSI listener could not start a reader: {err:#}");
-                drop(jobs);
+                queue.close();
                 return;
             }
         }
@@ -580,65 +712,187 @@ fn serve(listener: TcpListener, config: &GsiConfig, sink: &EventSink, stop: &Arc
 
     let mut limiter = RateLimiter::new(Instant::now());
     let mut seq: u64 = 0;
+    let mut pending: Vec<Pending> = Vec::new();
     while !stop.load(Ordering::SeqCst) {
-        match listener.accept() {
-            Ok((stream, _peer)) => {
-                // `_peer` is not logged: on a loopback bind it is `127.0.0.1` by definition.
-                if !limiter.allow(Instant::now()) {
-                    let mut stream = stream;
-                    lock(&state).counters.rate_limited();
-                    turn_away(&mut stream);
-                    continue;
+        let mut accepted_any = false;
+        for _ in 0..ACCEPTS_PER_PASS {
+            match listener.accept() {
+                Ok((stream, _peer)) => {
+                    // `_peer` is not logged: on a loopback bind it is `127.0.0.1` by definition.
+                    accepted_any = true;
+                    // The accepted socket may inherit the listener's non-blocking flag (macOS, *BSD) or
+                    // not (Linux, Windows). It must be non-blocking whichever: the intake never waits.
+                    if stream.set_nonblocking(true).is_err() {
+                        continue;
+                    }
+                    let _ = stream.set_nodelay(true);
+                    if pending.len() >= MAX_PENDING {
+                        if let Some(victim) = evict(&mut pending) {
+                            lock(&state).counters.busy();
+                            turn_away(victim.stream);
+                        }
+                    }
+                    pending.push(Pending {
+                        stream,
+                        buf: Vec::new(),
+                        arrived: Instant::now(),
+                        eof: false,
+                    });
                 }
-                seq += 1;
-                let job = Job { stream, seq };
-                match jobs.try_send(job) {
-                    Ok(()) => {}
-                    Err(TrySendError::Full(job)) | Err(TrySendError::Disconnected(job)) => {
-                        // The readers are all busy and the queue is full: the connection is
-                        // refused unread rather than held.
-                        let mut stream = job.stream;
-                        lock(&state).counters.busy();
-                        turn_away(&mut stream);
+                Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                Err(err) if err.kind() == ErrorKind::Interrupted => {}
+                Err(err) => {
+                    tracing::warn!("the GSI listener could not accept a connection: {err}");
+                    std::thread::sleep(ACCEPT_SLICE);
+                    break;
+                }
+            }
+        }
+
+        let now = Instant::now();
+        let mut i = 0;
+        while i < pending.len() {
+            match intake_step(&mut pending[i], now, config) {
+                Step::Wait => i += 1,
+                step => {
+                    let Pending { stream, buf, .. } = pending.swap_remove(i);
+                    match step {
+                        Step::Wait => {}
+                        Step::Gone => {}
+                        Step::Refuse(reject) => {
+                            lock(&state).counters.refused(reject);
+                            refuse(stream, reject.status());
+                        }
+                        Step::Dispatch(lane) => {
+                            if lane == Lane::Anonymous && !limiter.allow(now) {
+                                lock(&state).counters.rate_limited();
+                                turn_away(stream);
+                                continue;
+                            }
+                            seq += 1;
+                            let job = Job {
+                                stream,
+                                request: buf,
+                                seq,
+                            };
+                            if let Err(job) = queue.push(lane, job) {
+                                // The lane is full: refused whole rather than held.
+                                lock(&state).counters.busy();
+                                turn_away(job.stream);
+                            }
+                        }
                     }
                 }
             }
-            Err(err) if err.kind() == ErrorKind::WouldBlock => std::thread::sleep(ACCEPT_SLICE),
-            Err(err) if err.kind() == ErrorKind::Interrupted => {}
-            Err(err) => {
-                tracing::warn!("the GSI listener could not accept a connection: {err}");
-                std::thread::sleep(ACCEPT_SLICE);
-            }
+        }
+
+        if !accepted_any {
+            std::thread::sleep(if pending.is_empty() {
+                ACCEPT_SLICE
+            } else {
+                INTAKE_SLICE
+            });
         }
     }
 
-    // The readers wait on the queue, and the queue ends when the sender is dropped.
-    drop(jobs);
+    // The readers wait on the queue, and the queue ends when it is closed. Connections still
+    // arriving are dropped.
+    drop(pending);
+    queue.close();
     for reader in readers {
         let _ = reader.join();
     }
     tracing::debug!("the GSI listener stopped");
 }
 
-/// One reader: take a connection, answer it, take the next.
+/// What the intake decided about one connection in one pass.
+enum Step {
+    /// Still arriving: look again next pass.
+    Wait,
+    /// The peer left before it finished; there is nobody to answer.
+    Gone,
+    /// Answer with this refusal and close.
+    Refuse(http::Reject),
+    /// A whole request: queue it in this lane.
+    Dispatch(Lane),
+}
+
+/// Take what a connection has sent so far and decide what to do with it. Never blocks.
+fn intake_step(pending: &mut Pending, now: Instant, config: &GsiConfig) -> Step {
+    let mut chunk = [0u8; 8 * 1024];
+    let mut taken = 0;
+    while taken < READ_PER_PASS && !pending.eof {
+        match pending.stream.read(&mut chunk) {
+            Ok(0) => pending.eof = true,
+            Ok(n) => {
+                pending.buf.extend_from_slice(&chunk[..n]);
+                taken += n;
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+            Err(err) if err.kind() == ErrorKind::Interrupted => {}
+            Err(_) => return Step::Gone,
+        }
+    }
+    match http::frame(&pending.buf) {
+        http::Framing::Invalid => Step::Refuse(http::Reject::Malformed),
+        http::Framing::Browser => Step::Refuse(http::Reject::FromBrowser),
+        http::Framing::Complete { body } => Step::Dispatch(lane_of(config, &pending.buf, body)),
+        http::Framing::Incomplete { head_done } => {
+            if pending.eof || now.saturating_duration_since(pending.arrived) >= REQUEST_DEADLINE {
+                // A truncated head is not HTTP; a head with less body than it claimed is a body "shorter
+                // than it claims", as the framing has always answered it.
+                Step::Refuse(if head_done {
+                    http::Reject::TooLarge
+                } else {
+                    http::Reject::Malformed
+                })
+            } else {
+                Step::Wait
+            }
+        }
+    }
+}
+
+/// Which lane a whole request waits in: [`Lane::Trusted`] when it is a POST to a path this listener
+/// serves and its body carries that path's token, else [`Lane::Anonymous`].
+fn lane_of(config: &GsiConfig, request: &[u8], body: std::ops::Range<usize>) -> Lane {
+    let trusted = route_of(request)
+        .and_then(|target| {
+            let path = target.split('?').next().unwrap_or_default();
+            config
+                .game(path)
+                .map(|game| payload::carries_token(&request[body], &game.token))
+        })
+        .unwrap_or(false);
+    if trusted {
+        Lane::Trusted
+    } else {
+        Lane::Anonymous
+    }
+}
+
+/// The connection to give up when the pending set is full and another has arrived: the oldest of
+/// those that have sent nothing, else the oldest. A connection that has sent bytes is never
+/// preferred over one that has not, so the game's request (already in the socket) outlives any
+/// number of idle ones.
+fn evict(pending: &mut Vec<Pending>) -> Option<Pending> {
+    let victim = pending
+        .iter()
+        .enumerate()
+        .min_by_key(|(_, p)| (!p.buf.is_empty(), p.arrived))
+        .map(|(index, _)| index)?;
+    Some(pending.swap_remove(victim))
+}
+
+/// One reader: take a whole request, answer it, take the next.
 fn read_loop(
-    queue: &Arc<Mutex<Receiver<Job>>>,
+    queue: &Arc<Queue>,
     config: &GsiConfig,
     sink: &EventSink,
     state: &Arc<Mutex<State>>,
     stop: &Arc<AtomicBool>,
 ) {
-    loop {
-        let job = {
-            // The lock is held across the wait, which serialises the hand-out and not the
-            // work: a reader that has a connection is not holding it.
-            let queue = lock(queue);
-            match queue.recv() {
-                Ok(job) => job,
-                // The listener is shutting down.
-                Err(_) => break,
-            }
-        };
+    while let Some(job) = queue.pop() {
         if stop.load(Ordering::SeqCst) {
             break;
         }
@@ -646,16 +900,12 @@ fn read_loop(
     }
 }
 
-/// Answer `429` without reading the request, then swallow a bounded amount of what the peer
-/// already sent: closing a socket holding unread data resets the connection, and the reset can
-/// destroy the response before the peer reads it.
-fn turn_away(stream: &mut TcpStream) {
-    use std::io::Read;
-    let _ = stream.set_nonblocking(false);
-    let _ = stream.set_write_timeout(Some(Duration::from_millis(200)));
-    let _ = write_response(stream, 429);
+/// Answer without reading the request, then give the socket up cleanly: closing a socket holding
+/// unread data resets the connection, and the reset can destroy the response before the peer
+/// reads it. The socket is non-blocking (the intake's), so none of this can wait on the peer.
+fn refuse(mut stream: TcpStream, status: u16) {
+    let _ = write_response(&mut stream, status);
     let _ = stream.shutdown(std::net::Shutdown::Write);
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
     let mut sink = [0u8; 4096];
     for _ in 0..4 {
         if !matches!(stream.read(&mut sink), Ok(n) if n == sink.len()) {
@@ -664,44 +914,17 @@ fn turn_away(stream: &mut TcpStream) {
     }
 }
 
-/// How much is taken from the socket at a time while the route is read.
-///
-/// The same size the HTTP framing takes ([`crate::wire`]). A request that is refused before
-/// its body is read leaves the rest of the body in the socket, and the client sees a reset
-/// instead of the answer; taking the same amount here keeps the socket in the state the
-/// framing would have left it in.
-const ROUTE_CHUNK: usize = 4 * 1024;
+/// `429`, for a request the listener will not take.
+fn turn_away(stream: TcpStream) {
+    refuse(stream, 429);
+}
 
-/// The request's target, and the bytes read to find it.
-///
-/// The route has to be known before the body is read: the path decides which game's token
-/// the body is checked against. The target is in the request's first line, so the first
-/// line is read here and the bytes taken are replayed to the reader that frames the rest
-/// of the request.
-fn peek_target(stream: &mut impl Read) -> Result<(String, Vec<u8>), http::Reject> {
-    let mut prefix = Vec::new();
-    let mut chunk = [0u8; ROUTE_CHUNK];
-    loop {
-        let read = stream
-            .read(&mut chunk)
-            .map_err(|_| http::Reject::Malformed)?;
-        if read == 0 {
-            // The peer closed before the first line was complete.
-            return Err(http::Reject::Malformed);
-        }
-        prefix.extend_from_slice(&chunk[..read]);
-        if let Some(end) = prefix.iter().position(|byte| *byte == b'\n') {
-            let line = String::from_utf8_lossy(&prefix[..end]);
-            let line = line.trim_end_matches('\r');
-            return match request_target(line) {
-                Some(target) => Ok((target, prefix)),
-                None => Err(http::Reject::Malformed),
-            };
-        }
-        if prefix.len() > crate::wire::MAX_HEAD_BYTES {
-            return Err(http::Reject::Malformed);
-        }
-    }
+/// The request's target, from the first line of `request`, or `None` when that is not a request
+/// line.
+fn route_of(request: &[u8]) -> Option<String> {
+    let end = request.iter().position(|byte| *byte == b'\n')?;
+    let line = String::from_utf8_lossy(&request[..end]);
+    request_target(line.trim_end_matches('\r'))
 }
 
 /// The target of a request line, or `None` when the line is not one.
@@ -719,7 +942,7 @@ fn request_target(line: &str) -> Option<String> {
     Some(target.to_string())
 }
 
-/// Serve one connection.
+/// Serve one whole request.
 ///
 /// The order of the gates is the point of this function: the route is resolved, the request
 /// is framed, the token is looked for in the raw body, and only a body that carries the
@@ -727,6 +950,8 @@ fn request_target(line: &str) -> Option<String> {
 /// in the user's browser can `POST` here with a `text/plain` content type, which is a CORS
 /// "simple request" and is not preflighted — therefore cannot make the recorder parse
 /// megabytes.
+///
+/// The request is already in memory ([`Job::request`]), so nothing here waits on the peer.
 fn serve_one(
     job: Job,
     config: &GsiConfig,
@@ -734,30 +959,21 @@ fn serve_one(
     state: &Arc<Mutex<State>>,
     stop: &Arc<AtomicBool>,
 ) {
-    let Job { mut stream, seq } = job;
-    // `accept` inherits the listener's non-blocking flag on macOS/*BSD (not Linux or Windows), and
-    // a non-blocking socket ignores the read/write timeouts set below: every read with no buffered
-    // data fails with `WouldBlock`, which `http` reads as a malformed request (400) instead of the
-    // 403/200 the client should see. Put the accepted socket back into blocking mode first so the
-    // timeouts are the connection's real bound. A no-op on Windows and Linux.
+    let Job {
+        mut stream,
+        request: raw,
+        seq,
+    } = job;
+    // Blocking again, so the write below is bounded by a timeout and not by `WouldBlock`.
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(REQUEST_TIMEOUT));
     let _ = stream.set_write_timeout(Some(REQUEST_TIMEOUT));
-    let _ = stream.set_nodelay(true);
 
-    let mut reader = DeadlineReader {
-        stream: &mut stream,
-        deadline: Instant::now() + REQUEST_DEADLINE,
-    };
     // The route first: the path says which game is posting, and the game says which token
     // the body has to carry. A path no game serves is a 404, and the body is not even read.
-    let (target, prefix) = match peek_target(&mut reader) {
-        Ok(peeked) => peeked,
-        Err(reject) => {
-            lock(state).counters.refused(reject);
-            let _ = write_response(&mut stream, reject.status());
-            return;
-        }
+    let Some(target) = route_of(&raw) else {
+        lock(state).counters.refused(http::Reject::Malformed);
+        let _ = write_response(&mut stream, http::Reject::Malformed.status());
+        return;
     };
     // The path is what routes, and nothing in a query is ever read.
     let path = target.split('?').next().unwrap_or_default();
@@ -766,10 +982,7 @@ fn serve_one(
         let _ = write_response(&mut stream, http::Reject::NotFound.status());
         return;
     };
-    // The bytes the route was read from are replayed, so the request is framed as it would
-    // have been without the peek.
-    let mut replay = std::io::Cursor::new(prefix).chain(&mut reader);
-    let request = match http::read_request(&mut replay, &game.path) {
+    let request = match http::read_request(&mut std::io::Cursor::new(raw), &game.path) {
         Ok(request) => request,
         Err(reject) => {
             lock(state).counters.refused(reject);
@@ -778,8 +991,7 @@ fn serve_one(
         }
     };
 
-    // The token, read out of the raw body without parsing the rest of it. The block is the
-    // first thing the game sends, so this costs a few bytes however large the body is.
+    // The token, read out of the raw body without parsing the rest of it.
     let presented = match payload::auth_token(&request.body) {
         payload::AuthToken::Present(token) => token,
         payload::AuthToken::Absent => {
@@ -827,7 +1039,7 @@ fn serve_one(
         }
     }
 
-    // Fold it in, in the order the connections were accepted. The events are emitted under
+    // Fold it in, in the order the requests were completed. The events are emitted under
     // the same lock, so they leave in that order too.
     {
         let mut state = lock(state);
@@ -927,8 +1139,9 @@ impl Counters {
         self.rate_limited += 1;
         if self.rate_limited == 1 {
             tracing::warn!(
-                "the GSI listener is over {MAX_REQUESTS_PER_WINDOW} connections per second and \
-                 is answering the excess with HTTP 429"
+                "the GSI listener is over {MAX_REQUESTS_PER_WINDOW} unauthenticated requests per \
+                 second and is answering the excess with HTTP 429 (a request carrying the game's \
+                 token is not counted)"
             );
         } else {
             tracing::debug!(
@@ -955,14 +1168,16 @@ impl Counters {
         }
     }
 
-    /// A connection refused because every reader was busy: the in-flight bound, not the
-    /// per-second one.
+    /// A connection turned away because a bound was full: the open-connection set
+    /// ([`MAX_PENDING`]) gave up its most idle member, or a lane of the reader queue was full. The
+    /// in-flight bounds, not the per-second one.
     fn busy(&mut self) {
         self.busy += 1;
         if self.busy == 1 {
             tracing::warn!(
-                "the GSI listener has {WORKERS} readers and a queue of {MAX_QUEUED}, and is \
-                 answering the excess connections with HTTP 429"
+                "the GSI listener holds at most {MAX_PENDING} open connections and has \
+                 {WORKERS} readers with a queue of {MAX_QUEUED} per lane, and is answering \
+                 the excess with HTTP 429"
             );
         } else {
             tracing::debug!(
@@ -1010,21 +1225,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_reader_past_its_deadline_times_out_instead_of_waiting() {
-        use std::io::Read;
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let _client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut server, _) = listener.accept().unwrap();
-        let mut reader = DeadlineReader {
-            stream: &mut server,
-            deadline: Instant::now(),
-        };
-        let err = reader
-            .read(&mut [0u8; 8])
-            .expect_err("the deadline has passed");
-        assert_eq!(err.kind(), ErrorKind::TimedOut);
-    }
     use std::net::SocketAddr;
 
     fn snapshot(body: &str) -> GsiSnapshot {
@@ -1283,15 +1483,8 @@ mod tests {
 
     #[test]
     fn the_route_is_the_target_of_the_request_line() {
-        use std::io::Cursor;
-
         let raw = b"POST /gsi/cs2 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n{}";
-        let (target, prefix) = peek_target(&mut Cursor::new(raw.to_vec())).expect("a request line");
-        assert_eq!(target, "/gsi/cs2");
-        assert!(
-            prefix.starts_with(b"POST /gsi/cs2 HTTP/1.1\r\n"),
-            "the bytes taken are replayed to the reader that frames the rest: {prefix:?}"
-        );
+        assert_eq!(route_of(raw).as_deref(), Some("/gsi/cs2"));
 
         // A line that is not a request line is refused rather than guessed at.
         for raw in [
@@ -1299,11 +1492,124 @@ mod tests {
             b"GET\r\n".to_vec(),
             b"POST  /gsi HTTP/1.1\r\n".to_vec(),
             b"garbage\r\n".to_vec(),
+            b"POST /gsi HTTP/1.1".to_vec(),
         ] {
-            assert!(
-                peek_target(&mut Cursor::new(raw.clone())).is_err(),
-                "{raw:?} is not a request line"
-            );
+            assert_eq!(route_of(&raw), None, "{raw:?} is not a request line");
         }
+    }
+
+    fn pending(bytes: &[u8], age: Duration, now: Instant) -> Pending {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        // Keep the client end alive for the life of the test process's sockets: leaking it is
+        // fine in a unit test and keeps the connection open, as a stalled peer's would be.
+        std::mem::forget(client);
+        Pending {
+            stream: server,
+            buf: bytes.to_vec(),
+            arrived: now - age,
+            eof: false,
+        }
+    }
+
+    #[test]
+    fn a_full_pending_set_gives_up_the_most_idle_connection_and_never_the_one_that_has_sent_bytes()
+    {
+        let now = Instant::now();
+        // Sixteen stalled peers (nothing sent), the oldest first, and the game's request, which
+        // arrived last but is already whole in the socket.
+        let mut set: Vec<Pending> = (0..MAX_PENDING as u64)
+            .map(|n| pending(b"", Duration::from_millis(1000 - n), now))
+            .collect();
+        set.push(pending(
+            b"POST /gsi HTTP/1.1\r\n",
+            Duration::from_millis(1),
+            now,
+        ));
+        for _ in 0..MAX_PENDING {
+            let victim = evict(&mut set).expect("a victim");
+            assert!(victim.buf.is_empty(), "an idle connection is the victim");
+        }
+        assert_eq!(set.len(), 1);
+        assert!(!set[0].buf.is_empty(), "the one that sent bytes survived");
+        // With nothing idle left, the oldest goes.
+        set.push(pending(b"x", Duration::from_millis(500), now));
+        let victim = evict(&mut set).unwrap();
+        assert_eq!(victim.buf, b"x");
+    }
+
+    fn job_in(lane_queue: &Queue, lane: Lane, seq: u64) -> Result<(), Job> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        std::mem::forget(client);
+        lane_queue.push(
+            lane,
+            Job {
+                stream: server,
+                request: Vec::new(),
+                seq,
+            },
+        )
+    }
+
+    #[test]
+    fn each_lane_has_its_own_bound_and_the_games_lane_is_served_first() {
+        let queue = Queue::new();
+        for n in 0..MAX_QUEUED as u64 {
+            assert!(job_in(&queue, Lane::Anonymous, n).is_ok());
+        }
+        assert!(
+            job_in(&queue, Lane::Anonymous, 99).is_err(),
+            "the anonymous lane is full"
+        );
+        // A full anonymous lane does not touch the game's.
+        for n in 0..MAX_QUEUED as u64 {
+            assert!(job_in(&queue, Lane::Trusted, 100 + n).is_ok());
+        }
+        assert!(job_in(&queue, Lane::Trusted, 199).is_err());
+        // The game's lane first, then the rest, each in order.
+        let order: Vec<u64> = std::iter::from_fn(|| {
+            let mut state = lock(&queue.state);
+            state
+                .trusted
+                .pop_front()
+                .or_else(|| state.anonymous.pop_front())
+                .map(|job| job.seq)
+        })
+        .collect();
+        assert_eq!(order, vec![100, 101, 102, 103, 0, 1, 2, 3]);
+        // Closed: nothing more is taken, and a reader waiting is released.
+        queue.close();
+        assert!(job_in(&queue, Lane::Trusted, 1).is_err());
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn a_request_is_in_the_games_lane_only_when_it_carries_that_paths_token() {
+        let config = GsiConfig::new(0, "tok-cs2")
+            .with_game("/gsi/cs2", "tok-cs2", Some(730))
+            .add_game("/gsi/dota2", "tok-dota", Some(570));
+        let request = |path: &str, body: &str| {
+            let raw = format!(
+                "POST {path} HTTP/1.1\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let framed = http::frame(raw.as_bytes());
+            let http::Framing::Complete { body } = framed else {
+                panic!("a whole request: {framed:?}")
+            };
+            lane_of(&config, raw.as_bytes(), body)
+        };
+        let auth =
+            |token: &str| format!(r#"{{"provider":{{"appid":730}},"auth":{{"token":"{token}"}}}}"#);
+        assert_eq!(request("/gsi/cs2", &auth("tok-cs2")), Lane::Trusted);
+        assert_eq!(request("/gsi/dota2", &auth("tok-dota")), Lane::Trusted);
+        // Another game's token on this path, a wrong token, none, an unknown path.
+        assert_eq!(request("/gsi/cs2", &auth("tok-dota")), Lane::Anonymous);
+        assert_eq!(request("/gsi/cs2", &auth("tok-cs3")), Lane::Anonymous);
+        assert_eq!(request("/gsi/cs2", "{}"), Lane::Anonymous);
+        assert_eq!(request("/gsi/other", &auth("tok-cs2")), Lane::Anonymous);
     }
 }

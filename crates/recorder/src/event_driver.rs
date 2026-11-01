@@ -28,8 +28,13 @@ use crate::{ClipReason, ClipWindow, RecordedClip, Recorder};
 pub struct EventsSection {
     /// Poll the League Live Client Data API. Harmless with no game running: a refused loopback
     /// connection is the normal state.
+    ///
+    /// Defaulted ([`DEFAULT_GSI_PORT`] and `true` come from [`EventsSection::default`]) so a
+    /// `[events]` table that leaves a key out parses, as `config.example.toml` says it may.
+    #[serde(default = "default_lol_poll_enabled")]
     pub lol_poll_enabled: bool,
     /// The port the CS2 / Dota 2 GSI listener binds on loopback, or `0` to leave it off.
+    #[serde(default = "default_gsi_port")]
     pub gsi_port: u16,
     /// Let the operating system pick the GSI port instead of binding `gsi_port`.
     ///
@@ -76,7 +81,34 @@ impl GameClipSection {
     }
 }
 
+/// The GSI port a file that does not name one gets: above the ephemeral range, so a listener bound
+/// elsewhere at startup cannot shadow it.
+pub const DEFAULT_GSI_PORT: u16 = 45671;
+
+fn default_lol_poll_enabled() -> bool {
+    true
+}
+
+fn default_gsi_port() -> u16 {
+    DEFAULT_GSI_PORT
+}
+
 impl EventsSection {
+    /// Refuse a GSI port that cannot be bound as written.
+    ///
+    /// `0` disables the listener. Anything else must be a real, non-privileged port: the default sits
+    /// above the ephemeral range so a temporarily bound listener elsewhere cannot shadow it. Moved here
+    /// from the CLI's loader so both front-ends share it.
+    pub fn validate(&self) -> Result<()> {
+        if self.gsi_port != 0 && self.gsi_port < 1024 {
+            anyhow::bail!(
+                "events.gsi_port must be 0 (disabled) or between 1024 and 65535, got {}",
+                self.gsi_port
+            );
+        }
+        Ok(())
+    }
+
     /// The muted kinds, or the first tag that is not one.
     pub fn muted_kinds(&self) -> Result<Vec<EventKind>> {
         self.mute_clips
@@ -133,7 +165,7 @@ impl Default for EventsSection {
     fn default() -> Self {
         Self {
             lol_poll_enabled: true,
-            gsi_port: 45671,
+            gsi_port: DEFAULT_GSI_PORT,
             gsi_ephemeral_port: false,
             mute_clips: Vec::new(),
             lol: GameClipSection::default(),
@@ -530,24 +562,20 @@ fn gsi_config(port: u16, games: &[GameSetup]) -> GsiConfig {
 /// The token of one game, in a file of its own.
 ///
 /// One token per game: a token lifted from one game's installed `.cfg` must not be able to
-/// forge the other game's events. An install that predates this keeps working — the old single
-/// `gsi-token.txt` is copied into the game's own file, so the token already installed in the
-/// game's folder stays valid. The old file is left where it is: an older build of the
-/// application still finds its token there.
+/// forge the other game's events. The old single `gsi-token.txt` of the installs that predate this
+/// is deliberately **not** carried over. Copying it into each game's file made both games hold
+/// the same token, which is the exact property the split exists to remove, and a compatibility
+/// path that quietly keeps a shared secret alive is a way back to the weakness. Each game gets a
+/// fresh token the first time; the games' installed `.cfg` files carry the old one, so the
+/// integration has to be installed again (the desktop's "Install integration"), and this logs
+/// that. The old file is left where it is, unread: an older build still finds its token there.
 fn per_game_token(app_dir: &Path, game: &str) -> Result<String> {
     let path = app_dir.join(format!("gsi-token-{game}.txt"));
     let legacy = app_dir.join(LEGACY_TOKEN_FILE);
     if !path.exists() && legacy.is_file() {
-        // The copy keeps the file mode, so the token file stays owner-only.
-        std::fs::copy(&legacy, &path).with_context(|| {
-            format!(
-                "migrating the GSI token from {} into {}",
-                legacy.display(),
-                path.display()
-            )
-        })?;
-        tracing::info!(
-            "the GSI token for {game} was migrated from {} (that file is left in place)",
+        tracing::warn!(
+            "{game}: a new GSI token was generated instead of reusing the shared one in {}; \
+             install the {game} integration again so the game carries it",
             legacy.display()
         );
     }
@@ -657,11 +685,19 @@ impl Coalesce {
 /// Each member carries the media time it arrived at: the burst is waited out before the clip is
 /// cut, and a marker stamped with the request's instant would name the end of the wait rather
 /// than the moment the event happened.
+///
+/// `stop` ends the wait early with the burst so far. The wait can run for most of the pre-roll (18
+/// seconds at the default `pre_seconds`) and the driver thread is joined when its [`EventDriver`] is
+/// dropped, so a drop in the middle of a burst used to hold the application's shutdown for that long.
+/// The wait is sliced into [`DRIVER_POLL`] steps so the flag is seen within one of them.
+///
+/// `next` is the source of events: it waits up to the given time for one and returns it already
+/// stamped (see [`stamp_on_receipt`] for the caller that has only a bare channel).
 fn gather_burst(
     first: TimedEvent,
-    rx: &Receiver<GameEvent>,
+    next: &dyn Fn(Duration) -> Result<TimedEvent, RecvTimeoutError>,
     policy: &Policy,
-    media_now: &dyn Fn() -> u64,
+    stop: &AtomicBool,
 ) -> Vec<TimedEvent> {
     let c = policy.coalesce;
     let started = std::time::Instant::now();
@@ -672,21 +708,37 @@ fn gather_burst(
         let quiet_left = c.quiet.saturating_sub(now.duration_since(last_highlight));
         let max_left = c.max.saturating_sub(now.duration_since(started));
         let wait = quiet_left.min(max_left);
-        if wait.is_zero() {
+        if wait.is_zero() || stop.load(Ordering::Acquire) {
             return burst;
         }
-        match rx.recv_timeout(wait) {
-            Ok(event) => {
-                if policy.clips(&event) {
+        match next(wait.min(DRIVER_POLL)) {
+            Ok(timed) => {
+                if policy.clips(&timed.event) {
                     last_highlight = std::time::Instant::now();
                 }
-                burst.push(TimedEvent {
-                    event,
-                    at_ms: media_now(),
-                });
+                burst.push(timed);
             }
-            Err(_) => return burst,
+            // A slice that passed quietly: the loop re-reads the clocks and the stop flag.
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => return burst,
         }
+    }
+}
+
+/// An event source for [`gather_burst`] over a bare channel: each event is stamped with the media
+/// position at the moment it is *received here*.
+///
+/// Right for a caller that reads the channel as events arrive (the CLI's loop). The driver, which can be
+/// busy cutting a clip while events queue, stamps them as they arrive instead (see [`drive`]).
+fn stamp_on_receipt<'a>(
+    rx: &'a Receiver<GameEvent>,
+    media_now: &'a dyn Fn() -> u64,
+) -> impl Fn(Duration) -> Result<TimedEvent, RecvTimeoutError> + 'a {
+    move |wait| {
+        rx.recv_timeout(wait).map(|event| TimedEvent {
+            event,
+            at_ms: media_now(),
+        })
     }
 }
 
@@ -698,12 +750,37 @@ pub fn act_on_burst(
     rx: &Receiver<GameEvent>,
     policy: &Policy,
 ) -> Result<Option<RecordedClip>> {
+    act_on_burst_until(recorder, first, rx, policy, &AtomicBool::new(false))
+}
+
+/// [`act_on_burst`] that gives up waiting for the burst to settle once `stop` is set, and cuts the
+/// clip from what has been gathered (see [`gather_burst`]).
+pub fn act_on_burst_until(
+    recorder: &Recorder,
+    first: GameEvent,
+    rx: &Receiver<GameEvent>,
+    policy: &Policy,
+    stop: &AtomicBool,
+) -> Result<Option<RecordedClip>> {
     // The moment the first event arrived: the caller received it just before calling, and the
     // burst it belongs to may not be cut for another whole coalescing window.
     let first = TimedEvent {
         event: first,
         at_ms: recorder.media_now_ms(),
     };
+    let media_now = || recorder.media_now_ms();
+    let next = stamp_on_receipt(rx, &media_now);
+    act_on_timed_burst(recorder, first, &next, policy, stop)
+}
+
+/// [`act_on_burst_until`] for events that were stamped when they arrived.
+fn act_on_timed_burst(
+    recorder: &Recorder,
+    first: TimedEvent,
+    next: &dyn Fn(Duration) -> Result<TimedEvent, RecvTimeoutError>,
+    policy: &Policy,
+    stop: &AtomicBool,
+) -> Result<Option<RecordedClip>> {
     if !policy.clips(&first.event) {
         // A marker, or a highlight the player muted: recorded on the timeline, no footage.
         return recorder
@@ -711,7 +788,7 @@ pub fn act_on_burst(
             .map(|_| None)
             .context("recording a game-event marker");
     }
-    let mut burst = gather_burst(first, rx, policy, &|| recorder.media_now_ms()).into_iter();
+    let mut burst = gather_burst(first, next, policy, stop).into_iter();
     let head = burst.next().expect("a burst always holds its first event");
     let window = policy.window_for(head.event.source);
     let result = act_on_event_at(recorder, head, window);
@@ -793,31 +870,65 @@ impl Drop for EventDriver {
 
 const DRIVER_POLL: Duration = Duration::from_millis(250);
 
-fn drive(
+pub(crate) fn drive(
     recorder: &Recorder,
     sources: EventSources,
     stop: &AtomicBool,
     policy: &Policy,
     on_clip: &ClipHook,
 ) {
-    while !stop.load(Ordering::Acquire) {
-        match sources.events.recv_timeout(DRIVER_POLL) {
-            Ok(event) => {
-                // Nothing is recording (armed for a game, or stopped): an event then is a state, not a failure.
-                if !recorder.is_running() {
-                    tracing::info!("a game event arrived while nothing is being recorded; ignored");
-                    continue;
-                }
-                match act_on_burst(recorder, event, &sources.events, policy) {
-                    Ok(Some(clip)) => on_clip(&clip),
-                    Ok(None) => {}
-                    Err(err) => tracing::warn!("the game event could not be acted on: {err:#}"),
+    // The events are stamped on a thread of their own, as they arrive. This thread is held for the whole
+    // of a clip (the post-roll wait and the splice), and an event stamped only when it got back to the
+    // channel carried the end of that wait as its moment: the marker and the chapter named a second
+    // seconds after the play, and the clip it started could miss it.
+    let (stamped_tx, stamped) = mpsc::channel::<TimedEvent>();
+    std::thread::scope(|scope| {
+        let EventSources {
+            events,
+            _lol,
+            _gsi,
+            reports,
+        } = sources;
+        scope.spawn(move || {
+            while !stop.load(Ordering::Acquire) {
+                match events.recv_timeout(DRIVER_POLL) {
+                    Ok(event) => {
+                        let at_ms = recorder.media_now_ms();
+                        if stamped_tx.send(TimedEvent { event, at_ms }).is_err() {
+                            break;
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => break,
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
+        });
+        // The handles stay here, alive for the loop below: dropping them stops the sources.
+        let _keep = (_lol, _gsi, reports);
+        let next = |wait: Duration| stamped.recv_timeout(wait);
+        while !stop.load(Ordering::Acquire) {
+            match stamped.recv_timeout(DRIVER_POLL) {
+                Ok(first) => {
+                    // Nothing is recording (armed for a game, or stopped): an event then is a state, not a failure.
+                    if !recorder.is_running() {
+                        tracing::info!(
+                            "a game event arrived while nothing is being recorded; ignored"
+                        );
+                        continue;
+                    }
+                    match act_on_timed_burst(recorder, first, &next, policy, stop) {
+                        Ok(Some(clip)) => on_clip(&clip),
+                        Ok(None) => {}
+                        Err(err) => {
+                            tracing::warn!("the game event could not be acted on: {err:#}")
+                        }
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
         }
-    }
+    });
 }
 
 #[cfg(test)]
@@ -918,7 +1029,12 @@ mod tests {
         for _ in 0..4 {
             tx.send(kill()).unwrap();
         }
-        let burst = gather_burst(timed(kill(), 0), &rx, &quick(), &|| 0);
+        let burst = gather_burst(
+            timed(kill(), 0),
+            &stamp_on_receipt(&rx, &|| 0),
+            &quick(),
+            &AtomicBool::new(false),
+        );
         assert_eq!(
             burst.len(),
             5,
@@ -933,7 +1049,47 @@ mod tests {
         let mut policy = quick();
         policy.coalesce.max = Duration::from_secs(3_600);
         let (_tx, rx) = mpsc::channel::<GameEvent>();
-        assert_eq!(gather_burst(timed(kill(), 0), &rx, &policy, &|| 0).len(), 1);
+        assert_eq!(
+            gather_burst(
+                timed(kill(), 0),
+                &stamp_on_receipt(&rx, &|| 0),
+                &policy,
+                &AtomicBool::new(false)
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_burst_wait_ends_when_the_driver_is_stopped() {
+        // Dropping the driver sets the flag and joins its thread; a wait of an hour must not hold
+        // that join. The bound is generous (the wait is sliced at 250ms) so a loaded runner passes.
+        let mut policy = quick();
+        policy.coalesce = Coalesce {
+            quiet: Duration::from_secs(3_600),
+            max: Duration::from_secs(3_600),
+        };
+        let (_tx, rx) = mpsc::channel::<GameEvent>();
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            flag.store(true, Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        let burst = gather_burst(
+            timed(kill(), 0),
+            &stamp_on_receipt(&rx, &|| 0),
+            &policy,
+            &stop,
+        );
+        assert_eq!(burst.len(), 1, "the burst so far is kept");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the wait did not end with the stop flag"
+        );
+        setter.join().unwrap();
     }
 
     #[test]
@@ -947,7 +1103,12 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(20));
             }
         });
-        let burst = gather_burst(timed(kill(), 0), &rx, &quick(), &|| 0);
+        let burst = gather_burst(
+            timed(kill(), 0),
+            &stamp_on_receipt(&rx, &|| 0),
+            &quick(),
+            &AtomicBool::new(false),
+        );
         assert!(
             burst.len() > 1,
             "the burst gathered the stream until the cut"
@@ -990,5 +1151,29 @@ mod tests {
         let text = include_str!("../../../config.example.toml");
         let file: File = toml::from_str(text).expect("the example parses");
         assert_eq!(file.events, EventsSection::default());
+    }
+
+    /// `config.example.toml` says `gsi_port` may be omitted; the table used to refuse it as missing.
+    #[test]
+    fn an_events_table_may_omit_the_port_and_the_poll_switch() {
+        #[derive(Deserialize)]
+        struct File {
+            events: EventsSection,
+        }
+        let file: File = toml::from_str("[events]\n").expect("an empty table parses");
+        assert_eq!(file.events, EventsSection::default());
+        let file: File = toml::from_str("[events]\ngsi_port = 0\n").unwrap();
+        assert!(file.events.lol_poll_enabled, "the omitted switch is on");
+        assert_eq!(file.events.gsi_port, 0, "a stated value is kept");
+    }
+
+    #[test]
+    fn a_privileged_gsi_port_is_refused_and_zero_is_off() {
+        let mut events = EventsSection::default();
+        assert!(events.validate().is_ok());
+        events.gsi_port = 0;
+        assert!(events.validate().is_ok());
+        events.gsi_port = 80;
+        assert!(format!("{:#}", events.validate().unwrap_err()).contains("events.gsi_port"));
     }
 }

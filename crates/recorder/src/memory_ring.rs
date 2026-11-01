@@ -24,7 +24,8 @@ use replayed_replay::{MemoryRingBuffer, MemoryStats};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::ChildStdout;
-use std::sync::mpsc::{sync_channel, SyncSender, TrySendError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
@@ -35,9 +36,12 @@ const READ_CHUNK: usize = 256 * 1024;
 /// Fragmented MP4 as the encoder produced it; [`crate::session::finalise_part`] makes it an ordinary file.
 pub const SESSION_PART: &str = "recording.part";
 
-/// Chunks the session writer may be behind by before the file is given up on: 256 reads of at most
-/// [`READ_CHUNK`], so 64MiB of RAM at worst.
-const SINK_QUEUE_CHUNKS: usize = 256;
+/// Bytes the session writer may be behind by before the file is given up on: 64MiB of RAM at worst.
+///
+/// Bounded in bytes, not in reads: a read is anywhere from a few bytes to [`READ_CHUNK`], so a count
+/// of reads let the queue hold anywhere from a few KiB (a slow stream gives up on the file early) to
+/// far more than intended, and said nothing about the memory it was meant to cap.
+const SINK_QUEUE_BYTES: usize = 64 * 1024 * 1024;
 
 /// The reader's hand-off to the session file's writer thread.
 ///
@@ -47,24 +51,30 @@ const SINK_QUEUE_CHUNKS: usize = 256;
 /// keep up, an antivirus scan holding the file) or a write that fails ends the *file*, loudly, and
 /// leaves the ring running.
 struct SinkFeed {
-    tx: Option<SyncSender<Vec<u8>>>,
+    tx: Option<Sender<Vec<u8>>>,
+    /// Bytes queued and not yet written; the writer subtracts as it writes.
+    queued: Arc<AtomicUsize>,
+    limit_bytes: usize,
     failure: Arc<Mutex<Option<String>>>,
 }
 
 impl SinkFeed {
     fn push(&mut self, chunk: &[u8]) {
         let Some(tx) = &self.tx else { return };
-        match tx.try_send(chunk.to_vec()) {
-            Ok(()) => {}
-            Err(TrySendError::Full(_)) => {
-                record_sink_failure(
-                    &self.failure,
-                    "the disk could not keep up with the recording".to_string(),
-                );
-                self.tx = None;
-            }
-            // The writer already recorded why it stopped.
-            Err(TrySendError::Disconnected(_)) => self.tx = None,
+        // `fetch_add` first so the check and the reservation are one step; undone when refused.
+        let before = self.queued.fetch_add(chunk.len(), Ordering::AcqRel);
+        if before.saturating_add(chunk.len()) > self.limit_bytes {
+            self.queued.fetch_sub(chunk.len(), Ordering::AcqRel);
+            record_sink_failure(
+                &self.failure,
+                "the disk could not keep up with the recording".to_string(),
+            );
+            self.tx = None;
+            return;
+        }
+        // The writer already recorded why it stopped.
+        if tx.send(chunk.to_vec()).is_err() {
+            self.tx = None;
         }
     }
 }
@@ -84,17 +94,25 @@ fn record_sink_failure(slot: &Arc<Mutex<Option<String>>>, why: String) {
 type SinkFailure = Arc<Mutex<Option<String>>>;
 
 /// Start the writer thread for `path`; returns what the reader feeds, the thread to join and its failure slot.
-fn start_sink(path: &Path, capacity: usize) -> Result<(SinkFeed, JoinHandle<()>, SinkFailure)> {
+fn start_sink(
+    path: &Path,
+    capacity_bytes: usize,
+) -> Result<(SinkFeed, JoinHandle<()>, SinkFailure)> {
     let mut file = std::fs::File::create(path)
         .with_context(|| format!("creating the session file {}", path.display()))?;
-    let (tx, rx) = sync_channel::<Vec<u8>>(capacity);
+    let (tx, rx) = channel::<Vec<u8>>();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let writer_queued = Arc::clone(&queued);
     let failure = Arc::new(Mutex::new(None));
     let slot = Arc::clone(&failure);
     let writer = std::thread::Builder::new()
         .name("replayed-session-writer".into())
         .spawn(move || {
             while let Ok(chunk) = rx.recv() {
-                if let Err(err) = file.write_all(&chunk) {
+                let len = chunk.len();
+                let written = file.write_all(&chunk);
+                writer_queued.fetch_sub(len, Ordering::AcqRel);
+                if let Err(err) = written {
                     record_sink_failure(&slot, format!("writing the session file failed: {err}"));
                     return;
                 }
@@ -108,6 +126,8 @@ fn start_sink(path: &Path, capacity: usize) -> Result<(SinkFeed, JoinHandle<()>,
     Ok((
         SinkFeed {
             tx: Some(tx),
+            queued,
+            limit_bytes: capacity_bytes,
             failure: Arc::clone(&failure),
         },
         writer,
@@ -119,6 +139,10 @@ fn start_sink(path: &Path, capacity: usize) -> Result<(SinkFeed, JoinHandle<()>,
 ///
 /// A struct because five of the fields are bare numbers: a positional `pre_ms`/`cap_ms` swap would
 /// silently hold the wrong footage.
+///
+/// `Clone` so a capture resize can start the next ring with the same setup as the first (a new
+/// encoder writes a new stream, and a new stream needs a new ring).
+#[derive(Clone)]
 pub struct RingSetup {
     pub bin: FfmpegBinaries,
     pub clips_dir: PathBuf,
@@ -174,7 +198,7 @@ impl MemoryRing {
             .with_context(|| format!("creating the clips directory {}", clips_dir.display()))?;
         let (feed, sink_writer, sink_failure) = match &session_part {
             Some(path) => {
-                let (feed, writer, failure) = start_sink(path, SINK_QUEUE_CHUNKS)?;
+                let (feed, writer, failure) = start_sink(path, SINK_QUEUE_BYTES)?;
                 (Some(feed), Some(writer), Some(failure))
             }
             None => (None, None, None),
@@ -483,7 +507,7 @@ mod sink_tests {
         let dir = std::env::temp_dir().join(format!("lp-sink-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(SESSION_PART);
-        let (mut feed, writer, failure) = start_sink(&path, 8).unwrap();
+        let (mut feed, writer, failure) = start_sink(&path, 64 * 1024).unwrap();
         let mut expected = Vec::new();
         for i in 0..5u8 {
             let chunk = vec![i; 1000 + i as usize];
@@ -499,16 +523,18 @@ mod sink_tests {
 
     #[test]
     fn a_writer_that_cannot_keep_up_ends_the_file_not_the_feed() {
-        // A queue nobody drains: the second chunk finds it full.
-        let (tx, _rx) = sync_channel::<Vec<u8>>(1);
+        // A queue nobody drains, bounded at 1000 bytes: the second chunk would take it past the bound.
+        let (tx, _rx) = channel::<Vec<u8>>();
         let failure = Arc::new(Mutex::new(None));
         let mut feed = SinkFeed {
             tx: Some(tx),
+            queued: Arc::new(AtomicUsize::new(0)),
+            limit_bytes: 1000,
             failure: Arc::clone(&failure),
         };
-        feed.push(b"one");
+        feed.push(&[0u8; 600]);
         assert!(failure.lock().unwrap().is_none());
-        feed.push(b"two");
+        feed.push(&[0u8; 600]);
         assert!(failure
             .lock()
             .unwrap()
@@ -518,6 +544,38 @@ mod sink_tests {
         // Later pushes are no-ops rather than blocking or panicking.
         feed.push(b"three");
         assert!(feed.tx.is_none());
+    }
+
+    #[test]
+    fn the_queue_is_bounded_in_bytes_not_in_reads() {
+        // Many tiny reads stay far under the byte bound: the old count-of-reads bound would have given up on them.
+        let (tx, rx) = channel::<Vec<u8>>();
+        let failure = Arc::new(Mutex::new(None));
+        let queued = Arc::new(AtomicUsize::new(0));
+        let mut feed = SinkFeed {
+            tx: Some(tx),
+            queued: Arc::clone(&queued),
+            limit_bytes: 64 * 1024,
+            failure: Arc::clone(&failure),
+        };
+        for _ in 0..1000 {
+            feed.push(&[1u8; 16]);
+        }
+        assert!(failure.lock().unwrap().is_none());
+        assert_eq!(queued.load(Ordering::Relaxed), 16_000);
+        drop(rx);
+        // And a few large reads past the byte bound are refused, whatever their count.
+        let (tx, _rx) = channel::<Vec<u8>>();
+        let mut feed = SinkFeed {
+            tx: Some(tx),
+            queued: Arc::new(AtomicUsize::new(0)),
+            limit_bytes: 64 * 1024,
+            failure: Arc::clone(&failure),
+        };
+        feed.push(&vec![2u8; 40 * 1024]);
+        feed.push(&vec![2u8; 40 * 1024]);
+        assert!(feed.tx.is_none());
+        assert!(failure.lock().unwrap().is_some());
     }
 
     #[test]

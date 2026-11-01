@@ -8,7 +8,7 @@
  */
 
 import { mount, tick, unmount } from 'svelte';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import SessionDetail from './SessionDetail.svelte';
 import { toSessionView } from '../sessions';
@@ -29,7 +29,10 @@ describe('the session detail', () => {
     document.body.innerHTML = '';
   });
 
-  async function mountDetail(view: SessionView): Promise<HTMLElement> {
+  async function mountDetail(
+    view: SessionView,
+    overrides: { onDelete?: () => void; busy?: boolean } = {},
+  ): Promise<HTMLElement> {
     const target = document.createElement('div');
     document.body.appendChild(target);
     app = mount(SessionDetail, {
@@ -38,11 +41,11 @@ describe('the session detail', () => {
         session: view,
         events: [],
         matches: [],
-        busy: false,
+        busy: overrides.busy ?? false,
         onExtract: () => {},
         onExtractMatch: () => {},
         onFavourite: () => {},
-        onDelete: () => {},
+        onDelete: overrides.onDelete ?? (() => {}),
       },
     });
     // The selection is seeded in an effect, so the component has to be given a tick
@@ -71,5 +74,60 @@ describe('the session detail', () => {
     const target = await mountDetail(toSessionView({ ...session, duration_ms: 40 }));
     expect(extractButton(target)?.disabled).toBe(true);
     expect(target.textContent).toContain('shortest selection');
+  });
+
+  /** The button whose text is exactly `label`. */
+  function button(target: HTMLElement, label: string): HTMLButtonElement | null {
+    return (
+      [...target.querySelectorAll<HTMLButtonElement>('button')].find(
+        (b) => (b.textContent ?? '').replace(/\s+/g, ' ').trim() === label,
+      ) ?? null
+    );
+  }
+
+  it('does not delete the whole session on the first click', async () => {
+    // One unconfirmed click used to remove the row, the scratch segments and the concatenated
+    // file, next to a Favourite button that is harmless to hit by mistake.
+    const onDelete = vi.fn();
+    const target = await mountDetail(toSessionView(session), { onDelete });
+
+    button(target, 'Delete session')!.click();
+    await tick();
+
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(button(target, 'Confirm delete'), 'the click armed the button').not.toBeNull();
+  });
+
+  it('deletes once, on the confirmation', async () => {
+    const onDelete = vi.fn();
+    const target = await mountDetail(toSessionView(session), { onDelete });
+
+    button(target, 'Delete session')!.click();
+    await tick();
+    button(target, 'Confirm delete')!.click();
+    await tick();
+
+    expect(onDelete).toHaveBeenCalledTimes(1);
+    // It is disarmed again: the next delete asks again.
+    expect(button(target, 'Delete session')).not.toBeNull();
+    expect(button(target, 'Confirm delete')).toBeNull();
+  });
+
+  it('lets the user back out of a delete', async () => {
+    const onDelete = vi.fn();
+    const target = await mountDetail(toSessionView(session), { onDelete });
+
+    button(target, 'Delete session')!.click();
+    await tick();
+    button(target, 'Cancel')!.click();
+    await tick();
+
+    expect(onDelete).not.toHaveBeenCalled();
+    expect(button(target, 'Delete session')).not.toBeNull();
+  });
+
+  it('holds the delete button while a command is in flight', async () => {
+    const target = await mountDetail(toSessionView(session), { busy: true });
+    expect(button(target, 'Delete session')?.disabled).toBe(true);
   });
 });

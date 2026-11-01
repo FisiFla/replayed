@@ -19,6 +19,11 @@ pub struct StubCapture {
     read_back: u64,
     /// Frames consumed without being rendered (see [`Self::frames_discarded`]).
     discarded: u64,
+    /// A resize the source will make: the frame index it happens at and the size it changes to
+    /// (see [`Self::resize_at_frame`]).
+    resize: Option<(u64, (u32, u32))>,
+    /// The geometry a caller has not yet been told about (see [`CaptureBackend::take_size_change`]).
+    announced: Option<(u32, u32)>,
 }
 
 impl StubCapture {
@@ -29,7 +34,21 @@ impl StubCapture {
             started_at: None,
             read_back: 0,
             discarded: 0,
+            resize: None,
+            announced: None,
         }
+    }
+
+    /// Make the source change size, as a window dragged or a display mode switched would: the
+    /// frame at `frame_index` and every later one is `size`.
+    ///
+    /// Models the contract a real backend keeps ([`CaptureBackend::take_size_change`]): the change
+    /// is reported before the first frame of the new size is returned, and
+    /// [`CaptureBackend::native_size`] answers the new size from then on. It exists so a consumer
+    /// of that contract can be tested on a host that has no screen to resize.
+    pub fn resize_at_frame(mut self, frame_index: u64, size: (u32, u32)) -> Self {
+        self.resize = Some((frame_index, size));
+        self
     }
 
     /// How many frames this source has materialised: pixel buffers built by [`Self::render_next`],
@@ -65,7 +84,20 @@ impl StubCapture {
         (0..wanted).map(|_| self.render_next()).collect()
     }
 
+    /// Apply the scheduled resize when the frame about to be produced is the one it happens at.
+    fn apply_resize(&mut self) {
+        if let Some((at, size)) = self.resize {
+            if self.frame_index >= at {
+                self.resize = None;
+                self.cfg.width = size.0;
+                self.cfg.height = size.1;
+                self.announced = Some(size);
+            }
+        }
+    }
+
     fn render_next(&mut self) -> Frame {
+        self.apply_resize();
         self.read_back += 1;
         let (w, h) = (self.cfg.width, self.cfg.height);
         let phase = (self.frame_index % 256) as u8;
@@ -134,6 +166,9 @@ impl CaptureBackend for StubCapture {
         if !self.is_due(started.elapsed()) {
             return Ok(0);
         }
+        // A discarded frame is still a frame the source offered, so a resize scheduled for it
+        // happens at it: the announcement must not wait for a frame the caller keeps.
+        self.apply_resize();
         self.frame_index += 1;
         self.discarded += 1;
         Ok(1)
@@ -145,6 +180,10 @@ impl CaptureBackend for StubCapture {
 
     fn native_size(&self) -> (u32, u32) {
         (self.cfg.width, self.cfg.height)
+    }
+
+    fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        self.announced.take()
     }
 }
 
@@ -357,6 +396,54 @@ mod tests {
             .discard_pending()
             .expect_err("the stub has no schedule before start");
         assert!(err.to_string().contains("not started"), "got: {err}");
+    }
+
+    #[test]
+    fn a_resize_is_reported_once_before_the_first_frame_of_the_new_size_is_used() {
+        // The contract a real backend keeps: frames before the report are the old size, the
+        // report comes with the first frame of the new one, and `native_size` follows it.
+        let cfg = StubConfig {
+            width: 8,
+            height: 6,
+            fps: 1000,
+        };
+        let mut cap = StubCapture::new(cfg).resize_at_frame(3, (16, 12));
+        cap.start().unwrap();
+        assert_eq!(cap.take_size_change(), None, "nothing has changed yet");
+
+        let mut sizes = Vec::new();
+        for _ in 0..5 {
+            let frame = cap.next_frame(Duration::from_secs(1)).unwrap().unwrap();
+            let change = cap.take_size_change();
+            sizes.push(((frame.width, frame.height), change));
+        }
+
+        assert_eq!(
+            sizes,
+            vec![
+                ((8, 6), None),
+                ((8, 6), None),
+                ((8, 6), None),
+                ((16, 12), Some((16, 12))),
+                ((16, 12), None),
+            ],
+            "reported once, with the first frame that needs it"
+        );
+        assert_eq!(cap.native_size(), (16, 12));
+    }
+
+    #[test]
+    fn a_resize_that_lands_on_a_discarded_frame_is_still_reported() {
+        let cfg = StubConfig {
+            width: 8,
+            height: 6,
+            fps: 1000,
+        };
+        let mut cap = StubCapture::new(cfg).resize_at_frame(0, (4, 4));
+        cap.start().unwrap();
+        assert_eq!(cap.discard_pending().unwrap(), 1);
+        assert_eq!(cap.take_size_change(), Some((4, 4)));
+        assert_eq!(cap.native_size(), (4, 4));
     }
 
     #[test]

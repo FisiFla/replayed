@@ -28,6 +28,10 @@ use std::time::Duration;
 /// tree so nothing is downloaded at runtime.
 const RIOT_ROOT_PEM: &[u8] = include_bytes!("riotgames.pem");
 
+/// What the client calls itself: the crate's own version (the workspace's, so the app's), not a
+/// number written here that nobody updates.
+const USER_AGENT: &str = concat!("replayed/", env!("CARGO_PKG_VERSION"));
+
 /// How long to wait for the TCP connection. Loopback answers at once or not at all, and the
 /// once-a-second poller must not fall behind waiting on a socket.
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -167,11 +171,7 @@ impl LoopbackClient {
 
         // Built from the endpoint's validated path, so nothing upstream can break the request line
         // (see `endpoint::is_valid_path`).
-        let request = format!(
-            "GET {} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
-             User-Agent: replayed/0.1\r\nConnection: close\r\n\r\n",
-            self.endpoint.path()
-        );
+        let request = self.request_text(&host);
         tls.write_all(request.as_bytes())
             .map_err(|e| self.io_error(e))?;
         tls.flush().map_err(|e| self.io_error(e))?;
@@ -193,6 +193,16 @@ impl LoopbackClient {
             404 => Ok(Response::NotServing),
             other => Err(FetchError::UnexpectedStatus(other)),
         }
+    }
+
+    /// The request, written by hand: a `GET`, never another method, with a `User-Agent` carrying
+    /// the version of the build that sent it, so a Riot-side or support log names the real one.
+    fn request_text(&self, host: &str) -> String {
+        format!(
+            "GET {} HTTP/1.1\r\nHost: {host}\r\nAccept: application/json\r\n\
+             User-Agent: {USER_AGENT}\r\nConnection: close\r\n\r\n",
+            self.endpoint.path()
+        )
     }
 
     fn io_error(&self, e: std::io::Error) -> FetchError {
@@ -217,6 +227,23 @@ mod tests {
         let client = LoopbackClient::for_endpoint(ep.clone()).expect("a relaxed connector");
         assert_eq!(client.endpoint(), &ep);
         assert!(client.endpoint().is_loopback());
+    }
+
+    #[test]
+    fn the_request_is_a_get_that_names_the_build_that_sent_it() {
+        let client = LoopbackClient::live_client().expect("a client");
+        let request = client.request_text("127.0.0.1:2999");
+        assert!(
+            request.starts_with("GET /liveclientdata/allgamedata HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(request.contains("Host: 127.0.0.1:2999\r\n"), "{request}");
+        let agent = format!("User-Agent: replayed/{}\r\n", env!("CARGO_PKG_VERSION"));
+        assert!(request.contains(&agent), "{request}");
+        assert!(
+            !request.contains("replayed/0.1\r\n"),
+            "the stale hard-coded version is gone: {request}"
+        );
     }
 
     #[test]

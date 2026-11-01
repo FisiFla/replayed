@@ -228,6 +228,73 @@ mod tests {
         fn exit(&self, _span: &tracing::span::Id) {}
     }
 
+    thread_local! {
+        /// The [`Log`] this thread's events go to while a test is capturing them.
+        static CAPTURING: std::cell::RefCell<Option<Log>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// Run `f` with the events this thread emits recorded in `logs`.
+    ///
+    /// Not `tracing::subscriber::with_default`. A callsite's interest is cached for the whole
+    /// process when the callsite is first hit, and the other tests here hit `announce` on their
+    /// own threads with no subscriber at all. The cache could then read "never" just as a
+    /// capturing test began, and that test's subscriber was never asked: 12 runs in 400 with the
+    /// tests in parallel, none alone or one thread at a time. One global subscriber that is always
+    /// interested and routes events by thread has no such window.
+    fn capture<R>(logs: &Log, f: impl FnOnce() -> R) -> R {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            tracing::subscriber::set_global_default(Router)
+                .expect("nothing else in this test binary installs a global subscriber");
+        });
+        CAPTURING.with(|current| *current.borrow_mut() = Some(logs.clone()));
+        let out = f();
+        CAPTURING.with(|current| *current.borrow_mut() = None);
+        out
+    }
+
+    /// The global subscriber behind [`capture`]: interested in every callsite, and handing each
+    /// event to the [`Log`] of the thread that emitted it, if that thread is capturing.
+    struct Router;
+
+    impl tracing::Subscriber for Router {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            CAPTURING.with(|current| {
+                current
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|log| tracing::Subscriber::enabled(log, metadata))
+            })
+        }
+
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            CAPTURING.with(|current| {
+                if let Some(log) = current.borrow().as_ref() {
+                    tracing::Subscriber::event(log, event);
+                }
+            });
+        }
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
     /// Takes the event's `message`, which is where the text of a `tracing::info!` lives.
     struct Message<'a>(&'a mut String);
 
@@ -319,10 +386,7 @@ mod tests {
             },
             None,
         );
-        let subscriber = logs.clone();
-        let opened = tracing::subscriber::with_default(subscriber, || {
-            opener.open().expect("the fake opens")
-        });
+        let opened = capture(&logs, || opener.open().expect("the fake opens"));
         assert_eq!(opened.1, "system:speakers");
 
         let at_open = &opener.factory.log_at_open;
@@ -350,8 +414,7 @@ mod tests {
             },
             None,
         );
-        let subscriber = logs.clone();
-        tracing::subscriber::with_default(subscriber, || {
+        capture(&logs, || {
             opener.open().expect("the fake opens");
             opener.open().expect("the fake opens again");
         });

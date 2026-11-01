@@ -20,11 +20,15 @@
 //! select). League is detected through that read-only `GET`, which cannot fire outside a game.
 //!
 //! Everything else is recognised by executable name. That includes Valorant: Riot publishes no
-//! local game-state service for it (the Riot Client's lockfile-protected HTTP API reports the
-//! launcher's session, not a match, is undocumented, and is not used). Valorant is watched by
-//! `VALORANT-Win64-Shipping.exe`, the game process present only during a match, not
-//! `VALORANT.exe`, the launcher that would be a false positive all evening. Likewise
-//! `League of Legends.exe` not `LeagueClient.exe`, and `cs2.exe` not `steam.exe`.
+//! local game-state service for it (the Riot Client's HTTP API sits behind a lockfile, reports
+//! the launcher's session rather than a match, is undocumented, and is not used). Valorant is
+//! watched by `VALORANT-Win64-Shipping.exe`, the game process, not `VALORANT.exe`, the launcher
+//! that would be a false positive all evening. That is a narrower signal, not a match signal:
+//! the game process exists from the moment the game is opened, so it is present through the
+//! menus and agent select as well as during a match. A process-name match therefore means "the
+//! game is open", for every title recognised this way, and a recording armed on it covers the
+//! menus too. Likewise `League of Legends.exe` not `LeagueClient.exe`, and `cs2.exe` not
+//! `steam.exe`.
 //!
 //! # What the process watcher does and does not do
 //!
@@ -54,6 +58,7 @@
 //! name were absent from a snapshot under kernel anti-cheat, the result would be a game never
 //! detected: a false negative, never a wrong match, since a match requires an equal file name.
 
+use crate::lol::payload::GameData;
 use crate::lol::{Endpoint, LoopbackClient, Response};
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
@@ -401,9 +406,13 @@ pub fn validate_watch_list(watched: &[WatchedGame]) -> Result<()> {
 /// is being played.
 ///
 /// It reuses the crate's [`LoopbackClient`], pinned to an [`Endpoint`] that can only be
-/// loopback: no new HTTP client, no second place relaxing TLS, no new request path. It asks for
-/// the same `/liveclientdata/allgamedata` as the event poller and reads only the answer's
-/// status.
+/// loopback: no new HTTP client, no second place relaxing TLS. It is still one read-only `GET`
+/// on the same service, but for `/liveclientdata/gamestats` ([`Endpoint::game_stats`]), a
+/// document of a couple of hundred bytes, not the several-hundred-kilobyte `allgamedata` the
+/// event poller reads. A `200` alone is not "a game": the body is read and has to name one
+/// (a map or a running clock, the same test [`crate::lol::GameSnapshot::game_present`] applies),
+/// so `null`, `{}` and an empty document read as no game, and a body that is not JSON is a
+/// failure to look, not either answer.
 ///
 /// Limit: the endpoint is the game's, so a replay or spectated game served by the same client
 /// looks like a match being played. It is still a game the user opened, so not the costly kind
@@ -417,21 +426,34 @@ impl LiveClientPresence {
     /// The real thing: Riot's endpoint and the titles configured for it. Titles whose signal is
     /// [`Signal::Process`] are left out; [`CompositePresence`] hands each title to one source.
     pub fn new(watched: &[WatchedGame]) -> Result<Self> {
-        Self::for_endpoint(watched, Endpoint::live_client())
+        Self::for_endpoint(watched, Endpoint::game_stats())
     }
 
     /// The same detector against any loopback endpoint, for a test mock or a front-end with its
     /// own endpoint.
     pub fn for_endpoint(watched: &[WatchedGame], endpoint: Endpoint) -> Result<Self> {
+        Ok(Self::with_client(
+            watched,
+            LoopbackClient::for_endpoint(endpoint)?,
+        ))
+    }
+
+    /// As [`Self::for_endpoint`], trusting `root_pem` instead of Riot's root: how a test reaches
+    /// a mock. Still a pin, never a way to skip verification.
+    pub fn with_root(watched: &[WatchedGame], endpoint: Endpoint, root_pem: &[u8]) -> Result<Self> {
+        Ok(Self::with_client(
+            watched,
+            LoopbackClient::for_endpoint_with_root(endpoint, root_pem)?,
+        ))
+    }
+
+    fn with_client(watched: &[WatchedGame], client: LoopbackClient) -> Self {
         let watching = watched
             .iter()
             .filter(|game| game.signal == Signal::LiveClientApi)
             .cloned()
             .collect();
-        Ok(Self {
-            client: LoopbackClient::for_endpoint(endpoint)?,
-            watching,
-        })
+        Self { client, watching }
     }
 
     /// The endpoint this detector reads.
@@ -445,6 +467,30 @@ impl LiveClientPresence {
     }
 }
 
+/// Whether a Live Client body (`gamestats`, or a whole `allgamedata`) describes a game being
+/// played. `Err` for a body that is not a JSON object or `null`: a failure to look, which must
+/// not be read as either answer.
+fn serves_a_game(body: &[u8]) -> Result<bool> {
+    let value: Option<serde_json::Value> = serde_json::from_slice(body)
+        .map_err(|err| anyhow!("the League Live Client answered a body that is not JSON: {err}"))?;
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if !value.is_object() {
+        bail!("the League Live Client answered JSON that is not an object");
+    }
+    let as_stats = |value: &serde_json::Value| {
+        GameData::deserialize(value)
+            .map_err(|err| anyhow!("the League Live Client's game data is unreadable: {err}"))
+    };
+    // `gamestats` is the game data itself; `allgamedata` nests it under `gameData`.
+    let nested = match value.get("gameData") {
+        Some(nested) => as_stats(nested)?.is_present(),
+        None => false,
+    };
+    Ok(nested || as_stats(&value)?.is_present())
+}
+
 impl GamePresence for LiveClientPresence {
     fn poll(&mut self) -> Result<Vec<Presence>> {
         if self.watching.is_empty() {
@@ -454,8 +500,9 @@ impl GamePresence for LiveClientPresence {
         }
 
         let running = match self.client.get() {
-            // A body means the API is serving a game; what it says is `lol::derive`'s business.
-            Ok(Response::Body(_)) => true,
+            // A 200 is not yet a game: `null`, `{}` and an empty document are the client between
+            // games, and a body that is not JSON is somebody else answering.
+            Ok(Response::Body(body)) => serves_a_game(&body)?,
             // 404: the API is up and reports no game.
             Ok(Response::NotServing) => false,
             // A refused or timed-out loopback connection is the ordinary "no game is running" answer.
@@ -485,6 +532,8 @@ impl GamePresence for LiveClientPresence {
 pub struct CompositePresence {
     process: Option<ProcessWatcher>,
     live: Option<LiveClientPresence>,
+    /// So a source that keeps failing is one line, not one per poll.
+    quiet: RunQuiet,
 }
 
 impl CompositePresence {
@@ -527,7 +576,11 @@ impl CompositePresence {
             live.as_ref().map_or(0, |l| l.watching().len())
         );
 
-        Ok(Self { process, live })
+        Ok(Self {
+            process,
+            live,
+            quiet: RunQuiet::default(),
+        })
     }
 
     /// The process-name source, where this platform has one.
@@ -543,22 +596,72 @@ impl CompositePresence {
 
 impl GamePresence for CompositePresence {
     fn poll(&mut self) -> Result<Vec<Presence>> {
-        let mut snapshot = Vec::new();
+        let mut answers = Vec::new();
         if let Some(process) = &mut self.process {
-            snapshot.extend(
-                process
-                    .poll()
-                    .map_err(|err| anyhow!("reading the process list: {err}"))?,
-            );
+            answers.push(("reading the process list", process.poll()));
         }
         if let Some(live) = &mut self.live {
-            snapshot.extend(
-                live.poll()
-                    .map_err(|err| anyhow!("polling the League Live Client: {err}"))?,
-            );
+            answers.push(("polling the League Live Client", live.poll()));
         }
-        Ok(snapshot)
+        let merged = merge_sources(answers);
+        // Whatever failed, whole or in part, is one line per run of that failure and its end is
+        // one line too, the poller's own discipline.
+        let failure = match &merged {
+            Ok(merged) if merged.failures.is_empty() => None,
+            Ok(merged) => Some(merged.failures.join("; ")),
+            Err(err) => Some(format!("{err}")),
+        };
+        match failure {
+            Some(failure) => {
+                if self.quiet.note(failure.clone()) {
+                    tracing::warn!("game presence could not be fully read: {failure}");
+                }
+            }
+            None => {
+                if let Some(condition) = self.quiet.recovered() {
+                    tracing::info!("game presence is being read normally again ({condition})");
+                }
+            }
+        }
+        merged.map(|merged| merged.presences)
     }
+}
+
+/// What the sources of one poll said, with the failures a partial answer carries.
+#[derive(Debug)]
+struct Merged {
+    presences: Vec<Presence>,
+    failures: Vec<String>,
+}
+
+/// Combine what the sources answered, treating them as independent.
+///
+/// The two sources look at unrelated things (a process list and a loopback service), so one
+/// failing says nothing about the other: a Live Client answering something unreadable must not
+/// throw away the process list that was read fine, or a game recognised by name would stop being
+/// seen whenever League's endpoint misbehaved. A source that failed contributes no
+/// [`Presence`], and a game a snapshot does not mention is not evidence ([`PresenceTracker`]),
+/// so the failed source's titles simply keep their last belief. Only when *every* source
+/// failed is there nothing to report, and that is the `Err` the watcher reads as "could not
+/// look this time". A partial answer still carries its failures, so [`CompositePresence::poll`]
+/// can say so.
+fn merge_sources(answers: Vec<(&str, Result<Vec<Presence>>)>) -> Result<Merged> {
+    let total = answers.len();
+    let mut presences = Vec::new();
+    let mut failures = Vec::new();
+    for (what, answer) in answers {
+        match answer {
+            Ok(found) => presences.extend(found),
+            Err(err) => failures.push(format!("{what}: {err}")),
+        }
+    }
+    if total > 0 && failures.len() == total {
+        bail!("{}", failures.join("; "));
+    }
+    Ok(Merged {
+        presences,
+        failures,
+    })
 }
 
 /// One change in what is running. The directions are variants, not a `bool`, because a start
@@ -1048,9 +1151,9 @@ impl GamesSection {
 /// The titles a fresh configuration watches, and how each is recognised.
 ///
 /// Only League is recognised by Riot's Live Client Data API, the only title here publishing
-/// one. Everything else is recognised by its game executable (present only while the game runs,
+/// one. Everything else is recognised by its game executable (present while the game is open,
 /// never the launcher's), so a process-name match does not fire all evening on a client left
-/// open:
+/// open. It does mean "the game is open", not "a match is being played": menus count:
 ///
 /// | title | executable | signal |
 /// |---|---|---|
@@ -1062,7 +1165,8 @@ impl GamesSection {
 /// | Overwatch 2 | `Overwatch.exe` | process name |
 ///
 /// Valorant is a Riot title with no published local game-state API, so it is watched by the
-/// game process, which exists only while a match runs.
+/// game process, which exists from the moment the game is opened (menus and agent select
+/// included), not only while a match runs.
 pub fn default_watch() -> Vec<WatchedGame> {
     vec![
         WatchedGame::by_live_client_api("League of Legends", "League of Legends.exe"),
@@ -1614,7 +1718,118 @@ mod tests {
         assert_eq!(source.poll().expect("nothing to answer"), Vec::new());
     }
 
+    #[test]
+    fn a_200_is_a_game_only_when_the_body_names_one() {
+        // The small `gamestats` document of a game being played, with a clock and a map.
+        assert!(
+            serves_a_game(br#"{"gameMode":"CLASSIC","gameTime":812.5,"mapName":"Map11"}"#).unwrap()
+        );
+        // During the loading screen the clock is negative, which still names a game.
+        assert!(serves_a_game(br#"{"gameTime":-25.0}"#).unwrap());
+        // `allgamedata` nests the same thing, for an endpoint that serves the whole snapshot.
+        assert!(serves_a_game(br#"{"gameData":{"gameTime":3.0,"mapName":"Map11"}}"#).unwrap());
+
+        // The client between games: all of these were a "running game" when any 200 counted.
+        for empty in [
+            &b"null"[..],
+            b"{}",
+            br#"{"gameTime":0,"mapName":""}"#,
+            br#"{"gameData":{}}"#,
+        ] {
+            assert!(
+                !serves_a_game(empty).unwrap(),
+                "{} is no game",
+                String::from_utf8_lossy(empty)
+            );
+        }
+
+        // Somebody else answering is a failure to look, never "running" and never "stopped".
+        for foreign in [
+            &b"<html>hello</html>"[..],
+            b"[]",
+            b"42",
+            br#"{"gameTime":"soon"}"#,
+        ] {
+            assert!(
+                serves_a_game(foreign).is_err(),
+                "{} is not the Live Client",
+                String::from_utf8_lossy(foreign)
+            );
+        }
+    }
+
+    #[test]
+    fn the_presence_check_asks_for_the_small_document() {
+        let source = LiveClientPresence::new(&default_watch()).expect("a client");
+        assert_eq!(source.endpoint().path(), "/liveclientdata/gamestats");
+        assert_eq!(source.endpoint().addr().port(), 2999);
+        assert!(source.endpoint().is_loopback());
+    }
+
     // ---- the composite -----------------------------------------------------------------
+
+    fn presence(name: &str, exe: &str, running: bool) -> Presence {
+        Presence {
+            game: WatchedGame::by_process(name, exe),
+            running,
+        }
+    }
+
+    #[test]
+    fn a_failing_source_does_not_discard_the_one_that_answered() {
+        // The process list saw a game; the Live Client answered garbage. The game must still be
+        // reported.
+        let merged = merge_sources(vec![
+            (
+                "reading the process list",
+                Ok(vec![presence("Dota 2", "dota2.exe", true)]),
+            ),
+            ("polling the League Live Client", Err(anyhow!("not TLS"))),
+        ])
+        .expect("one source answered, so there is something to report");
+        assert_eq!(merged.presences.len(), 1);
+        assert!(merged.presences[0].running);
+        assert_eq!(merged.failures.len(), 1, "the failure is carried, not lost");
+        assert!(
+            merged.failures[0].contains("not TLS"),
+            "{:?}",
+            merged.failures
+        );
+
+        // And the other way round.
+        let merged = merge_sources(vec![
+            ("reading the process list", Err(anyhow!("snapshot refused"))),
+            (
+                "polling the League Live Client",
+                Ok(vec![presence(
+                    "League of Legends",
+                    "League of Legends.exe",
+                    true,
+                )]),
+            ),
+        ])
+        .expect("the Live Client answered");
+        assert_eq!(merged.presences.len(), 1);
+    }
+
+    #[test]
+    fn only_when_every_source_fails_is_the_poll_an_error() {
+        let err = merge_sources(vec![
+            ("reading the process list", Err(anyhow!("snapshot refused"))),
+            ("polling the League Live Client", Err(anyhow!("not TLS"))),
+        ])
+        .expect_err("nothing answered");
+        let text = format!("{err}");
+        assert!(
+            text.contains("snapshot refused") && text.contains("not TLS"),
+            "{text}"
+        );
+
+        // A source that answers with nothing to say is an answer, not a failure.
+        let merged = merge_sources(vec![("polling the League Live Client", Ok(Vec::new()))])
+            .expect("an empty answer is an answer");
+        assert!(merged.presences.is_empty() && merged.failures.is_empty());
+    }
 
     #[test]
     fn the_composite_partitions_the_watch_list_by_signal() {

@@ -2,14 +2,24 @@
 //!
 //! Poll about once a second, yet do not report "no game" as an error every second:
 //!
-//! * one poll a second, always: a refused loopback connection costs microseconds and makes a
-//!   game's start noticed within a second;
+//! * one poll a second, always, and a game's start is noticed within about that. What a poll
+//!   costs when nothing listens depends on the platform: macOS and Linux refuse a closed
+//!   loopback port at once, but Windows retries the connection and gives up only after about two
+//!   seconds ([`crate::lol::client::CONNECT_TIMEOUT`] is the bound), which surfaces as a
+//!   timeout, not a refusal. Both are the ordinary "no game" answer
+//!   ([`crate::lol::FetchError::is_no_game`]), and on Windows a poll with no game therefore takes
+//!   about two seconds, so the effective period there is the interval plus that, not one second;
 //! * a condition that lasts is logged once, at the level it deserves, and its end is logged
 //!   too. Nothing listening on `127.0.0.1:2999` is [`tracing::debug`], the normal state of a
 //!   machine with no League game (or no League);
 //! * a malformed answer (non-JSON body, an unexpected status) is a [`tracing::warn`], once per
 //!   run, and does not end the game: one bad poll is not evidence the game stopped, so the
 //!   tracker keeps what it knew.
+//!
+//! The same two seconds bound shutdown. [`LolHandle::stop`] waits for a poll in flight, and a
+//! poll can be sitting in that connect, so stopping the poller can take about that long on
+//! Windows when no game is running (a game that is running answers at once). The wait is bounded
+//! by the client's timeouts, never open-ended.
 //!
 //! Derived events are logged as derived (`debug` each, `info` for transitions) and handed to
 //! the sink. The poller does not decide what they are worth: a driver does

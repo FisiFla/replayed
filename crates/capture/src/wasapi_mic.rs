@@ -54,9 +54,18 @@
 //! A removed endpoint (headset unplugged, microphone disabled, USB device yanked) is different: a
 //! live shared-mode capture stream delivers a packet every device period even when nobody is
 //! talking, so a quiet stream has died. `AUDCLNT_E_DEVICE_INVALIDATED` and
-//! `AUDCLNT_E_RESOURCES_INVALIDATED` become an actionable error, and a stream that delivered
-//! nothing for `DEVICE_STALL` is checked against `IMMDevice::GetState` and fails naming the
-//! state. Waiting is bounded by the caller's timeout, so a dead endpoint is not a hot loop.
+//! `AUDCLNT_E_RESOURCES_INVALIDATED` mark the stream lost, and a stream that delivered nothing
+//! for `DEVICE_STALL` is checked against `IMMDevice::GetState` and marked lost when the endpoint
+//! is no longer active. Waiting is bounded by the caller's timeout, so a dead endpoint is not a
+//! hot loop.
+//!
+//! **A lost microphone does not end the recording.** It used to: the error went up through the
+//! pump and the engine failed the whole session, video and game audio included, because someone
+//! unplugged a headset. The stream is now held by the same `RecoveringSource` as the game audio:
+//! the outage is padded with silence on the unbroken timeline, so the voice track stays aligned
+//! with the video, and the endpoint is reopened every `audio_recovery::RETRY_INTERVAL` (the
+//! default communications capture endpoint again, or the configured one). Only the *first* open
+//! is fatal, so a recording that asked for a microphone and never had one is refused at start.
 //!
 //! The Windows half type-checks for `x86_64-pc-windows-msvc` from macOS (`cargo check` does not
 //! link) but has never been executed on Windows: neither endpoint selection, event-callback
@@ -271,6 +280,7 @@ mod wasapi_impl {
     use crate::{clock_base, is_silent_block, AudioBackend, AudioBuffer, ConvertedSilenceWatch};
     // Shared with the loopback backend rather than copied: the same three questions asked of a
     // different endpoint, which keeps the log lines comparable and the published format identical.
+    use crate::audio_recovery::{RecoveringSource, SourceGone, SourceOpener};
     use crate::audio_timeline::{qpc_to_shared, AudioTimeline, PacketInfo, PacketSource};
     use crate::wasapi::{
         check_apartment, native_format, qpc_anchor, requested_format, ApartmentOwner,
@@ -284,7 +294,8 @@ mod wasapi_impl {
         eCapture, eCommunications, IAudioCaptureClient, IAudioClient, IMMDevice,
         IMMDeviceEnumerator, MMDeviceEnumerator, AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY,
         AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR,
-        AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED, AUDCLNT_SHAREMODE_SHARED,
+        AUDCLNT_E_DEVICE_INVALIDATED, AUDCLNT_E_RESOURCES_INVALIDATED,
+        AUDCLNT_E_SERVICE_NOT_RUNNING, AUDCLNT_SHAREMODE_SHARED,
         AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM, AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
         AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY, DEVICE_STATE_ACTIVE,
     };
@@ -297,10 +308,6 @@ mod wasapi_impl {
 
     /// 100-nanosecond units per millisecond, for `IAudioClient::Initialize`.
     const HNS_PER_MS: i64 = 10_000;
-
-    /// Packets drained per `next_buffer` call, so a chatty device cannot spin the drain loop forever.
-    /// Sixteen is 160ms of audio; the next call picks up the rest.
-    const MAX_PACKETS_PER_CALL: usize = 16;
 
     /// How long the stream may deliver nothing before the endpoint's state is checked.
     ///
@@ -333,9 +340,14 @@ mod wasapi_impl {
     pub struct WasapiMicrophone {
         /// The endpoint id to open; empty is the default communications capture endpoint.
         device: String,
-        client: Option<Client>,
-        /// Places packets by device time, like the game-audio track, and slices 10ms blocks.
-        timeline: AudioTimeline,
+        /// The open stream and the timeline it feeds, reopened when the microphone goes away.
+        ///
+        /// The same arrangement as the game audio: the timeline is never reset, so the outage is
+        /// padded with silence like any other gap and the voice track still lines up with the
+        /// video and the game audio when the microphone comes back.
+        source: Option<RecoveringSource<MicOpener>>,
+        /// The stream generation `silence_watch` was armed for.
+        watched_generation: u64,
         /// Whether this thread's COM apartment was taken by us and must be given back.
         com_owned: bool,
         /// The thread that took the apartment, once the backend is started.
@@ -346,15 +358,29 @@ mod wasapi_impl {
         /// Diagnostic for a microphone delivering only silence (see [`ConvertedSilenceWatch`]). Armed
         /// when the endpoint needed engine conversion; it only logs.
         silence_watch: ConvertedSilenceWatch,
-        /// When the endpoint's state was last checked, so a stalled stream asks Windows at most once per [`DEVICE_STALL`].
-        last_state_check: Instant,
     }
 
-    struct Client {
+    /// Opens the microphone stream, for [`RecoveringSource`].
+    ///
+    /// It never changes its mind about which endpoint is wanted: the microphone is the one the
+    /// recording opened, or the default communications endpoint at the moment a reopen is needed
+    /// (an empty `device`). Following a change of the default *while a working stream is open*
+    /// would swap a microphone the user is talking into for another mid-sentence, and the
+    /// microphone never did that before.
+    pub(crate) struct MicOpener {
+        device: String,
+        /// The key of the stream most recently opened, which is what [`SourceOpener::wanted`]
+        /// reports, so the open stream is never judged stale.
+        last_key: String,
+    }
+
+    pub(crate) struct Client {
         audio: IAudioClient,
         capture: IAudioCaptureClient,
         /// Kept because `GetState` tells a stream that stopped delivering from a device that is gone.
         device: IMMDevice,
+        /// The endpoint's id, which is the key [`RecoveringSource`] knows this stream by.
+        endpoint: String,
         event: EventHandle,
         /// Whether the endpoint's native format needed the engine's converter (was not already 48kHz
         /// stereo s16), so the capture loop can decide whether silence is worth blaming on conversion.
@@ -365,6 +391,9 @@ mod wasapi_impl {
         /// When a packet last came out of the engine. Persisted across `next_buffer` calls because the
         /// caller polls in short slices, so a per-call timestamp could never reach [`DEVICE_STALL`].
         last_packet_at: Instant,
+        /// When the endpoint's state was last checked, so a stalled stream asks Windows at most
+        /// once per [`DEVICE_STALL`].
+        last_state_check: Instant,
     }
 
     // SAFETY: the backend is used from one thread at a time: the one that called `start`, which is
@@ -406,14 +435,13 @@ mod wasapi_impl {
         pub fn new(device: &str) -> Result<Self> {
             Ok(Self {
                 device: device.to_owned(),
-                client: None,
-                timeline: AudioTimeline::new(TARGET, Duration::ZERO),
+                source: None,
+                watched_generation: 0,
                 com_owned: false,
                 // Set by `start`, on the thread that opens the backend.
                 apartment: None,
                 // Disarmed until `start` learns whether the endpoint needed conversion.
                 silence_watch: ConvertedSilenceWatch::new(false),
-                last_state_check: Instant::now(),
             })
         }
 
@@ -446,7 +474,7 @@ mod wasapi_impl {
 
     impl AudioBackend for WasapiMicrophone {
         fn start(&mut self) -> Result<()> {
-            if self.client.is_some() {
+            if self.source.is_some() {
                 bail!("WASAPI microphone capture is already started");
             }
             // The attempt, before it is made.
@@ -471,13 +499,19 @@ mod wasapi_impl {
             // backend is opened, read from and stopped on one thread, and this is the record of
             // which one.
             self.apartment = Some(ApartmentOwner::here());
-            match open_client(&self.device) {
-                Ok(client) => {
-                    self.timeline = AudioTimeline::new(TARGET, client.anchor);
-                    // A fresh session gets a fresh watch, armed only if the endpoint needed the engine's converter.
-                    self.silence_watch = ConvertedSilenceWatch::new(client.converting);
-                    self.last_state_check = Instant::now();
-                    self.client = Some(client);
+            // Frame 0 is the moment capture began, as for the game audio, so a microphone that
+            // opens a little late starts its track alongside the video and the gap is silence.
+            let now = clock_base().elapsed();
+            let opener = MicOpener {
+                device: self.device.clone(),
+                last_key: String::new(),
+            };
+            // Failing to open the first stream is fatal, unlike every later loss: a recording
+            // that asked for a microphone and never had one should say so at start.
+            match RecoveringSource::start(opener, AudioTimeline::new(TARGET, now), now) {
+                Ok(source) => {
+                    self.source = Some(source);
+                    self.watched_generation = 0;
                     Ok(())
                 }
                 Err(e) => {
@@ -501,13 +535,12 @@ mod wasapi_impl {
                 "WASAPI microphone capture",
             )?;
             let Self {
-                client,
-                timeline,
+                source,
                 silence_watch,
-                last_state_check,
+                watched_generation,
                 ..
             } = self;
-            let client = client
+            let source = source
                 .as_mut()
                 .context("WASAPI microphone capture is not started")?;
             let deadline = Instant::now() + timeout;
@@ -515,11 +548,21 @@ mod wasapi_impl {
             loop {
                 // Take everything the engine has already handed us, placed by its device timestamps so a
                 // glitch that loses samples leaves silence rather than pulling the rest of the track early.
-                if timeline.drain(client, MAX_PACKETS_PER_CALL)? {
-                    timeline.fill_to(clock_base().elapsed());
+                //
+                // A microphone that goes away is not an error here: the stream is reopened on the
+                // default communications endpoint every `RETRY_INTERVAL` and the outage is silence on
+                // the timeline. Unplugging a headset must not end a recording that is still capturing
+                // video and the game's audio. Only an error that is not a lost endpoint comes back.
+                source.poll(clock_base().elapsed())?;
+                if let Some(client) = source.stream() {
+                    if source.generation() != *watched_generation {
+                        // Each endpoint gets its own watch, armed only if it needs the engine's converter.
+                        *watched_generation = source.generation();
+                        *silence_watch = ConvertedSilenceWatch::new(client.converting);
+                    }
                 }
 
-                if let Some(block) = timeline.next_block() {
+                if let Some(block) = source.next_block() {
                     let buffer = block.buffer;
                     let block_duration = Duration::from_micros(
                         buffer.frames as u64 * 1_000_000 / u64::from(TARGET.sample_rate),
@@ -552,26 +595,20 @@ mod wasapi_impl {
                     return Ok(Some(buffer));
                 }
 
-                // Nothing has arrived for a while. A live capture endpoint cannot be silent at the API level (a
-                // muted microphone is packets flagged silent, not an absence of packets), so ask Windows whether
-                // the device is still there. This is the unplugged-headset path and must be neither an endless
-                // wait nor a hot loop.
-                //
-                // Checked here, ahead of the deadline, not after the wait below: the recorder drains this
-                // backend with a zero timeout (`pump_once_counted`), which returns before reaching the wait, so a
-                // check placed there would never run in the real capture loop. Throttled to one `GetState` per
-                // [`DEVICE_STALL`], so checking on every poll costs nothing.
-                let since_packet = client.last_packet_at.elapsed();
-                if since_packet >= DEVICE_STALL && last_state_check.elapsed() >= DEVICE_STALL {
-                    *last_state_check = Instant::now();
-                    check_endpoint_alive(client, since_packet)?;
-                }
-
+                // A stream that has gone quiet is checked against the endpoint's state inside the
+                // packet source (`Client::pull`), ahead of the deadline: the recorder drains this
+                // backend with a zero timeout (`pump_once_counted`), which returns before reaching
+                // the wait below, so a check placed there would never run in the real capture loop.
                 let now = Instant::now();
                 if now >= deadline {
                     // A partial block stays buffered until it is complete.
                     return Ok(None);
                 }
+                let Some(client) = source.stream() else {
+                    // No stream to wait on while the microphone is being reopened; silence is padded meanwhile.
+                    std::thread::sleep((deadline - now).min(Duration::from_millis(10)));
+                    continue;
+                };
                 // The engine signals this event once per device period, so waiting on it beats sleeping a fixed slice.
                 let wait_ms = (deadline - now).as_millis().clamp(1, 200) as u32;
                 // SAFETY: `client.event` is a live auto-reset event owned by `self`.
@@ -587,8 +624,7 @@ mod wasapi_impl {
 
         fn stop(&mut self) -> Result<()> {
             // Dropping the client stops the stream and closes the event handle.
-            self.client = None;
-            self.timeline = AudioTimeline::new(TARGET, Duration::ZERO);
+            self.source = None;
             self.release_com();
             Ok(())
         }
@@ -597,8 +633,32 @@ mod wasapi_impl {
     impl Drop for WasapiMicrophone {
         fn drop(&mut self) {
             // A backend dropped without `stop` must still release the endpoint and the COM apartment it took.
-            self.client = None;
+            self.source = None;
             self.release_com();
+        }
+    }
+
+    impl SourceOpener for MicOpener {
+        type Stream = Client;
+
+        fn open(&mut self) -> Result<(Client, String)> {
+            // The attempt, before it is made: an open that hangs or fails is otherwise a silence
+            // with nothing in the log, and a reopen is the case where that silence is audible.
+            tracing::debug!(
+                endpoint = if self.device.is_empty() {
+                    "the default communications capture endpoint"
+                } else {
+                    self.device.as_str()
+                },
+                "opening the microphone stream"
+            );
+            let client = open_client(&self.device)?;
+            self.last_key.clone_from(&client.endpoint);
+            Ok((client, self.last_key.clone()))
+        }
+
+        fn wanted(&mut self) -> Result<String> {
+            Ok(self.last_key.clone())
         }
     }
 
@@ -720,7 +780,13 @@ mod wasapi_impl {
         tracing::info!(
             endpoint = endpoint,
             endpoint_data_flow = "eCapture",
-            endpoint_role = "eCommunications",
+            // The role only chose the device when none was configured; a configured one is
+            // opened by its id.
+            chosen_by = if wanted.is_empty() {
+                "the default communications role"
+            } else {
+                "its id in [mic] device"
+            },
             native_sample_rate = native.sample_rate,
             native_channels = native.channels,
             native_sample_format = ?native.encoding,
@@ -729,38 +795,40 @@ mod wasapi_impl {
             requested_sample_format = "s16",
             converting = native.needs_conversion(),
             engine_upmixes_mono_to_stereo = native.channels == 1,
-            "WASAPI microphone capture started on the default communications capture endpoint"
+            "WASAPI microphone capture started"
         );
         Ok(Client {
             audio,
             capture,
             device,
+            endpoint,
             event,
             converting: native.needs_conversion(),
             anchor_hns,
             anchor,
             last_packet_at: Instant::now(),
+            last_state_check: Instant::now(),
         })
     }
 
-    /// Fail cleanly if the endpoint behind a stalled stream has gone away.
+    /// Report a stream whose endpoint has gone away as [`SourceGone`], so it is reopened.
     ///
     /// Consulted only when the stream has already gone quiet. A still-active device is not an error
     /// however quiet the room ([`ConvertedSilenceWatch`] only warns about that); an inactive one can
-    /// never deliver another packet, so saying so beats waiting forever.
+    /// never deliver another packet on this stream, so the stream is given up and a new one opened
+    /// when the endpoint is back.
     fn check_endpoint_alive(client: &Client, since_packet: Duration) -> Result<()> {
         // SAFETY: the device is alive for at least as long as `client`, which outlives this call.
         let state =
             unsafe { client.device.GetState() }.map_err(wasapi_call("IMMDevice::GetState"))?;
         if state.0 & DEVICE_STATE_ACTIVE.0 == 0 {
-            bail!(
+            return Err(SourceGone(format!(
                 "the microphone endpoint has delivered no packet for {:.1}s and is no longer \
-                 active (DEVICE_STATE {:#x}): it was unplugged, disabled or removed, and a WASAPI \
-                 capture stream does not recover from that. Stop the recording and check the \
-                 microphone in Settings > System > Sound > Input",
+                 active (DEVICE_STATE {:#x}): it was unplugged, disabled or removed",
                 since_packet.as_secs_f64(),
                 state.0
-            );
+            ))
+            .into());
         }
         Ok(())
     }
@@ -768,23 +836,32 @@ mod wasapi_impl {
     /// Whether an HRESULT means the endpoint behind this stream is gone.
     ///
     /// `AUDCLNT_E_DEVICE_INVALIDATED` is the reply for a device removed or disabled while streaming;
-    /// `AUDCLNT_E_RESOURCES_INVALIDATED` is its sibling for held resources. Both are permanent for the stream.
+    /// `AUDCLNT_E_RESOURCES_INVALIDATED` is its sibling for held resources, and
+    /// `AUDCLNT_E_SERVICE_NOT_RUNNING` is the audio service restarting. All are permanent for the
+    /// stream and recoverable by opening a new one.
     fn is_endpoint_gone(e: &windows::core::Error) -> bool {
-        e.code() == AUDCLNT_E_DEVICE_INVALIDATED || e.code() == AUDCLNT_E_RESOURCES_INVALIDATED
+        [
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            AUDCLNT_E_RESOURCES_INVALIDATED,
+            AUDCLNT_E_SERVICE_NOT_RUNNING,
+        ]
+        .contains(&e.code())
     }
 
-    /// Context for a WASAPI call, with the unplugged-microphone case spelled out.
+    /// Context for a WASAPI call, with the unplugged-microphone case spelled out and marked as
+    /// [`SourceGone`] so the stream is reopened instead of the recording failing.
     ///
     /// The same HRESULT comes back for a yanked device and for everything else, and reads as a bare
     /// `0x88890004` in a log; a user with a disconnected headset can act on a sentence, not a number.
     fn wasapi_call(what: &'static str) -> impl FnOnce(windows::core::Error) -> anyhow::Error {
         move |e| {
             if is_endpoint_gone(&e) {
-                anyhow::anyhow!(
+                SourceGone(format!(
                     "{what}: the microphone endpoint was removed, unplugged or disabled \
-                     (HRESULT {:#010x}); this capture stream cannot recover",
+                     (HRESULT {:#010x})",
                     e.code().0
-                )
+                ))
+                .into()
             } else {
                 anyhow::Error::new(e).context(what)
             }
@@ -799,6 +876,16 @@ mod wasapi_impl {
             let available = unsafe { self.capture.GetNextPacketSize() }
                 .map_err(wasapi_call("IAudioCaptureClient::GetNextPacketSize"))?;
             if available == 0 {
+                // Nothing has arrived for a while. A live capture endpoint cannot be silent at the API level (a
+                // muted microphone is packets flagged silent, not an absence of packets), so ask Windows whether
+                // the device is still there. This is the unplugged-headset path and must be neither an endless
+                // wait nor a hot loop: it is throttled to one `GetState` per [`DEVICE_STALL`], so asking on
+                // every poll costs nothing. A gone endpoint comes back as `SourceGone` and is reopened.
+                let since_packet = self.last_packet_at.elapsed();
+                if since_packet >= DEVICE_STALL && self.last_state_check.elapsed() >= DEVICE_STALL {
+                    self.last_state_check = Instant::now();
+                    check_endpoint_alive(self, since_packet)?;
+                }
                 return Ok(None);
             }
 
@@ -871,6 +958,37 @@ mod wasapi_impl {
         let packet = unsafe { std::slice::from_raw_parts(data, byte_len) };
         out.extend_from_slice(packet);
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use windows::Win32::Foundation::E_FAIL;
+
+        #[test]
+        fn a_removed_microphone_is_a_lost_source_so_the_recording_survives_it() {
+            // `RecoveringSource` reopens on `SourceGone` and fails the recording on anything else, so
+            // this mapping is what decides whether unplugging a headset ends the session.
+            for code in [
+                AUDCLNT_E_DEVICE_INVALIDATED,
+                AUDCLNT_E_RESOURCES_INVALIDATED,
+                AUDCLNT_E_SERVICE_NOT_RUNNING,
+            ] {
+                let err = wasapi_call("IAudioCaptureClient::GetBuffer")(code.into());
+                assert!(
+                    err.downcast_ref::<SourceGone>().is_some(),
+                    "{code:?} must be a lost source, got: {err:#}"
+                );
+            }
+        }
+
+        #[test]
+        fn another_failure_is_still_an_error_that_ends_the_recording() {
+            // Only a lost endpoint is recoverable. A failure with no known remedy is not hidden
+            // behind a silent track: it comes back as an error.
+            let err = wasapi_call("IAudioCaptureClient::GetBuffer")(E_FAIL.into());
+            assert!(err.downcast_ref::<SourceGone>().is_none(), "got: {err:#}");
+        }
     }
 }
 

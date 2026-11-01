@@ -42,7 +42,7 @@ impl GameSnapshot {
     /// loading screen and counts up from there). An empty document, as a client between games has
     /// been seen to send, fails both and reads as "no game", not as a game with no data.
     pub fn game_present(&self) -> bool {
-        !self.game_data.map_name.trim().is_empty() || self.game_data.game_time != 0.0
+        self.game_data.is_present()
     }
 
     /// The document's own event stream, oldest first as the client writes it.
@@ -121,6 +121,15 @@ pub struct GameData {
     pub map_terrain: String,
 }
 
+impl GameData {
+    /// Whether this names a game: a map, or a clock that is not zero. The one definition both the
+    /// poller's tracker and the presence check use, so the two cannot disagree about what "a game
+    /// is being played" means.
+    pub fn is_present(&self) -> bool {
+        !self.map_name.trim().is_empty() || self.game_time != 0.0
+    }
+}
+
 /// `events` — the game's own event log. The key really is capitalised in the payload.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
@@ -155,6 +164,12 @@ pub struct StreamEvent {
     pub stolen: Option<String>,
     #[serde(rename = "KillStreak")]
     pub kill_streak: Option<i64>,
+    /// `FirstBlood` only: who drew it (`Recipient`).
+    #[serde(rename = "Recipient")]
+    pub recipient: Option<String>,
+    /// `Ace` only: who finished the enemy team (`Acer`).
+    #[serde(rename = "Acer")]
+    pub acer: Option<String>,
     #[serde(rename = "TurretKilled")]
     pub turret_killed: Option<String>,
     #[serde(rename = "InhibKilled")]

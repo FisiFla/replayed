@@ -5,6 +5,15 @@
 #   %LOCALAPPDATA%\replayed\config.toml
 #
 # replayed never reads configuration from environment variables.
+#
+# Two programs read this one file: the desktop app and `replayed-cli`. They do not read all of
+# it. Keys only one of them reads are marked "CLI only" or "desktop only" where they appear. The
+# CLI refuses to start without `[buffer]`, `[encode]`, `[audio]`, `[storage]`, `[hotkeys]` and
+# `[events]`; the desktop app falls back to the values shown here for what it finds missing.
+#
+# A value the engine cannot honour is refused with the key named, not clamped or guessed at: a
+# zero for `segment_time`, `post_seconds`, `fps` or a retention limit, a `ram_cap_bytes` below
+# 8 MiB, `vendor = "software"`, and an `[events] gsi_port` below 1024 (other than 0).
 
 # The version of this file's layout. Written by the app; leave it alone. A file without it
 # is read as version 1. A file declaring a version newer than the app understands is refused
@@ -14,7 +23,7 @@ schema_version = 1
 [recorder]
 # What a recording is:
 #
-#   "buffer"  — the rolling replay buffer. A bounded scratch ring holds the last
+#   "buffer"  — the rolling replay buffer. A bounded in-memory ring holds the last
 #               seconds of play, and the hotkey (or a game event) splices a clip out
 #               of it. Default, and what every build before Phase 5 did.
 #
@@ -29,7 +38,9 @@ schema_version = 1
 # Either way a `sessions` row is opened when recording starts and closed when it
 # stops, and the hotkey still takes an instant clip from the same footage.
 #
-# The CLI can override this per run with `--mode session` (or `--mode buffer`).
+# CLI only. The CLI can override this per run with `--mode session` (or `--mode buffer`). The
+# desktop app ignores this key and records the replay buffer; of the `[recorder]` section it reads
+# only `save_session` below.
 mode = "buffer"
 # In "buffer" mode, also write the whole recording to a session file while the replay
 # buffer keeps serving clips, from the same single encode (no extra GPU or CPU). The file
@@ -48,11 +59,19 @@ post_seconds = 5
 # ring; a request above them is clamped, never an error.
 max_pre_seconds = 0
 max_post_seconds = 0
-# Seconds per scratch segment. This also sets the keyframe interval, and
+# Seconds per segment. This also sets the keyframe interval, and
 # therefore the granularity of lossless trimming (cuts snap to <= this value).
-# Lower = more precise cuts, higher = larger files.
+# Lower = more precise cuts, higher = larger files. At least 1 (0 is refused). The window
+# lengths above and this one are capped at 86400 (a day).
 segment_time = 1
 # Empty = %LOCALAPPDATA%\replayed\scratch
+#
+# The shared scratch folder. In "buffer" mode the replay buffer is held in RAM
+# (`ram_cap_bytes`) and writes no segment files, so nothing is written here for it. A full
+# session (and `save_session`) writes its segments into a folder of its own,
+# `session-<timestamp>`, under `[storage.sessions] sessions_dir`, never into this one.
+# Retention never deletes this folder or what is in it, so it is safe to point somewhere that
+# holds other files, but it is also not cleaned up for you.
 scratch_dir = ""
 # How much memory a replay buffer may use for the footage it has not been asked to keep,
 # in bytes. Default: 256 MiB.
@@ -62,6 +81,7 @@ scratch_dir = ""
 # more than that budget can hold. The oldest footage is dropped first, so a buffer that
 # hits this ceiling keeps serving clips - just shorter ones, and it says so in the log
 # rather than quietly returning less than was asked for.
+# Below 8 MiB is refused; above 64 GiB is clamped to 64 GiB.
 ram_cap_bytes = 268435456
 
 [capture]
@@ -92,8 +112,10 @@ vendor = "auto"
 codec = "h264"
 # Also settable as a quality preset in the app: low 8000, balanced 20000, high 40000.
 # Held as a constant bitrate (CBR) where the encoder obeys it; see docs/verification-status.md section 19.
+# The settings panel refuses a value above 250000 (250 Mbit/s); the file itself is not bounded.
 bitrate_kbps = 20000
-# The frame rate asked for — a ceiling, not a promise. See adapt_fps below.
+# The frame rate asked for — a ceiling, not a promise. See adapt_fps below. At least 1 (0 is
+# refused); the settings panel offers 1 to 240.
 fps = 60
 # Measure what this machine can actually sustain at the capture resolution and
 # record at the lower of that and `fps` (default: true).
@@ -126,6 +148,19 @@ adapt_fps = true
 # This is also the single biggest lever on the sustainable rate: at 4K a frame is
 # 33 MB, at 1080p it is 8 MB.
 output_size = ""
+# How the encoder spends its bitrate: "cbr" (hold the rate), "vbr" (aim near it; the peak may
+# rise to 150% of it) or "quality" (the encoder's own constant quality, so file size follows
+# the picture and `bitrate_kbps` is not a target). Default "cbr". The zero-copy path (below)
+# offers "cbr" and "vbr" only.
+#
+# rate_control = "cbr"
+#
+# The encoder's own preset, passed to ffmpeg's `-preset`. Empty = the encoder's default.
+# NVENC takes p1..p7, QSV veryfast..veryslow, AMF speed/balanced/quality. A preset that does
+# not belong to the encoder that was picked is dropped with a warning, not passed on. The
+# zero-copy path has no preset and ignores this.
+#
+# preset = ""
 
 # Hand captured frames to the hardware encoder as GPU textures, so their pixels never
 # reach this process's memory. Default: false.
@@ -151,6 +186,12 @@ output_size = ""
 # Setting it changes that. `true` *requires* the hardware path and refuses to start
 # without it; `false` turns it off everywhere.
 #
+# The hardware path only uses an encoder on the GPU the captured display is on: a texture
+# cannot be handed to another GPU's encoder, and frames are never copied between GPUs. On a
+# machine with two (an NVIDIA card and an Intel iGPU, say), `vendor = "qsv"` while the game's
+# display is on the NVIDIA card records through ffmpeg's `h264_qsv` on the ordinary path
+# when this is unset, and refuses to start, naming the GPU, when it is `true`.
+#
 # Measured on the 4K Windows test machine it was built for: 4.0% of one core against 88.9% on the readback
 # path, 59.6 fps of 60 against 55.5, and no dropped frames against 8. See
 # docs/verification-status.md (§15).
@@ -158,6 +199,9 @@ output_size = ""
 # zero_copy = true
 
 [audio]
+# CLI only: the desktop app does not read this key and always records the game audio (it reads
+# `bitrate_kbps` below, nothing else here).
+#
 # Whether the game-audio track is recorded. `false` is a **video-only recording**: the encoder
 # is given no audio input at all, no loopback listener is bound and the container carries no
 # audio stream. Smaller files and one fewer capture session, for footage whose sound is
@@ -179,14 +223,23 @@ codec = "aac"
 # The game-audio track's bitrate, in kbps. **This key is honoured**: it reaches ffmpeg's
 # `-b:a`, so the file records what this says — and it is unused when `enabled = false`, which
 # encodes no audio at all. 192 is what every build without a readable key has recorded.
+# The settings panel refuses a value above 512.
 bitrate_kbps = 192
 
 [storage]
 # Empty = %LOCALAPPDATA%\replayed\clips
+#
+# Changing this while a recording is running takes effect for the recorder only after it
+# restarts; the settings panel says so. The window may only read a clips folder you picked
+# in its folder picker (or that this file already named at start-up), and once the window has
+# stopped reading a folder it cannot be pointed back at it until replayed restarts.
 clips_dir = ""
-# Default: 50 GiB. Favourited clips are exempt from this cap.
+# Default: 50 GiB. Favourited clips count toward the total but are never deleted to meet it.
+# Must be greater than 0: a zero cap is exceeded by every file, so it is refused (the
+# recording will not start) rather than deleting every clip that is not a favourite.
 max_total_bytes = 53687091200
-# Favourited clips are exempt from this limit.
+# Clips older than this many days are deleted; favourited clips are exempt. Must be at least
+# 1: 0 is refused for the same reason as above.
 max_age_days = 7
 
 # --- The session store (Phase 5) -----------------------------------------------
@@ -200,7 +253,14 @@ max_age_days = 7
 # unsatisfiable cap rather than paid for out of the finished sessions beside it.
 #
 # Defaults: 200 GiB and 7 days. A 4K session is roughly 9 GB an hour at the example
-# bitrate, so raise the cap if you record long sessions at 4K.
+# bitrate, so raise the cap if you record long sessions at 4K. As above, 0 is refused for
+# both numbers.
+#
+# Automatic cleanup only ever deletes inside `clips_dir` and `sessions_dir` (a clip's file
+# inside the first, a session's file and its `session-<n>` folder inside the second); an empty
+# `sessions_dir` means `<app data>/sessions`. If you
+# move either folder, the index rows written under the old one are no longer cleaned up
+# automatically. A `%` in either path is fine.
 [storage.sessions]
 # Empty = %LOCALAPPDATA%\replayed\sessions
 sessions_dir = ""
@@ -214,12 +274,15 @@ max_age_days = 7
 # surprise. With this off, the encoder is invoked exactly as it was before the feature
 # existed (one audio input, no second track).
 #
-# With it on, every clip and every session file carries TWO audio tracks — the game
-# audio first, the microphone second — and the microphone is the default
+# With it on, every session file carries TWO audio tracks — the game audio first, the
+# microphone second — and every clip THREE: a "Game + Mic" mix first, for the players that
+# play only a file's first audio track, then those two as recorded. The microphone is the default
 # *communications* capture endpoint (the device Windows assigns to voice chat) unless
 # `device` below names another. On Windows this needs a capture device; if it cannot be
 # started, the recording fails at start rather than producing a video with a silent
-# voice track.
+# voice track. Once a recording is running, losing the microphone (a headset unplugged) does
+# not end it: the gap is filled with silence, so the voice stays in step with the video, and
+# the microphone is reopened when the device comes back.
 #
 # Turning this on with `[audio] enabled = false` is refused at start, naming both keys:
 # the container's first audio track is named "Game Audio", so a video-only recording
@@ -241,10 +304,12 @@ device = ""
 # for. (The game-audio path still enumerates the process list, once, to find the
 # watched game's process id for the per-application capture; that is a different
 # feature and it does not run a watcher.) League of Legends is detected through Riot's own
-# Live Client Data API (a read-only GET to 127.0.0.1:2999, which only answers during
-# a real match); every other title by comparing process names in a snapshot — the
-# same enumeration Task Manager does, with nothing opened, read or injected, and no
-# handle held between polls. Nothing is ever sent anywhere but loopback.
+# Live Client Data API (a read-only GET of /liveclientdata/gamestats on 127.0.0.1:2999, which
+# only answers during a real match, and whose answer has to describe a game); every other title
+# by comparing process names in a snapshot — the same enumeration Task Manager does, with
+# nothing opened, read or injected, and no handle held between polls. A process-name match
+# means the game's executable is running, which is taken as the game being open: it cannot tell
+# a match from the main menu. Nothing is ever sent anywhere but loopback.
 #
 # `poll_ms` is how often to look; it is clamped to 250..30000. A change is believed
 # after two consecutive polls, so one flickering snapshot cannot start or end a
@@ -265,13 +330,19 @@ auto_record = false
 poll_ms = 2500
 
 [hotkeys]
+# A chord is any of the modifiers Ctrl, Alt and Shift plus one key, joined by "+": F1..F24,
+# one letter or one digit. A letter or a digit must carry Ctrl or Alt: the chord is claimed
+# system-wide, so a bare "K" would stop you typing K anywhere, and Shift+K still types a
+# capital K. A function key may stand alone or with Shift. Holding the chord counts as one
+# press, and presses closer together than 300 ms count as one.
 clip = "Ctrl+F8"
 # Desktop app only, off unless uncommented. Each must be a chord nothing else holds:
 #   toggle_recording = "Ctrl+F9"   # start / stop the recording
 #   bookmark = "Ctrl+F10"          # a marker on the session timeline, no clip
 #   screenshot = "Ctrl+F7"         # one frame of the display → a PNG in the library
 # Only these three are read in this build. Anything else here is ignored, because the
-# config structs do not deny unknown fields.
+# config structs do not deny unknown fields. The CLI accepts these keys too, so one file
+# serves both, but only the desktop app acts on them.
 
 [app]
 # Start replayed with Windows (the desktop app; the CLI is never autostarted).
@@ -282,11 +353,12 @@ clip = "Ctrl+F8"
 # `false` = that value is removed, if this app put it there. Nothing else in the Run key is
 #           ever touched: the value name is replayed's own.
 #
-# The file is the only switch **for this key**: the settings panel edits the clips
-# directory, the capture rate, the resolution, the microphone and auto-record, and
-# deliberately not this — and an autostart entry that disagreed with the file would be a
-# second, invisible source of truth. It is applied at startup, so a change needs a restart.
-# Windows only — off Windows the app says so and does nothing.
+# The file is the only switch **for this key**: Settings > Startup writes it, and applying
+# the checkbox also asks Windows for the entry at once, but the next launch re-syncs the
+# entry from the file either way, so an entry that disagreed with the file would not survive.
+# The entry's command line carries `--background`, so a launch by the login hides the window
+# and leaves the tray icon and the hotkey; launching the app by hand shows the window.
+# Windows only — off Windows the setting is saved and nothing is registered.
 start_with_system = false
 
 [events]
@@ -305,8 +377,9 @@ start_with_system = false
 lol_poll_enabled = true
 
 # --- CS2 / Dota 2 (Valve Game State Integration) ------------------------------------
-# The port the GSI listener binds on 127.0.0.1. Set it to 0 (or omit it) to leave the
-# listener off; it never binds anything but loopback.
+# The port the GSI listener binds on 127.0.0.1. Set it to 0 to leave the listener off; it
+# never binds anything but loopback. Omitting the key does NOT turn it off: an omitted
+# gsi_port is 45671, so the listener is on. A non-zero value must be 1024 to 65535.
 #
 # The listener requires a token, which arrives inside the game's POST body (in the payload's
 # "auth" object — that is how Valve's "auth" block works; GSI sends no Authorization
@@ -320,7 +393,14 @@ lol_poll_enabled = true
 #   .../dota 2 beta/game/dota/cfg/gamestate_integration/
 # and restart the game. A payload whose token does not match is answered HTTP 403 and
 # ignored; the token itself is never logged. Delete the gsi-token-<game>.txt file to rotate
-# that game's token (the generated cfg file must then be replaced too).
+# that game's token (the generated cfg file must then be replaced too). The desktop app
+# does the copy for you when it finds a gamestate_integration_replayed.cfg already in a Steam
+# library's game folder as a recording starts (and rewrites an out-of-date one); with the CLI,
+# or a game outside a Steam library it found, copy the file yourself. A token from before
+# per-game tokens (gsi-token.txt) is not reused: install the cfg again.
+#
+# Requests that carry a browser's Sec-Fetch-* headers are refused with 403: the game never
+# sends them, a web page always does.
 #
 # Each game has its own token and its own path, and the listener refuses a payload whose
 # provider app id is not that game's, so a token lifted from one game's installed cfg

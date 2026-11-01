@@ -181,6 +181,43 @@ fn toml_string_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
 // Download and hashing
 // ---------------------------------------------------------------------------------------
 
+/// Largest archive a download may be, in bytes. The biggest sidecar archive is ~120 MB; this is
+/// a ceiling against a redirect to something absurd, not a tight fit.
+const MAX_DOWNLOAD_BYTES: &str = "536870912"; // 512 MiB
+
+/// How long one download attempt may take, in seconds, so a stalled CDN fails a CI job in
+/// minutes and not at the job's own timeout.
+const MAX_DOWNLOAD_SECONDS: &str = "1200";
+
+/// The transport flags every download uses (everything but the output file and the URL).
+///
+/// `validate_url` insists on `https` for the URL it is given, but `--location` follows redirects,
+/// and curl follows one to **any** protocol unless told otherwise: a misconfigured host or CDN
+/// could send the download to `http://`, or to something enormous. `--proto =https` and
+/// `--proto-redir =https` refuse the downgrade at the transport (curl says "protocol not
+/// supported" and fails, instead of the hash rejecting the content after the fact); TLS 1.2 is the
+/// floor; the timeouts and the size cap bound a hang or a disk fill. `--max-filesize` is only
+/// enforced when the server states a length, which is why the hash check stays the real pin.
+const CURL_ARGS: &[&str] = &[
+    "--fail",
+    "--location",
+    "--silent",
+    "--show-error",
+    "--retry",
+    "3",
+    "--proto",
+    "=https",
+    "--proto-redir",
+    "=https",
+    "--tlsv1.2",
+    "--connect-timeout",
+    "30",
+    "--max-time",
+    MAX_DOWNLOAD_SECONDS,
+    "--max-filesize",
+    MAX_DOWNLOAD_BYTES,
+];
+
 /// Download `url` to `dest` with `curl`.
 ///
 /// `curl` rather than an HTTP crate: an HTTP client with TLS would add a certificate stack and
@@ -193,15 +230,8 @@ pub fn download(url: &str, dest: &Path) -> Result<()> {
             .with_context(|| format!("creating {}", parent.display()))?;
     }
     let out = Command::new("curl")
-        .args([
-            "--fail",
-            "--location",
-            "--silent",
-            "--show-error",
-            "--retry",
-            "3",
-            "--output",
-        ])
+        .args(CURL_ARGS)
+        .arg("--output")
         .arg(dest)
         .arg(url)
         .output()
@@ -904,6 +934,40 @@ fn first_line_of_version(bin: &Path) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The value that follows `flag` in curl's argument list.
+    fn curl_value(flag: &str) -> Option<&'static str> {
+        let at = CURL_ARGS.iter().position(|a| *a == flag)?;
+        CURL_ARGS.get(at + 1).copied()
+    }
+
+    #[test]
+    fn a_download_refuses_a_redirect_to_anything_but_https() {
+        // `--location` alone follows a redirect to http (or ftp, or anything curl speaks).
+        assert_eq!(curl_value("--proto"), Some("=https"));
+        assert_eq!(curl_value("--proto-redir"), Some("=https"));
+        assert!(
+            CURL_ARGS.contains(&"--location"),
+            "redirects are still followed"
+        );
+        assert!(CURL_ARGS.contains(&"--tlsv1.2"), "TLS 1.2 is the floor");
+    }
+
+    #[test]
+    fn a_download_is_bounded_in_time_and_size() {
+        let seconds: u64 = curl_value("--max-time").unwrap().parse().unwrap();
+        let connect: u64 = curl_value("--connect-timeout").unwrap().parse().unwrap();
+        let bytes: u64 = curl_value("--max-filesize").unwrap().parse().unwrap();
+        assert!(
+            connect <= 60 && seconds <= 3600,
+            "a stalled CDN must fail in bounded time"
+        );
+        assert!(
+            bytes >= 200 * 1024 * 1024,
+            "the real archive (~120 MB) must still fit"
+        );
+        assert!(bytes <= 1024 * 1024 * 1024, "and a runaway one must not");
+    }
+
     use super::*;
     use std::fs;
     use tempfile::TempDir;

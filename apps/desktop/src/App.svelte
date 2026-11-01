@@ -54,6 +54,7 @@
     reconcile,
   } from './lib/nav';
   import type { RailView, View } from './lib/nav';
+  import { startPolling } from './lib/poll';
   import { describeRecordedClip } from './lib/recording';
   import { describeSettingsUpdate } from './lib/settings';
   import {
@@ -87,7 +88,12 @@
    */
   const RECORDING_POLL_MS = 500;
 
-  /** The health page reads the log's tail and the disk, so it is polled far less often. */
+  /**
+   * The health page reads the log's tail and the disk, so it is polled far less often.
+   *
+   * Neither poll stacks: `startPolling` does not start a read while the last one is still in
+   * flight, so a command that stalls costs one pending call and not one per tick.
+   */
   const HEALTH_POLL_MS = 5000;
 
   interface Props {
@@ -136,6 +142,11 @@
    * library until the next event.
    */
   let refreshSeq = 0;
+  /**
+   * Counts the reads of a session's markers, for the same reason as `refreshSeq`: click one
+   * session and then another, and the first one's answer can land after the second's.
+   */
+  let sessionSeq = 0;
 
   /** Clip ids ticked for combining, in the order they were ticked. */
   let combineIds = $state<number[]>([]);
@@ -167,6 +178,9 @@
       // A clip removed by the storage policy leaves its cached thumbnail behind; the map is
       // pruned against the clips that are still listed, so it cannot grow without bound.
       thumbnails = pruneThumbnails(thumbnails, clips.map((clip) => clip.id));
+      for (const id of thumbnailFailures) {
+        if (!clips.some((clip) => clip.id === id)) thumbnailFailures.delete(id);
+      }
       stats = storage;
       sessions = toSessionViews(sessionRows);
       // An open clip or session that is no longer listed was deleted — here or by a retention
@@ -190,16 +204,56 @@
   }
 
   /**
+   * The clips whose thumbnail could not be made, so that a corrupt or moved file is tried once
+   * and not again on every refresh. Without it, one bad clip costs an ffmpeg run and a notice
+   * each time a hotkey clip is saved.
+   */
+  const thumbnailFailures = new Set<number>();
+  /** The thumbnail run in progress, if one is. */
+  let thumbnailRun: Promise<void> | null = null;
+  /** A second request arrived during a run: the clips it was asked about may be new ones. */
+  let thumbnailsAgain = false;
+
+  /**
    * Thumbnails, one clip at a time.
    *
    * Each cache miss is one ffmpeg process on the Rust side, so they are requested in
    * sequence rather than all at once — a library of 200 clips would otherwise start 200
    * decoders. Rust caches each result on disk, so this cost is paid once and a later start
    * answers from the cache.
+   *
+   * There is only ever one run. A second request while one is going (the mount and a hotkey
+   * clip a second later) does not start a second sequence — two of them would both miss the
+   * cache for the same clip and both start its ffmpeg — it asks the running one to look at
+   * the library again when it has finished, and shares its promise.
    */
-  async function loadThumbnails() {
+  function loadThumbnails(): Promise<void> {
+    if (thumbnailRun !== null) {
+      thumbnailsAgain = true;
+      return thumbnailRun;
+    }
+    thumbnailRun = (async () => {
+      try {
+        let gaveUp = false;
+        do {
+          thumbnailsAgain = false;
+          gaveUp = await loadMissingThumbnails();
+        } while (thumbnailsAgain && !gaveUp);
+      } finally {
+        thumbnailRun = null;
+      }
+    })();
+    return thumbnailRun;
+  }
+
+  /**
+   * One pass over the library, asking for each thumbnail that is not there yet. Answers
+   * whether it gave up because ffmpeg is not installed, in which case another pass is no use.
+   */
+  async function loadMissingThumbnails(): Promise<boolean> {
+    let failed = 0;
     for (const clip of clips) {
-      if (thumbnails[clip.id] !== undefined) continue;
+      if (thumbnails[clip.id] !== undefined || thumbnailFailures.has(clip.id)) continue;
       // A screenshot is its own picture: the card shows the file, and asking for an ffmpeg frame
       // of a PNG would be one process per screenshot for a thumbnail of itself.
       if (clip.isScreenshot) continue;
@@ -207,14 +261,28 @@
         const thumb = await source.thumbnail(clip.id, thumbnailAtMs(clip.durationMs));
         thumbnails = { ...thumbnails, [clip.id]: source.assetUrl(thumb.path) };
       } catch (err) {
-        // A clip with no thumbnail is a missing picture, not a broken library: say so once
-        // and keep going, leaving the placeholder in that row.
-        error = errorMessage(err);
         // ...unless ffmpeg is not there at all, in which case every remaining clip would
-        // fail the same way and there is nothing to learn from trying them.
-        if (errorCode(err) === 'ffmpeg_unavailable') return;
+        // fail the same way and there is nothing to learn from trying them. That one is
+        // something the user can act on, so it is the banner.
+        if (errorCode(err) === 'ffmpeg_unavailable') {
+          error = errorMessage(err);
+          return true;
+        }
+        // A clip with no thumbnail is a missing picture, not a broken library: it keeps the
+        // placeholder, and the pass says so once at the end instead of raising a banner per
+        // clip, each replacing the last (and any recorder failure that was on screen). The
+        // command's own failure is already in the log.
+        thumbnailFailures.add(clip.id);
+        failed += 1;
       }
     }
+    if (failed > 0) {
+      notice =
+        failed === 1
+          ? 'One clip has no thumbnail: its file may be missing or damaged.'
+          : `${failed} clips have no thumbnail: their files may be missing or damaged.`;
+    }
+    return false;
   }
 
   /**
@@ -227,15 +295,28 @@
    * When it grows, the clip that was just taken is in the index, so the list is refreshed —
    * otherwise a clip saved from the keyboard (or from the tray) would not appear until the
    * user happened to toggle something else.
+   *
+   * The other thing that moves without this window is whether a recording exists at all. A
+   * start inserts a session row and a stop (the tray's, or a watched game exiting) finalises
+   * it with its length and file, so when `running` flips, or the matched game changes, the
+   * library is read again: otherwise the Sessions list keeps showing a finished session as
+   * still recording (where extraction says "Stop it first" and delete is refused) and the
+   * storage totals stay as they were, until some unrelated action refreshes them.
    */
   async function refreshRecording() {
     try {
       const next = await source.recordingStatus();
       const grew = recording !== null && next.clips > recording.clips;
+      const changed =
+        recording !== null &&
+        (next.running !== recording.running || next.matched_game !== recording.matched_game);
       recording = next;
-      if (grew) {
+      if (grew || changed) {
         await refresh();
         void loadThumbnails();
+        // A session that is open was opened as it was: a stop gives it its length and its
+        // matches, and the markers recorded since it was selected.
+        if (changed && view.kind === 'session') void loadSessionMarkers(view.id);
       }
     } catch (err) {
       error = errorMessage(err);
@@ -304,6 +385,8 @@
       recording = await source.startRecording();
       notice =
         'Recording. The buffer fills in the background; press Save clip for one now.';
+      // The start inserted the session row; the list should show it as it is now.
+      await refresh();
     } catch (err) {
       error = errorMessage(err);
     } finally {
@@ -316,6 +399,8 @@
     try {
       recording = await source.stopRecording();
       notice = 'Recording stopped; the encoder was flushed.';
+      // The stop finalised the session (its end, its length, its file) and the library's totals.
+      await refresh();
     } catch (err) {
       error = errorMessage(err);
       // The stop may have failed *after* the recorder went away, so the readout is
@@ -558,10 +643,29 @@
     view = openSession(id);
     sessionEvents = [];
     sessionMatches = [];
+    await loadSessionMarkers(id);
+  }
+
+  /**
+   * Read a session's markers and its matches, and show them if that session is still the one
+   * on screen when they arrive.
+   *
+   * Both are fetched together and assigned together, under a token like `refresh`'s: the
+   * answers for a session the user has already clicked away from are dropped, and so is their
+   * failure, rather than drawing the previous session's markers on the new one's timeline.
+   */
+  async function loadSessionMarkers(id: number) {
+    const token = ++sessionSeq;
     try {
-      sessionEvents = await source.sessionEvents(id);
-      sessionMatches = await source.sessionMatches(id);
+      const [events, matches] = await Promise.all([
+        source.sessionEvents(id),
+        source.sessionMatches(id),
+      ]);
+      if (token !== sessionSeq || selectedSessionId !== id) return;
+      sessionEvents = events;
+      sessionMatches = matches;
     } catch (err) {
+      if (token !== sessionSeq || selectedSessionId !== id) return;
       error = errorMessage(err);
     }
   }
@@ -650,22 +754,20 @@
       await refresh();
       void loadThumbnails();
     })();
-    // The recorder's counters are independent of the library, and are polled from here on.
-    void refreshRecording();
     // Read once: a chord cannot change while the process runs (it is registered at startup),
     // and neither can the path the config came from.
     void refreshApp();
     // The settings panel's values; re-read after every apply, which returns them anyway.
     void refreshSettings();
-    void refreshHealth();
     void refreshGsiTargets();
     void refreshAudioDevices();
-    const poll = setInterval(() => void refreshRecording(), RECORDING_POLL_MS);
-    const healthPoll = setInterval(() => void refreshHealth(), HEALTH_POLL_MS);
-    return () => {
-      clearInterval(poll);
-      clearInterval(healthPoll);
-    };
+    // The recorder's counters and the health page are independent of the library, and are read
+    // from here on: once now, then on their intervals, never two of the same at once and not at
+    // all while the window is hidden to the tray.
+    return startPolling([
+      { run: refreshRecording, everyMs: RECORDING_POLL_MS },
+      { run: refreshHealth, everyMs: HEALTH_POLL_MS },
+    ]);
   });
 </script>
 
@@ -834,6 +936,7 @@
               {recording}
               {busy}
               onApply={updateSettings}
+              onEncoderSaved={refreshSettings}
               onChooseClipsDir={() => source.chooseClipsDir()}
               hotkeyInForce={app === null ? null : app.hotkey.installed ? app.hotkey.chord : null}
             />

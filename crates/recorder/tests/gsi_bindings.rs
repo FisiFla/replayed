@@ -174,30 +174,6 @@ fn the_two_games_carry_different_tokens_and_their_own_paths() {
 }
 
 #[test]
-fn the_old_single_token_file_is_migrated_into_the_games_own_files() {
-    let dir = tempfile::tempdir().expect("a temp dir");
-    // The install that predates per-game tokens: one file, one token, both games.
-    let old = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    std::fs::write(dir.path().join("gsi-token.txt"), format!("{old}\n")).expect("the old token");
-
-    let sources = start_event_sources(dir.path(), &events(free_port(), true));
-    assert_eq!(
-        gsi_report(&sources).state,
-        SourceState::Running,
-        "the migrated install still starts"
-    );
-
-    // The token in force is the old one, so the cfg already installed in the game's folder
-    // keeps working.
-    assert_eq!(token(dir.path(), CS2), old, "cs2 kept the old token");
-    assert_eq!(token(dir.path(), DOTA2), old, "dota2 kept the old token");
-    assert!(
-        dir.path().join("gsi-token.txt").is_file(),
-        "the old file is left in place"
-    );
-}
-
-#[test]
 fn the_ephemeral_port_binds_a_port_that_is_not_the_configured_one() {
     let dir = tempfile::tempdir().expect("a temp dir");
     let configured = free_port();
@@ -391,13 +367,36 @@ fn the_binding_renders_the_cfg_the_game_must_be_given() {
     }
 }
 
+/// The old single `gsi-token.txt` used to be copied into each game's own file, so both games ended up
+/// holding the same token: the thing per-game tokens exist to prevent. It is no longer carried over.
+#[test]
+fn a_legacy_shared_token_is_not_handed_to_both_games() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let legacy = replayed_events::gsi::load_or_create_token(&dir.path().join("gsi-token.txt"))
+        .expect("the legacy token");
+    let sources = start_event_sources(dir.path(), &events(free_port(), true));
+    assert_eq!(
+        gsi_report(&sources).state,
+        SourceState::Running,
+        "the install still starts"
+    );
+    let cs2 = token(dir.path(), CS2);
+    let dota2 = token(dir.path(), DOTA2);
+    assert_ne!(cs2, dota2, "each game has a token of its own");
+    assert_ne!(cs2, legacy, "the shared token is not reused for cs2");
+    assert_ne!(dota2, legacy, "nor for dota2");
+    assert!(
+        dir.path().join("gsi-token.txt").is_file(),
+        "the old file is left where it was"
+    );
+}
+
 #[cfg(unix)]
 #[test]
-fn the_migrated_token_file_is_owner_only_like_the_one_it_came_from() {
+fn the_token_files_are_owner_only_even_when_a_legacy_file_exists() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().expect("a temp dir");
-    // The legacy file was written by the application, so it is owner-only; the migration
-    // copies the file, mode and all, so the token does not become world-readable on the way.
+    // A legacy file is no longer copied, so the new files get the mode the token writer gives them.
     replayed_events::gsi::load_or_create_token(&dir.path().join("gsi-token.txt"))
         .expect("the legacy token");
     start_event_sources(dir.path(), &events(free_port(), true));
@@ -407,7 +406,7 @@ fn the_migrated_token_file_is_owner_only_like_the_one_it_came_from() {
             .expect("the token file")
             .permissions()
             .mode();
-        assert_eq!(mode & 0o777, 0o600, "the migrated token file is owner-only");
+        assert_eq!(mode & 0o777, 0o600, "the token file is owner-only");
     }
 }
 

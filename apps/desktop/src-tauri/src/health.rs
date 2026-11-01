@@ -24,11 +24,16 @@
 //!
 //! # The root the write is contained by
 //!
-//! The install folder is found through `libraryfolders.vdf`, a file any local user can edit.
-//! A folder that file names is therefore not a root a write may be contained by, so the
-//! folder is checked against the Steam roots the operating system knows about
-//! ([`steam_roots`]) before one is used: it has to be exactly a known root's
-//! `steamapps/common/<game folder>`. A folder that is not is refused rather than trusted.
+//! The install folder is found through `libraryfolders.vdf`, a file in the user's own Steam
+//! directory. Those libraries are **trusted as the user's configuration**, not checked against a
+//! list of operating-system roots: another unprivileged account cannot edit that file, anything
+//! that can edit it already runs with the user's rights, and refusing the libraries it names would
+//! break a game on a second drive for no gain. What is enforced is the shape and the boundary:
+//! the folder has to be exactly a library's `steamapps/common/<game folder>` (see
+//! [`trusted_install`]), resolved through symlinks, and the write is contained by that *library*,
+//! so a symlink inside the game folder that points out of the library is refused. The roots the
+//! libraries are read from ([`steam_roots`]) are Steam's registered install path and the default
+//! locations; they only say where to *look*.
 //!
 //! # The file is written atomically
 //!
@@ -107,9 +112,19 @@ impl GsiGame {
     }
 }
 
-/// Steam's own roots, from the environment. Whatever does not exist is filtered later.
+/// Steam's own roots: the install path Steam registered, then the default locations.
+///
+/// The registry is first because it is the only answer for a Steam installed anywhere but
+/// `Program Files` (`D:\Steam` is common), which the fixed paths below can never find. Whatever
+/// does not exist is filtered later.
 pub fn steam_roots() -> Vec<PathBuf> {
+    steam_roots_from(registered_steam_path())
+}
+
+/// [`steam_roots`], with the registry's answer supplied so a test can drive it.
+fn steam_roots_from(registered: Option<PathBuf>) -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    roots.extend(registered);
     for var in ["ProgramFiles(x86)", "ProgramFiles"] {
         if let Some(base) = std::env::var_os(var) {
             roots.push(PathBuf::from(base).join("Steam"));
@@ -122,6 +137,50 @@ pub fn steam_roots() -> Vec<PathBuf> {
         roots.push(home.join(".local/share/Steam"));
     }
     roots
+}
+
+/// The Steam install path Steam keeps under the current user's registry key.
+///
+/// `HKCU\Software\Valve\Steam`, value `SteamPath`: a read of the user's own hive through
+/// `reg.exe`, the same tool the autostart sync already uses, so no new API and no new dependency.
+/// Nothing is written and nothing about another process is touched. A missing key (Steam not
+/// installed, or installed for another user) and a `reg.exe` that cannot run are both "no answer":
+/// the default locations still apply, so this can only add a root, never remove one.
+#[cfg(windows)]
+fn registered_steam_path() -> Option<PathBuf> {
+    let output = replayed_media::sidecar_command("reg")
+        .args(["query", r"HKCU\Software\Valve\Steam", "/v", "SteamPath"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_steam_path(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// There is no registry off Windows; the default locations are the whole answer.
+#[cfg(not(windows))]
+fn registered_steam_path() -> Option<PathBuf> {
+    None
+}
+
+/// The `SteamPath` data in `reg query` output.
+///
+/// `reg query` prints `    SteamPath    REG_SZ    c:/program files (x86)/steam`: the value's
+/// name, its type, then the data, which may itself contain spaces and is kept whole. Steam writes
+/// it with forward slashes; Windows accepts those, so the path is used as written.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_steam_path(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("SteamPath")?;
+        // The name is a whole word: `SteamPathX` is some other value.
+        let rest = rest.strip_prefix(char::is_whitespace)?.trim_start();
+        let data = rest
+            .strip_prefix("REG_SZ")
+            .or_else(|| rest.strip_prefix("REG_EXPAND_SZ"))?
+            .trim();
+        (!data.is_empty()).then(|| PathBuf::from(data))
+    })
 }
 
 /// Every Steam library: the roots themselves plus the `"path"` entries of each root's
@@ -227,9 +286,9 @@ pub enum GsiListener<'a> {
 /// file once, when it started, and a file replaced since would leave the game posting a token
 /// the listener refuses.
 ///
-/// `install` has to be a known Steam root's `steamapps/common/<game folder>`: the folder is
-/// found through a user-writable `libraryfolders.vdf`, so it is checked against the roots the
-/// operating system knows about ([`steam_roots`]) before it is used to contain the write.
+/// `install` has to be exactly a Steam library's `steamapps/common/<game folder>`: the libraries
+/// are the user's own configuration (see [`trusted_install`]), and the write is contained by the
+/// library, with symlinks resolved, so it cannot leave it.
 ///
 /// With no listener running there is nothing for the game to post to, so the install is
 /// refused with the reason rather than writing a file that cannot work.
@@ -432,12 +491,27 @@ pub fn remember_install(
     });
 }
 
-/// Rewrite the installations whose live binding has moved.
+/// Whether the file an installation points at lacks a data block this build subscribes to.
+///
+/// The record says which binding the file was written from, not what is in it now: a file put
+/// back by hand from an older guide, or by an older build sharing the folder, has the right port
+/// and token and is still missing `player_id`, so the game posts rounds with no identity in them
+/// and the spectator rules cannot tell the user from the player they are watching. Only
+/// Counter-Strike's file has that check ([`gsi::cs2_cfg_is_current`]); a file that cannot be read
+/// is not called stale, because the rewrite that would follow reports that failure properly.
+fn on_disk_cfg_is_stale(entry: &InstalledGsi) -> bool {
+    entry.game == GsiGame::Cs2
+        && std::fs::read_to_string(&entry.path).is_ok_and(|text| !gsi::cs2_cfg_is_current(&text))
+}
+
+/// Rewrite the installations whose live binding has moved, or whose file no longer carries the
+/// data blocks this build subscribes to.
 ///
 /// The port the listener binds can change between runs, and the token with it, so an
 /// installed file that names the old ones is exactly the stale file this exists to prevent.
 /// Every installation whose game the listener serves and whose binding differs from the one
-/// it was written from is rewritten.
+/// it was written from is rewritten, and so is one whose file is out of date
+/// ([`on_disk_cfg_is_stale`]) even though the binding matches.
 ///
 /// An installation whose rewrite fails is dropped rather than retried: the game folder is
 /// gone, or its permissions changed, and every later start would say the same thing.
@@ -452,7 +526,7 @@ pub fn refresh_installed_gsi(
             // it to, and the installation is kept for when it does.
             return true;
         };
-        if *binding == entry.binding {
+        if *binding == entry.binding && !on_disk_cfg_is_stale(entry) {
             return true;
         }
         match install_with_binding(entry.game, &entry.install, binding, libraries) {
@@ -1106,6 +1180,70 @@ mod tests {
         assert_eq!(installed.len(), 1);
     }
 
+    /// What an older build wrote: this build's file without the `player_id` block.
+    fn without_player_id(text: &str) -> String {
+        text.lines()
+            .filter(|line| !line.contains("player_id"))
+            .map(|line| format!("{line}\n"))
+            .collect()
+    }
+
+    #[test]
+    fn an_installed_cs2_cfg_missing_a_block_is_rewritten_even_when_the_binding_is_unchanged() {
+        let steam = tempfile::tempdir().unwrap();
+        let install = fake_steam(steam.path(), GsiGame::Cs2);
+        std::fs::create_dir_all(install.join("game/csgo/cfg")).unwrap();
+        let roots = [steam.path().to_path_buf()];
+
+        let live = binding(GsiGame::Cs2, 45671, TOKEN);
+        let out =
+            install_gsi_cfg(GsiGame::Cs2, &install, GsiListener::Running(&live), &roots).unwrap();
+        let mut installed = Vec::new();
+        remember_install(
+            &mut installed,
+            GsiGame::Cs2,
+            &install,
+            Path::new(&out.path),
+            &live,
+        );
+        // The same port and token, in the file an older build wrote.
+        let old = without_player_id(&std::fs::read_to_string(&out.path).unwrap());
+        assert!(!gsi::cs2_cfg_is_current(&old));
+        std::fs::write(&out.path, &old).unwrap();
+
+        refresh_installed_gsi(&mut installed, std::slice::from_ref(&live), &roots);
+
+        let text = std::fs::read_to_string(&out.path).unwrap();
+        assert!(gsi::cs2_cfg_is_current(&text), "got:\n{text}");
+        assert!(text.contains(TOKEN), "and it still carries the live token");
+        assert_eq!(installed.len(), 1);
+    }
+
+    #[test]
+    fn an_install_over_an_older_cfg_leaves_a_current_file_with_the_live_port_and_token() {
+        let steam = tempfile::tempdir().unwrap();
+        let install = fake_steam(steam.path(), GsiGame::Cs2);
+        let cfg_dir = install.join("game/csgo/cfg");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let roots = [steam.path().to_path_buf()];
+
+        // What an earlier build installed: no `player_id`, another port and the legacy token.
+        let legacy_token = "1111111111111111111111111111111111111111111111111111111111111111"; // gitleaks:allow
+        let older = without_player_id(&gsi::integration_cfg(40000, legacy_token));
+        std::fs::write(cfg_dir.join(GSI_CFG_NAME), &older).unwrap();
+
+        let live = binding(GsiGame::Cs2, 45671, TOKEN);
+        let out =
+            install_gsi_cfg(GsiGame::Cs2, &install, GsiListener::Running(&live), &roots).unwrap();
+
+        let text = std::fs::read_to_string(&out.path).unwrap();
+        assert!(out.replaced);
+        assert!(gsi::cs2_cfg_is_current(&text), "got:\n{text}");
+        assert!(text.contains(":45671/"), "the live port:\n{text}");
+        assert!(text.contains(TOKEN), "the live token");
+        assert!(!text.contains(legacy_token), "and not the legacy one");
+    }
+
     #[test]
     fn an_installation_that_cannot_be_rewritten_is_dropped_rather_than_retried() {
         let steam = tempfile::tempdir().unwrap();
@@ -1216,6 +1354,86 @@ mod tests {
         let log = dir.path().join("l.log");
         std::fs::write(&log, "t  ERROR x: broke\n").unwrap();
         assert_eq!(read_recent_problems(&log, 5).len(), 1);
+    }
+
+    /// The Windows lock bug, end to end through the health page's own reader.
+    ///
+    /// The log is held by the running process through [`crate::log_file::RotatingFile`]; the page
+    /// reads it through a second handle in the same process. With a mandatory lock on the log
+    /// itself that read failed with `ERROR_LOCK_VIOLATION` and `read_recent_problems` answered
+    /// with an empty list, so the page that exists to show what went wrong showed nothing. (On
+    /// Unix the lock is advisory, so only the Windows run can fail this.)
+    #[test]
+    fn the_problems_are_readable_while_the_running_process_holds_the_log() {
+        use std::io::Write;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replayed.log");
+        let (mut log, owns) = crate::log_file::RotatingFile::open_locked(path.clone(), 4096, 1)
+            .expect("the log opens");
+        assert!(owns);
+        log.write_all(b"2026-10-17T10:00:03Z ERROR a: held and visible\n")
+            .unwrap();
+        log.flush().unwrap();
+
+        let problems = read_recent_problems(&path, 5);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("held and visible"));
+    }
+
+    #[test]
+    fn steam_path_is_read_from_reg_query_output() {
+        // The shape `reg query HKCU\Software\Valve\Steam /v SteamPath` printed on a real box, CRLFs
+        // included. The data has spaces and is kept whole.
+        let out = "\r\nHKEY_CURRENT_USER\\Software\\Valve\\Steam\r\n    SteamPath    REG_SZ    c:/program files (x86)/steam\r\n\r\n";
+        assert_eq!(
+            parse_steam_path(out),
+            Some(PathBuf::from("c:/program files (x86)/steam"))
+        );
+        assert_eq!(
+            parse_steam_path("    SteamPath    REG_SZ    D:/Steam"),
+            Some(PathBuf::from("D:/Steam"))
+        );
+        // Another value, an empty one and no value at all are no answer.
+        assert_eq!(parse_steam_path("    SteamPathX    REG_SZ    D:/x"), None);
+        assert_eq!(parse_steam_path("    SteamPath    REG_SZ    "), None);
+        assert_eq!(parse_steam_path("    SteamPath    REG_DWORD    0x1"), None);
+        assert_eq!(parse_steam_path(""), None);
+    }
+
+    /// The real registry read, on a machine that has Steam. Where the key is absent (no Steam, or
+    /// a CI image) the read is "no answer" and there is nothing to assert; where it is present the
+    /// answer must be the directory Steam registered, and it must lead the roots.
+    #[cfg(windows)]
+    #[test]
+    fn the_registry_read_returns_the_steam_directory_when_steam_is_installed() {
+        if let Some(path) = registered_steam_path() {
+            assert!(path.is_dir(), "the registered Steam path exists: {path:?}");
+            assert_eq!(steam_roots().first(), Some(&path));
+        }
+    }
+
+    #[test]
+    fn a_steam_installed_outside_program_files_is_a_root_and_is_looked_in_first() {
+        // The reported failure: Steam at `D:\Steam`, which no fixed path names.
+        let steam = tempfile::tempdir().unwrap();
+        let roots = steam_roots_from(Some(steam.path().to_path_buf()));
+        assert_eq!(roots.first(), Some(&steam.path().to_path_buf()));
+
+        // And a game in it is found through the library list that root yields.
+        let install = steam
+            .path()
+            .join("steamapps/common")
+            .join(GsiGame::Cs2.folder());
+        std::fs::create_dir_all(&install).unwrap();
+        let libs = steam_libraries(&roots);
+        assert_eq!(find_install(GsiGame::Cs2, &libs), Some(install));
+
+        // With no registry answer the default locations are still there.
+        assert_eq!(
+            steam_roots_from(None).len() + 1,
+            roots.len(),
+            "the registry adds a root and removes none"
+        );
     }
 
     #[test]

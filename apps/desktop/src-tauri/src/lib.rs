@@ -19,6 +19,7 @@ pub mod config;
 pub mod health;
 mod log_file;
 pub mod paths;
+mod window_focus;
 
 use background::{
     AppStatus, CloseAction, HotkeyStatus, MenuAction, Shell, TrayRendering, TrayState, TrayView,
@@ -27,19 +28,20 @@ use commands::{
     AppPaths, ClipDto, CommandError, DeleteOutcome, DeleteSessionOutcome, Deps, DiagnosticsReport,
     EncoderSettings, EncoderStatus, ErrorCode, ExportOutcome, PruneOutcome, RecordedClipDto,
     RecorderHost, RecordingStatusDto, SessionDto, SessionEventDto, StorageConfigView, StorageStats,
-    ThumbnailRef,
+    ThumbnailRef, UpdatePreparationDto,
 };
 use config::{BackgroundConfig, RecordingConfig, StorageConfig};
 use replayed_media::FfmpegBinaries;
 use replayed_recorder::GsiBinding;
 use replayed_store::Store;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tauri::image::Image;
 use tauri::menu::{MenuBuilder, MenuItem, MenuItemBuilder};
 use tauri::tray::TrayIconBuilder;
-use tauri::{AppHandle, Manager, State, WindowEvent, Wry};
+use tauri::{AppHandle, Manager, RunEvent, State, WindowEvent, Wry};
 
 /// The one window this application has (`tauri.conf.json` declares it).
 const MAIN_WINDOW: &str = "main";
@@ -87,6 +89,14 @@ pub struct AppState {
     /// application data directory is therefore one the user picked in the native folder picker
     /// (`choose_clips_dir`) or one the config file already names.
     approved_roots: Mutex<Vec<PathBuf>>,
+    /// Clips directories taken out of the asset protocol's scope during this run.
+    ///
+    /// The scope can only be narrowed for good: a forbidden directory stays forbidden until the
+    /// process ends, and the forbid wins over any later allow. Moving the clips directory away
+    /// from one and then back to it would therefore leave a library whose clips do not play and no
+    /// message saying why. The list is what lets `update_settings` refuse that move up front, with
+    /// the reason, before anything is written.
+    withdrawn_roots: Mutex<Vec<PathBuf>>,
     /// The log file this process writes, and the health page reads.
     log_path: PathBuf,
     /// The GSI cfgs this shell installed into games' own directories, and the binding each
@@ -158,6 +168,19 @@ impl AppState {
             )
         })?;
 
+        // An index brought across from the old `localplay` directory still names its clips there.
+        // Repaired before anything reads it, so the library lists them as present, and never at the
+        // cost of the start: a failure is a warning, and the rows stay as they were.
+        if let Some(base) = app_data_dir.parent() {
+            match config::repair_legacy_index_paths(&store, base, app_data_dir, &paths.db_path) {
+                Ok(0) => {}
+                Ok(changed) => tracing::info!(
+                    "{changed} path(s) in the clip index were repaired after the data directory moved"
+                ),
+                Err(err) => tracing::warn!("the clip index paths were not repaired: {err}"),
+            }
+        }
+
         // ffmpeg is a startup warning, not a failure: everything except trimming and thumbnails works
         // without it, and the user can fix a missing sidecar while the app runs. The warning goes to
         // the storage panel, where it is visible, not only to a log nobody reads.
@@ -178,7 +201,18 @@ impl AppState {
         // The startup summary says what is on disk, not what the index claims: a row whose file is
         // gone holds no bytes and is left out of both lists, and the count of them is what tells a
         // user why the library is smaller than the index (the storage panel offers the prune).
-        let clips = store.list_clips().unwrap_or_default();
+        let clips_read = store.list_clips();
+        // The thumbnail cache is swept against the index once per start: retention and the CLI
+        // delete clips without telling it, so its files otherwise outlive their clips for ever.
+        // Only against an index that was actually read: a failed read must not look like "no clip
+        // owns anything".
+        if let Ok(listed) = &clips_read {
+            let swept = commands::sweep_stale_thumbnails(&paths.thumbnails_dir, listed);
+            if swept > 0 {
+                tracing::info!("removed {swept} cached thumbnails whose clips are gone");
+            }
+        }
+        let clips = clips_read.unwrap_or_default();
         let sessions = store.list_sessions().unwrap_or_default();
         let missing_clips = clips
             .iter()
@@ -227,6 +261,7 @@ impl AppState {
                 "the hotkey is installed when the shell has finished starting",
             )),
             approved_roots: Mutex::new(Vec::new()),
+            withdrawn_roots: Mutex::new(Vec::new()),
             log_path,
             installed_gsi,
             last_encoder: Mutex::new(None),
@@ -357,6 +392,54 @@ impl AppState {
             .any(|root| wanted == *root || wanted.starts_with(root))
     }
 
+    /// Record that `dir` was taken out of the asset protocol's scope, for good.
+    fn withdraw_clips_root(&self, dir: &Path) {
+        let mut withdrawn = self
+            .withdrawn_roots
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        if !withdrawn.iter().any(|old| old == dir) {
+            withdrawn.push(dir.to_path_buf());
+        }
+    }
+
+    /// Refuse a clips directory that overlaps one withdrawn earlier in this run.
+    ///
+    /// Overlap in both directions: a directory inside a withdrawn one is forbidden with it (the
+    /// forbid is recursive), and a directory that contains a withdrawn one would be only partly
+    /// readable. The remedy is a restart, which starts with an empty scope, and the message says
+    /// so rather than leaving the user with clips that will not play.
+    ///
+    /// `dir` is the value the user typed or picked; empty means the default directory, which is
+    /// never withdrawn (the static scope in `tauri.conf.json` covers it and it is never forbidden).
+    pub fn check_clips_dir_not_withdrawn(&self, dir: &str) -> Result<(), CommandError> {
+        if dir.is_empty() {
+            return Ok(());
+        }
+        let wanted = AppPaths::resolve(&self.app_data_dir, dir).clips_dir;
+        let withdrawn = self
+            .withdrawn_roots
+            .lock()
+            .unwrap_or_else(|err| err.into_inner());
+        match withdrawn
+            .iter()
+            .find(|old| wanted.starts_with(old) || old.starts_with(&wanted))
+        {
+            None => Ok(()),
+            Some(old) => Err(CommandError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "{} cannot be the clips directory again until replayed is restarted: \
+                     {} was taken away from the window's file access when the directory was \
+                     moved earlier in this session, and that cannot be undone while it runs. \
+                     Nothing was changed.",
+                    wanted.display(),
+                    old.display()
+                ),
+            )),
+        }
+    }
+
     /// The `config.toml` this process read: the file the tray's "open config file" item reveals and
     /// the window names, since configuration is a file rather than a settings dialog.
     pub fn config_path(&self) -> PathBuf {
@@ -387,9 +470,15 @@ impl AppState {
     /// Build the explicit dependencies for one command call and run it.
     ///
     /// The guard lives for the whole call, so a concurrent command cannot mutate the store halfway
-    /// through; no command awaits, so holding it is cheap. Lock order is store, then paths, then
-    /// storage; the settings command takes the latter two in that order and never the store, so
-    /// nothing can deadlock.
+    /// through. Lock order is store, then paths, then storage, the last two only for as long as it
+    /// takes to copy them; the settings command takes those two in that order and never the store,
+    /// so nothing can deadlock.
+    ///
+    /// **For work that is quick.** The store's lock is held for the whole of `run`, so a command
+    /// that runs ffmpeg in here keeps every other command that reads the index waiting for as long as
+    /// the encode takes (a minute, for a long clip), and the window's list, the storage panel and the
+    /// drag lookup all stop answering. Anything that runs a child process or walks a directory of
+    /// footage goes through [`Self::with_deps_detached`] instead.
     fn with_deps<T>(
         &self,
         run: impl FnOnce(&Deps<'_>) -> Result<T, CommandError>,
@@ -398,10 +487,14 @@ impl AppState {
             .store
             .lock()
             .map_err(|_| Self::poisoned("the store lock"))?;
+        // Copied out, not held: the store's lock is the one this call needs for its whole run, and
+        // keeping the paths' and the settings' as well made a quick command that waited on the index
+        // also keep `update_settings` and every detached command waiting.
         let paths = self
             .paths
             .lock()
-            .map_err(|_| Self::poisoned("the paths lock"))?;
+            .map_err(|_| Self::poisoned("the paths lock"))?
+            .clone();
         let storage = StorageConfigView::from(
             &*self
                 .storage
@@ -417,7 +510,105 @@ impl AppState {
         };
         run(&deps)
     }
+
+    /// [`Self::with_deps`] for work that runs for a while, with **no lock held while it runs**.
+    ///
+    /// The paths and the storage settings are copied out under their locks and the locks are let go;
+    /// the index is opened on a connection of its own for the call. The CLI and the recorder already
+    /// share the database file this way (the busy timeout is what lets two writers take turns), and
+    /// a connection is a file open, not a migration, so this costs nothing next to the ffmpeg run it
+    /// exists for.
+    ///
+    /// What is given up is the serialisation `with_deps` gave for free: two such commands can now
+    /// overlap, and one can delete a clip another is reading. That is the same race the recorder's
+    /// own clip writes and the CLI have always had with the window, and it ends in an ffmpeg error
+    /// that names the missing file, not in a corrupt index: every write is one SQL statement.
+    fn with_deps_detached<T>(
+        &self,
+        run: impl FnOnce(&Deps<'_>) -> Result<T, CommandError>,
+    ) -> Result<T, CommandError> {
+        let paths = self
+            .paths
+            .lock()
+            .map_err(|_| Self::poisoned("the paths lock"))?
+            .clone();
+        let storage = StorageConfigView::from(
+            &*self
+                .storage
+                .lock()
+                .map_err(|_| Self::poisoned("the storage lock"))?,
+        );
+        let store = Store::open(&paths.db_path).map_err(|e| {
+            CommandError::new(
+                ErrorCode::Store,
+                format!(
+                    "could not open the clip index {}: {e:#}",
+                    paths.db_path.display()
+                ),
+            )
+        })?;
+        let deps = Deps {
+            store: &store,
+            bins: self.bins.as_ref(),
+            paths: &paths,
+            storage: &storage,
+            warnings: &self.warnings,
+        };
+        run(&deps)
+    }
 }
+
+/// Run a command's work on the blocking pool, off the UI thread and off the async workers.
+///
+/// A synchronous `#[tauri::command]` runs on the thread that owns the window, and an `async`
+/// command whose body blocks holds one of the runtime's few workers for as long as it blocks. The
+/// commands that run ffmpeg, wait for the encoder or walk a directory of footage take seconds to
+/// minutes, so they run here: the pool grows to what the work needs and the window keeps painting.
+///
+/// A panic in `work` comes back as an error instead of taking the command's task down silently.
+async fn blocking<T, F>(app: &AppHandle, work: F) -> Result<T, CommandError>
+where
+    T: Send + 'static,
+    F: FnOnce(&AppState) -> Result<T, CommandError> + Send + 'static,
+{
+    let app = app.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let state = app.state::<AppState>();
+        work(&state)
+    })
+    .await
+    .map_err(|err| CommandError::new(ErrorCode::Io, format!("the command did not finish: {err}")))?
+}
+
+/// Run `work` on a thread of its own, so a callback the event loop is waiting on can return.
+///
+/// **The event loop's callbacks (a tray menu click, a window event) run on the thread that
+/// paints every window.** Anything slow in them freezes the window: a start runs the encoder
+/// smoke test and a stop concatenates the session, seconds each. And anything that waits for
+/// that thread from another thread, while holding a lock the callback also wants, is a deadlock:
+/// the tray refresh does exactly that (its icon and menu updates are round trips to the UI
+/// thread, made while the refresh holds the lock the callback would take), so a refresh from a
+/// callback was a hang waiting for the two to meet. Both end when the callbacks hand their work
+/// to this and return.
+fn off_event_loop(name: &str, work: impl FnOnce() + Send + 'static) {
+    if let Err(err) = std::thread::Builder::new().name(name.into()).spawn(work) {
+        tracing::error!("the {name} thread could not be started: {err}");
+    }
+}
+
+/// Tray menu actions, one at a time and in the order they were clicked.
+///
+/// They used to run one after another on the event loop; moved to threads they would overlap,
+/// and a double-clicked "Start recording" would race itself. The lock restores the order.
+static TRAY_ACTIONS: Mutex<()> = Mutex::new(());
+
+/// Thumbnails, one ffmpeg run at a time.
+///
+/// They used to queue behind the index's lock without anyone meaning them to. Now that the lock
+/// is not held across ffmpeg, a window that asks for forty visible clips' thumbnails would start
+/// forty ffmpeg processes at once on a machine that is also recording; this keeps it at the one
+/// the lock allowed.
+static THUMBNAIL_GATE: Mutex<()> = Mutex::new(());
 
 // ---------------------------------------------------------------------------------------
 // The IPC commands. Every one of these is a delegation: resolve the state, call the plain
@@ -425,42 +616,52 @@ impl AppState {
 // ---------------------------------------------------------------------------------------
 
 /// Every clip in the index, newest first.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn list_clips(state: State<'_, AppState>) -> Result<Vec<ClipDto>, CommandError> {
     state.with_deps(commands::list_clips)
 }
 
 /// Usage, the configured cap and age limit, and the cleanup policy's verdict.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn storage_stats(state: State<'_, AppState>) -> Result<StorageStats, CommandError> {
     state.with_deps(commands::storage_stats)
 }
 
 /// Remove the index rows whose files are gone. The user confirms this in the Storage panel: it is
 /// the one place the shell rewrites the index from the filesystem's evidence.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn prune_missing(state: State<'_, AppState>) -> Result<PruneOutcome, CommandError> {
     state.with_deps(commands::prune_missing)
 }
 
 /// Combine whole clips into one file, losslessly.
+///
+/// Runs ffmpeg over every clip, so it is off the UI thread and holds no lock while it runs.
 #[tauri::command(rename_all = "snake_case")]
-fn combine_clips(state: State<'_, AppState>, ids: Vec<i64>) -> Result<ClipDto, CommandError> {
-    state.with_deps(|deps| commands::combine_clips(deps, &ids))
+async fn combine_clips(app: AppHandle, ids: Vec<i64>) -> Result<ClipDto, CommandError> {
+    blocking(&app, move |state| {
+        state.with_deps_detached(|deps| commands::combine_clips(deps, &ids))
+    })
+    .await
 }
 
 /// Re-encode a clip with one of the export presets, into a new file beside it.
+///
+/// A full re-encode: minutes for a long clip. Off the UI thread, and no lock held.
 #[tauri::command(rename_all = "snake_case")]
-fn export_clip(
-    state: State<'_, AppState>,
+async fn export_clip(
+    app: AppHandle,
     id: i64,
     preset: String,
 ) -> Result<ExportOutcome, CommandError> {
-    state.with_deps(|deps| commands::export_clip(deps, id, &preset))
+    blocking(&app, move |state| {
+        state.with_deps_detached(|deps| commands::export_clip(deps, id, &preset))
+    })
+    .await
 }
 
 /// Mark a clip as a favourite, or clear it.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn set_favourite(
     state: State<'_, AppState>,
     id: i64,
@@ -470,7 +671,7 @@ fn set_favourite(
 }
 
 /// Rename a clip (its display title; the file keeps its name). Blank clears the title.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn set_clip_title(
     state: State<'_, AppState>,
     id: i64,
@@ -480,7 +681,7 @@ fn set_clip_title(
 }
 
 /// Replace a clip's tags.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn set_clip_tags(
     state: State<'_, AppState>,
     id: i64,
@@ -491,30 +692,40 @@ fn set_clip_tags(
 
 /// Put the clip's file on the system clipboard, as a file.
 ///
-/// Async because it waits for PowerShell: the call blocks until the child process is done, and
-/// the window must not stop answering while it does.
-#[tauri::command(async, rename_all = "snake_case")]
-fn copy_clip_to_clipboard(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
-    let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
-    clip_files::copy_file_to_clipboard(&path)
-        .map_err(|msg| CommandError::new(commands::ErrorCode::Io, msg))
+/// On the blocking pool because it waits for PowerShell: the call blocks until the child process
+/// is done, and neither the window nor the runtime's workers may stop while it does.
+#[tauri::command(rename_all = "snake_case")]
+async fn copy_clip_to_clipboard(app: AppHandle, id: i64) -> Result<(), CommandError> {
+    blocking(&app, move |state| {
+        let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
+        clip_files::copy_file_to_clipboard(&path)
+            .map_err(|msg| CommandError::new(commands::ErrorCode::Io, msg))
+    })
+    .await
+}
+
+/// Show `path` in the system file manager: the file selected where the platform allows, else its
+/// folder.
+///
+/// Spawns [`background::reveal_process`] and not a command built from [`background::reveal_command`]:
+/// on Windows Explorer parses its own command line and wants `/select,"C:\a b\c.mp4"` with plain
+/// quotes, which `Command::arg` would have escaped into something Explorer does not recognise as a
+/// selection (it then opened the default folder, or nothing, for any path with a space in it).
+fn reveal_in_file_manager(path: &Path) -> Result<(), String> {
+    let mut command = background::reveal_process(path, background::FileManager::current());
+    command.spawn().map(drop).map_err(|err| {
+        format!(
+            "could not run {}: {err}",
+            command.get_program().to_string_lossy()
+        )
+    })
 }
 
 /// Show the clip's file in the system file manager, selected where the platform allows.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn reveal_clip(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> {
     let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
-    let (program, args) = background::reveal_command(&path, background::FileManager::current());
-    replayed_media::sidecar_command(&program)
-        .args(&args)
-        .spawn()
-        .map(drop)
-        .map_err(|err| {
-            CommandError::new(
-                commands::ErrorCode::Io,
-                format!("could not run {program}: {err}"),
-            )
-        })
+    reveal_in_file_manager(&path).map_err(|msg| CommandError::new(commands::ErrorCode::Io, msg))
 }
 
 /// Show the application's data directory in the system file manager.
@@ -522,20 +733,10 @@ fn reveal_clip(state: State<'_, AppState>, id: i64) -> Result<(), CommandError> 
 /// The folder that holds the clips, the sessions, the thumbnails, the index, the log and
 /// `config.toml`: one button for "where is everything", instead of three paths printed on pages
 /// for the user to copy.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn open_data_dir(state: State<'_, AppState>) -> Result<(), CommandError> {
     let dir = state.data_dir().to_path_buf();
-    let (program, args) = background::reveal_command(&dir, background::FileManager::current());
-    replayed_media::sidecar_command(&program)
-        .args(&args)
-        .spawn()
-        .map(drop)
-        .map_err(|err| {
-            CommandError::new(
-                commands::ErrorCode::Io,
-                format!("could not run {program}: {err}"),
-            )
-        })
+    reveal_in_file_manager(&dir).map_err(|msg| CommandError::new(commands::ErrorCode::Io, msg))
 }
 
 /// How long a screenshot waits for the display to present a frame.
@@ -570,28 +771,34 @@ fn take_screenshot(state: &AppState) -> Result<ClipDto, CommandError> {
     backend.deliver_textures(false);
     let frame = replayed_capture::grab_frame(backend.as_mut(), SCREENSHOT_TIMEOUT)
         .map_err(|err| CommandError::new(commands::ErrorCode::Io, format!("{err:#}")))?;
-    state.with_deps(|deps| commands::save_screenshot(deps, &frame))
+    state.with_deps_detached(|deps| commands::save_screenshot(deps, &frame))
 }
 
 /// Take a screenshot of the configured capture target.
 ///
-/// Async because it waits for a frame: at 60 Hz that is a few milliseconds, but a target that
-/// presents nothing waits the whole [`SCREENSHOT_TIMEOUT`], and the window must keep answering.
-#[tauri::command(async, rename_all = "snake_case")]
-fn screenshot_now(state: State<'_, AppState>) -> Result<ClipDto, CommandError> {
-    take_screenshot(&state)
+/// On the blocking pool because it waits for a frame: at 60 Hz that is a few milliseconds, but a
+/// target that presents nothing waits the whole [`SCREENSHOT_TIMEOUT`], and the window must keep
+/// answering.
+#[tauri::command(rename_all = "snake_case")]
+async fn screenshot_now(app: AppHandle) -> Result<ClipDto, CommandError> {
+    blocking(&app, take_screenshot).await
 }
 
 /// Begin a native drag of the clip's file out of the window (to Explorer, Discord, a browser
 /// upload). Called when the pointer has started dragging a library row; the OS drag loop
 /// then runs on the main thread until the drop or a cancel.
+///
+/// **The one command that stays synchronous**, on purpose: it begins an OS drag loop, which has to
+/// start on the UI thread while the button is still down. The only thing that could make it wait
+/// is therefore the lookup, which uses [`AppState::with_deps_detached`] so that it never queues
+/// behind another command's hold on the index.
 #[tauri::command(rename_all = "snake_case")]
 fn drag_clip_out(
     window: tauri::WebviewWindow,
     state: State<'_, AppState>,
     id: i64,
 ) -> Result<(), CommandError> {
-    let path = state.with_deps(|deps| commands::clip_file(deps, id))?;
+    let path = state.with_deps_detached(|deps| commands::clip_file(deps, id))?;
     start_native_drag(&window, path)
 }
 
@@ -627,31 +834,36 @@ fn start_native_drag(_window: &tauri::WebviewWindow, _path: PathBuf) -> Result<(
 
 /// Cut `[start_ms, end_ms)` into a new clip file with a lossless stream copy.
 ///
-/// Async because it runs ffmpeg: the cut takes as long as the footage does, up to a minute.
-#[tauri::command(async, rename_all = "snake_case")]
-fn trim_clip(
-    state: State<'_, AppState>,
+/// On the blocking pool because it runs ffmpeg: the cut takes as long as the footage does, up to
+/// a minute, and no lock is held while it does.
+#[tauri::command(rename_all = "snake_case")]
+async fn trim_clip(
+    app: AppHandle,
     id: i64,
     start_ms: u64,
     end_ms: u64,
 ) -> Result<ClipDto, CommandError> {
-    state.with_deps(|deps| commands::trim_clip(deps, id, start_ms, end_ms))
+    blocking(&app, move |state| {
+        state.with_deps_detached(|deps| commands::trim_clip(deps, id, start_ms, end_ms))
+    })
+    .await
 }
 
 /// A cached JPEG thumbnail for one clip at one timestamp.
 ///
-/// Async because it runs ffmpeg per clip, and a list of clips is a list of ffmpeg runs.
-#[tauri::command(async, rename_all = "snake_case")]
-fn thumbnail(
-    state: State<'_, AppState>,
-    id: i64,
-    at_ms: u64,
-) -> Result<ThumbnailRef, CommandError> {
-    state.with_deps(|deps| commands::thumbnail(deps, id, at_ms))
+/// On the blocking pool because it runs ffmpeg per clip, and a list of clips is a list of ffmpeg
+/// runs; [`THUMBNAIL_GATE`] keeps those to one at a time.
+#[tauri::command(rename_all = "snake_case")]
+async fn thumbnail(app: AppHandle, id: i64, at_ms: u64) -> Result<ThumbnailRef, CommandError> {
+    blocking(&app, move |state| {
+        let _one_at_a_time = THUMBNAIL_GATE.lock().unwrap_or_else(|err| err.into_inner());
+        state.with_deps_detached(|deps| commands::thumbnail(deps, id, at_ms))
+    })
+    .await
 }
 
 /// Delete a clip: the row first, then the file.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn delete_clip(state: State<'_, AppState>, id: i64) -> Result<DeleteOutcome, CommandError> {
     state.with_deps(|deps| commands::delete_clip(deps, id))
 }
@@ -663,19 +875,19 @@ fn delete_clip(state: State<'_, AppState>, id: i64) -> Result<DeleteOutcome, Com
 // `commands::session_events` for why it must not be recomputed here.
 
 /// Every session the index knows, newest first.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn list_sessions(state: State<'_, AppState>) -> Result<Vec<SessionDto>, CommandError> {
     state.with_deps(commands::list_sessions)
 }
 
 /// One session's row, for the detail panel.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn session_detail(state: State<'_, AppState>, session_id: i64) -> Result<SessionDto, CommandError> {
     state.with_deps(|deps| commands::session_detail(deps, session_id))
 }
 
 /// A session's timeline markers, in media-time order.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn session_events(
     state: State<'_, AppState>,
     session_id: i64,
@@ -684,7 +896,7 @@ fn session_events(
 }
 
 /// A session split into its matches (Full Match segments), with markers and scoreboards.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn session_matches(
     state: State<'_, AppState>,
     session_id: i64,
@@ -693,17 +905,22 @@ fn session_matches(
 }
 
 /// Cut one match out of a finished session as a clip.
+///
+/// A lossless cut over a long session: ffmpeg, so off the UI thread and with no lock held.
 #[tauri::command(rename_all = "snake_case")]
-fn extract_match(
-    state: State<'_, AppState>,
+async fn extract_match(
+    app: AppHandle,
     session_id: i64,
     match_index: usize,
 ) -> Result<ClipDto, CommandError> {
-    state.with_deps(|deps| commands::extract_match(deps, session_id, match_index))
+    blocking(&app, move |state| {
+        state.with_deps_detached(|deps| commands::extract_match(deps, session_id, match_index))
+    })
+    .await
 }
 
 /// Mark a session as a favourite, or clear it.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn set_session_favourite(
     state: State<'_, AppState>,
     session_id: i64,
@@ -714,55 +931,95 @@ fn set_session_favourite(
 
 /// Delete a session: the row first, then its segments and its recorded file.
 ///
-/// Async because deleting a session removes a whole directory of footage, which takes as long as
-/// the disk needs.
-#[tauri::command(async, rename_all = "snake_case")]
-fn delete_session(
-    state: State<'_, AppState>,
+/// On the blocking pool because deleting a session removes a whole directory of footage, which
+/// takes as long as the disk needs, and no lock is held while it does.
+#[tauri::command(rename_all = "snake_case")]
+async fn delete_session(
+    app: AppHandle,
     session_id: i64,
 ) -> Result<DeleteSessionOutcome, CommandError> {
-    state.with_deps(|deps| commands::delete_session(deps, session_id))
+    blocking(&app, move |state| {
+        state.with_deps_detached(|deps| commands::delete_session(deps, session_id))
+    })
+    .await
 }
 
 /// Cut a clip out of a finished session, losslessly. Refused while it is still recording.
+///
+/// ffmpeg over the span asked for, so off the UI thread and with no lock held.
 #[tauri::command(rename_all = "snake_case")]
-fn extract_clip(
-    state: State<'_, AppState>,
+async fn extract_clip(
+    app: AppHandle,
     session_id: i64,
     start_ms: u64,
     end_ms: u64,
 ) -> Result<ClipDto, CommandError> {
-    state.with_deps(|deps| commands::extract_clip(deps, session_id, start_ms, end_ms))
+    blocking(&app, move |state| {
+        state.with_deps_detached(|deps| commands::extract_clip(deps, session_id, start_ms, end_ms))
+    })
+    .await
 }
 
 // -- recording ---------------------------------------------------------------------------
 //
-// The recording commands are `async`, unlike most of the others, because tauri runs a
-// synchronous command on the webview's own thread and these block for real time: `clip_now`
-// waits for the post-roll (seconds), and a start runs the encoder smoke test. An `async fn`
-// runs on the runtime's workers, keeping the window responsive while a clip is saved.
+// **No command runs on the UI thread, except the one that has to.** Tauri runs a synchronous
+// command on the thread that owns the window, so a command that blocks (on ffmpeg, on a child
+// process, on the encoder, or merely on a lock another command holds) freezes every window for
+// as long as it blocks. There are three shapes here, and a test
+// (`every_command_but_the_drag_runs_off_the_ui_thread`) fails when a fourth appears:
 //
-// The same applies to the commands that are not about recording but block just as long: a
-// `trim_clip` runs ffmpeg over the whole window, a `thumbnail` runs ffmpeg per clip, a
-// `delete_session` removes a directory of footage, `copy_clip_to_clipboard` waits for
-// PowerShell, `list_audio_devices` waits for the thread that owns the COM apartment, and
-// `update_settings` writes the file and flushes it to disk. Each of those carries
-// `#[tauri::command(async)]`, which dispatches a synchronous body to a thread pool — the
-// signature does not have to change for that.
+// * `async fn` over [`blocking`], for the commands that run for real time: the ones that run
+//   ffmpeg (`trim_clip`, `thumbnail`, `combine_clips`, `export_clip`, `extract_clip`,
+//   `extract_match`, the screenshot), remove a directory of footage (`delete_session`), wait for
+//   PowerShell, or are a recording's start, stop or clip. They run on the blocking pool, which
+//   grows to the work, and the index ones hold no lock while they run.
+// * `#[tauri::command(async)]` over a synchronous body, for the quick ones that still touch the
+//   disk or a lock (every other command). The body runs on the runtime's workers and the window
+//   keeps painting; the signature does not have to change for that.
+// * `recording_status`, an `async fn` with no blocking in it: a few atomic loads.
+//
+// `drag_clip_out` is the exception, and says why where it is defined.
 
 /// Start recording through the shared engine.
 #[tauri::command(rename_all = "snake_case")]
-async fn start_recording(state: State<'_, AppState>) -> Result<RecordingStatusDto, CommandError> {
-    // Read at start time, not window-open time: a capture-only mistake must not stop the review
-    // pane from opening (see `config.rs`).
-    let settings = RecordingConfig::load(&state.recorder.config_path())?;
-    state.recorder.start(&settings)
+async fn start_recording(app: AppHandle) -> Result<RecordingStatusDto, CommandError> {
+    blocking(&app, |state| {
+        // Read at start time, not window-open time: a capture-only mistake must not stop the review
+        // pane from opening (see `config.rs`).
+        let settings = RecordingConfig::load(&state.recorder.config_path())?;
+        state.recorder.start(&settings)
+    })
+    .await
 }
 
 /// Stop recording and flush the encoder. Idempotent.
 #[tauri::command(rename_all = "snake_case")]
-async fn stop_recording(state: State<'_, AppState>) -> Result<RecordingStatusDto, CommandError> {
-    state.recorder.stop()
+async fn stop_recording(app: AppHandle) -> Result<RecordingStatusDto, CommandError> {
+    blocking(&app, |state| state.recorder.stop()).await
+}
+
+/// Get the recording out of the way of an update install.
+///
+/// The updater's installer ends this process, so whatever is recording is cut off where it stands:
+/// the session's scratch directory is left unconcatenated and its row never gets an end. The
+/// window calls this **before** it installs, and installs only when it returned `Ok`:
+///
+/// * nothing recording: `Ok({was_recording: false, stopped: false})`;
+/// * recording and `stop_recording` is `false`: an error with code `recording_active`, and the
+///   recording is untouched. This is what the window passes first, to learn whether it has to ask
+///   the user;
+/// * recording and `stop_recording` is `true`: the recording is stopped and finalised exactly as
+///   the Stop button does it, and the answer is `Ok({was_recording: true, stopped: true})`. A stop
+///   that fails is an error, and the install must not go ahead.
+#[tauri::command(rename_all = "snake_case")]
+async fn prepare_for_update(
+    app: AppHandle,
+    stop_recording: bool,
+) -> Result<UpdatePreparationDto, CommandError> {
+    blocking(&app, move |state| {
+        state.recorder.prepare_for_update(stop_recording)
+    })
+    .await
 }
 
 /// The live recording status. Answers "not running" before anything has been started.
@@ -773,15 +1030,15 @@ async fn recording_status(state: State<'_, AppState>) -> Result<RecordingStatusD
 
 /// Take a clip now: wait for the post-roll, splice it losslessly, index it.
 #[tauri::command(rename_all = "snake_case")]
-async fn clip_now(state: State<'_, AppState>) -> Result<RecordedClipDto, CommandError> {
-    state.recorder.clip_now()
+async fn clip_now(app: AppHandle) -> Result<RecordedClipDto, CommandError> {
+    blocking(&app, |state| state.recorder.clip_now()).await
 }
 
 /// What the window shows about the half of the shell that is not a window: the clip hotkey,
 /// where the configuration was read from, and what closing the window does. It puts on screen
 /// which chord to press and whether it is actually installed, and makes "the config is a file"
 /// a readable path.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
     let config_path = state.config_path();
     Ok(AppStatus {
@@ -793,7 +1050,7 @@ fn app_status(state: State<'_, AppState>) -> Result<AppStatus, CommandError> {
 }
 
 /// The health page: recorder, encoder, disk, event sources and the last problems the log holds.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn health(state: State<'_, AppState>) -> Result<health::HealthDto, CommandError> {
     let status = state.recorder.raw_status();
     let log_path = state.log_path().to_path_buf();
@@ -816,7 +1073,7 @@ fn health(state: State<'_, AppState>) -> Result<health::HealthDto, CommandError>
 }
 
 /// Which of CS2 / Dota 2 are installed in a Steam library, and whether the cfg is in place.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn gsi_targets() -> Vec<health::GsiTarget> {
     health::gsi_targets(&health::steam_libraries(&health::steam_roots()))
 }
@@ -828,15 +1085,18 @@ fn gsi_targets() -> Vec<health::GsiTarget> {
 /// clipboard so a user can paste it into a bug report without attaching anything by hand, and
 /// returned so the panel can show what was copied.
 ///
-/// Async because it waits for the clipboard: the call blocks until the child process is done,
-/// and the window must not stop answering while it does.
-#[tauri::command(async, rename_all = "snake_case")]
-fn copy_diagnostics(state: State<'_, AppState>) -> Result<DiagnosticsReport, CommandError> {
-    commands::copy_diagnostics(&state.app_data_dir, &state.config_path(), state.log_path())
+/// On the blocking pool because it waits for the clipboard: the call blocks until the child
+/// process is done, and the window must not stop answering while it does.
+#[tauri::command(rename_all = "snake_case")]
+async fn copy_diagnostics(app: AppHandle) -> Result<DiagnosticsReport, CommandError> {
+    blocking(&app, |state| {
+        commands::copy_diagnostics(&state.app_data_dir, &state.config_path(), state.log_path())
+    })
+    .await
 }
 
 /// The effective encoder settings, for the encoder panel.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn encoder_settings(state: State<'_, AppState>) -> Result<EncoderSettings, CommandError> {
     commands::encoder_settings(&state.config_path())
 }
@@ -858,7 +1118,7 @@ fn update_encoder_settings(
 /// The capabilities depend on the path the recording will take, not only on the vendor: the
 /// zero-copy Media Foundation path cannot scale and has no presets, and the ffmpeg-child path
 /// can. See `commands::encoder`.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn encoder_status(state: State<'_, AppState>) -> Result<EncoderStatus, CommandError> {
     let last = state.last_encoder();
     commands::encoder_status(&state.config_path(), last.as_deref())
@@ -877,7 +1137,7 @@ fn encoder_status(state: State<'_, AppState>) -> Result<EncoderStatus, CommandEr
 ///
 /// With no listener running there is nothing for the game to post to, so the install is
 /// refused with the reason rather than writing a file that cannot work.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn install_gsi_cfg(
     state: State<'_, AppState>,
     game: health::GsiGame,
@@ -916,7 +1176,7 @@ fn install_gsi_cfg(
 
 /// The effective settings, for the settings panel: the file's values where it sets them,
 /// the example's where it does not.
-#[tauri::command(rename_all = "snake_case")]
+#[tauri::command(async, rename_all = "snake_case")]
 fn get_settings(state: State<'_, AppState>) -> Result<commands::SettingsDto, CommandError> {
     commands::read_settings(&state.app_data_dir, &state.config_path())
 }
@@ -1065,6 +1325,12 @@ fn update_settings(
             ));
         }
     }
+    // A directory the asset protocol was taken off earlier in this run stays unreadable until a
+    // restart, so moving back to it is refused before anything is written (see
+    // `AppState::withdrawn_roots`).
+    if let Some(dir) = &update.clips_dir {
+        state.check_clips_dir_not_withdrawn(dir)?;
+    }
     let running = state.recorder().is_running()?;
     // `update_settings_and_prepare` creates the new clips directory before it writes anything, so
     // what is left here, committing it to the running shell and re-scoping the asset protocol, is
@@ -1138,12 +1404,14 @@ fn commit_clips_dir(
     // default for good.
     let scope = app.asset_protocol_scope();
     if previous != paths.clips_dir && previous != state.default_clips_dir() {
-        if let Err(err) = scope.forbid_directory(&previous, true) {
-            tracing::warn!(
+        match scope.forbid_directory(&previous, true) {
+            // Remembered, because it cannot be undone: see `AppState::withdrawn_roots`.
+            Ok(()) => state.withdraw_clips_root(&previous),
+            Err(err) => tracing::warn!(
                 "the asset protocol was not taken off {}: {err}. Files in that directory may \
                  still be readable.",
                 previous.display()
-            );
+            ),
         }
     }
     if let Err(err) = scope.allow_directory(&paths.clips_dir, true) {
@@ -1243,6 +1511,9 @@ fn open_state(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let log_path = init_tracing();
+    // The move of the old data directory ran before the subscriber existed (it runs inside the
+    // first `app_data_dir` call, which is the log's own set-up), so its report is replayed here.
+    config::log_migration_report();
 
     let app_data_dir = config::app_data_dir();
     let config_path = app_data_dir.join("config.toml");
@@ -1282,15 +1553,26 @@ pub fn run() {
         ));
     }
     let asset_roots = state.asset_roots();
+    // The Run entry's `--background` says this start came from the login and not from the user, so
+    // the review window stays out of the way. Read from this process's own arguments only: a second
+    // launch is handed to the running instance by the single-instance plugin below, which shows the
+    // window, because that one *is* the user.
+    let background_launch = background::is_background_launch(std::env::args_os());
+    // Set once the recorder has been flushed for the exit in progress (see `exit_action`).
+    let exit_flushed = Arc::new(AtomicBool::new(false));
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         // A second launch must hand over to the running instance (which owns the hotkey, tray and
         // capture session) instead of fighting it. Registered first, as the plugin requires.
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
-                let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
+                // Not the window's own focus call: on Windows it sends a synthetic Alt key, which an
+                // anti-cheat treats as automation (see `window_focus`).
+                if let Err(err) = window_focus::bring_window_forward(&window) {
+                    tracing::warn!(
+                        "the running window could not be shown for a second launch: {err}"
+                    );
+                }
             }
         }))
         // The settings panel's folder picker (open dialogs only; see capabilities/default.json).
@@ -1365,6 +1647,19 @@ pub fn run() {
             });
             app.manage(state);
 
+            if background_launch {
+                // Before the tray is wired, so its first refresh already sees a hidden window.
+                match app.get_webview_window(MAIN_WINDOW).map(|w| w.hide()) {
+                    Some(Err(err)) => {
+                        tracing::warn!("the window could not be hidden for a background start: {err}")
+                    }
+                    Some(Ok(())) => tracing::info!(
+                        "started with --background: the window is hidden, and replayed is in the tray"
+                    ),
+                    None => {}
+                }
+            }
+
             // The start-with-Windows entry, if the config asks for it. Best effort and never fatal: a
             // failed autostart write must not stop a recording session. Windows only; elsewhere it reports
             // why it did nothing. A config file that could not be read is said out loud too: the entry
@@ -1422,6 +1717,7 @@ pub fn run() {
             extract_clip,
             start_recording,
             stop_recording,
+            prepare_for_update,
             recording_status,
             clip_now,
             app_status,
@@ -1439,8 +1735,95 @@ pub fn run() {
             encoder_status,
             log_from_frontend
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running the replayed desktop shell");
+        .build(tauri::generate_context!())
+        .expect("error while building the replayed desktop shell");
+    app.run(move |app, event| handle_run_event(app, &event, &exit_flushed));
+}
+
+/// What an exit request has to do before the process may end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitAction {
+    /// The recorder is already flushed (or this is the request that follows the flush): exit.
+    Proceed,
+    /// Hold the exit, flush the recorder on a thread of its own, then ask again.
+    FlushThenExit,
+    /// The exit cannot be held (Tauri ignores `prevent_exit` for a restart), so flush here, now.
+    FlushInline,
+}
+
+/// Decide an exit request. `code` is the request's exit code, `None` when a user asked.
+fn exit_action(code: Option<i32>, flushed: bool) -> ExitAction {
+    if flushed {
+        ExitAction::Proceed
+    } else if code == Some(tauri::RESTART_EXIT_CODE) {
+        ExitAction::FlushInline
+    } else {
+        ExitAction::FlushThenExit
+    }
+}
+
+/// Stop and finalise the recording before the process ends.
+///
+/// Everything that ends the process without pressing Stop (the tray's Quit, the system closing the
+/// application, a restart) comes through the run loop's exit events, so the recorder is flushed
+/// *here*: otherwise the in-flight segment is never closed, the session's scratch directory is left
+/// unconcatenated and its row never gets an end. A failure is logged and the exit goes ahead; an
+/// application that cannot be quit is worse than a recording that could not be finalised.
+fn flush_recorder_for_exit(app: &AppHandle) {
+    let Some(state) = app.try_state::<AppState>() else {
+        return;
+    };
+    match state.recorder().stop_for_exit() {
+        Ok(true) => tracing::info!("the recording was stopped and finalised for the exit"),
+        Ok(false) => {}
+        Err(err) => tracing::error!("the recording could not be finalised for the exit: {err}"),
+    }
+}
+
+/// The run loop's exit handling.
+///
+/// `ExitRequested` runs on the thread that paints the windows, and the flush takes seconds (the
+/// session is concatenated), so the exit is held, the flush runs on a thread of its own (the same
+/// rule as [`off_event_loop`]), and that thread asks to exit again once it is done. `Exit` is the
+/// last word: it flushes only if nothing earlier did, and may block, because there is no window
+/// left to freeze.
+///
+/// The updater's installer ends the process without any of these events, which is why the window
+/// asks `prepare_for_update` before it installs.
+fn handle_run_event(app: &AppHandle, event: &RunEvent, flushed: &Arc<AtomicBool>) {
+    match event {
+        RunEvent::ExitRequested { code, api, .. } => {
+            match exit_action(*code, flushed.load(Ordering::Acquire)) {
+                ExitAction::Proceed => {}
+                ExitAction::FlushInline => {
+                    flush_recorder_for_exit(app);
+                    flushed.store(true, Ordering::Release);
+                }
+                ExitAction::FlushThenExit => {
+                    let (handle, done) = (app.clone(), Arc::clone(flushed));
+                    let code = code.unwrap_or(0);
+                    let spawned = std::thread::Builder::new()
+                        .name("replayed-exit-flush".into())
+                        .spawn(move || {
+                            flush_recorder_for_exit(&handle);
+                            done.store(true, Ordering::Release);
+                            handle.exit(code);
+                        });
+                    match spawned {
+                        Ok(_) => api.prevent_exit(),
+                        Err(err) => {
+                            // No thread, so no hold: flush on this one and let the exit through.
+                            tracing::error!("the exit flush thread could not be started: {err}");
+                            flush_recorder_for_exit(app);
+                            flushed.store(true, Ordering::Release);
+                        }
+                    }
+                }
+            }
+        }
+        RunEvent::Exit if !flushed.swap(true, Ordering::AcqRel) => flush_recorder_for_exit(app),
+        _ => {}
+    }
 }
 
 /// Record an error the frontend hit, on the same stream as the backend's own.
@@ -1455,7 +1838,7 @@ pub fn run() {
 /// and let the rest of it read as a backend line, and an unbounded message would churn the
 /// rotation set. So the text is flattened to one line and capped, and the line is tagged as the
 /// webview's so a forged backend line is distinguishable from a real one.
-#[tauri::command]
+#[tauri::command(async)]
 fn log_from_frontend(level: String, message: String, detail: Option<String>) {
     let detail = detail.unwrap_or_default();
     let detail = detail.trim();
@@ -1612,13 +1995,25 @@ fn wire_background(
                              the tray. Quit from the tray menu (there is no other way out)."
                         );
                     }
-                    wiring.refresh(&shell, &hotkey);
+                    // Off the event loop: this callback is the UI thread, and a refresh from it
+                    // can wait on itself (see [`off_event_loop`]).
+                    let (shell, wiring, hotkey) =
+                        (shell.clone(), Arc::clone(&wiring), hotkey.clone());
+                    off_event_loop("replayed-tray-refresh", move || {
+                        wiring.refresh(&shell, &hotkey);
+                    });
                 }
             }
         });
     }
 
-    wiring.refresh(&shell, &hotkey);
+    // `setup` runs on the UI thread too, with the poll thread already running.
+    {
+        let (shell, wiring, hotkey) = (shell.clone(), Arc::clone(&wiring), hotkey.clone());
+        off_event_loop("replayed-tray-refresh", move || {
+            wiring.refresh(&shell, &hotkey);
+        });
+    }
     Ok(())
 }
 
@@ -1672,13 +2067,9 @@ impl Shell for AppShell {
         let window = self
             .window()
             .ok_or_else(|| "the window is gone".to_string())?;
-        // Unminimise first: a window restored from the taskbar is minimised as often as hidden, and
-        // `show` alone would leave it in the tray area.
-        let _ = window.unminimize();
-        window
-            .show()
-            .and_then(|()| window.set_focus())
-            .map_err(|err| err.to_string())
+        // Restores, shows and asks for the foreground without synthesising input; a refused
+        // foreground flashes the taskbar button instead (see `window_focus`).
+        window_focus::bring_window_forward(&window).map(drop)
     }
 
     fn hide_window(&self) -> Result<(), String> {
@@ -1712,11 +2103,7 @@ impl Shell for AppShell {
             .try_state::<AppState>()
             .ok_or_else(|| "the application state is not available yet".to_string())?;
         let path = state.config_path();
-        let (program, args) = background::reveal_command(&path, background::FileManager::current());
-        replayed_media::sidecar_command(&program)
-            .args(&args)
-            .spawn()
-            .map_err(|err| format!("could not run {program}: {err}"))?;
+        reveal_in_file_manager(&path)?;
         Ok(path)
     }
 
@@ -1806,21 +2193,29 @@ impl TrayWiring {
             // no separate click handler to get out of step with it.
             .show_menu_on_left_click(true)
             .on_menu_event(move |app, event| {
-                let shell = AppShell { app: app.clone() };
                 let id = event.id().as_ref().to_string();
                 let Some(action) = MenuAction::from_id(&id) else {
                     tracing::warn!("the tray sent an id this build did not create: {id}");
                     return;
                 };
-                let outcome = background::dispatch(action, &shell);
-                tracing::info!("tray: {id} → {}", outcome.describe());
-                // The wiring's own refresh, from the callback: the poll thread would catch up within half a
-                // second, but a menu already stale when it reopens lies twice.
-                if let Some(wiring) = app.try_state::<Arc<TrayWiring>>() {
-                    if let Some(state) = app.try_state::<AppState>() {
-                        wiring.refresh(&shell, &state.hotkey());
+                // **This callback runs on the thread that paints the window, so it only hands the
+                // action off.** A start or a stop takes seconds, and the refresh after it waits on
+                // this very thread for the icon and menu updates while holding the lock this
+                // callback would take (see [`off_event_loop`]).
+                let app = app.clone();
+                off_event_loop("replayed-tray-action", move || {
+                    let _in_order = TRAY_ACTIONS.lock().unwrap_or_else(|err| err.into_inner());
+                    let shell = AppShell { app: app.clone() };
+                    let outcome = background::dispatch(action, &shell);
+                    tracing::info!("tray: {id} → {}", outcome.describe());
+                    // The wiring's own refresh: the poll thread would catch up within half a second,
+                    // but a menu already stale when it reopens lies twice.
+                    if let Some(wiring) = app.try_state::<Arc<TrayWiring>>() {
+                        if let Some(state) = app.try_state::<AppState>() {
+                            wiring.refresh(&shell, &state.hotkey());
+                        }
                     }
-                }
+                });
             })
             .build(&shell.app)?;
 
@@ -1852,6 +2247,12 @@ impl TrayWiring {
     }
 
     /// Re-derive the tray from the shell and apply what changed.
+    ///
+    /// **Never call this from the event loop** (a menu or window callback, `setup`). The icon,
+    /// tooltip and label updates below are round trips to the UI thread, made while `rendering` is
+    /// held so two refreshes cannot interleave their writes; a UI-thread caller waiting for that
+    /// lock while the holder waits for the UI thread is a deadlock. Callers there go through
+    /// [`off_event_loop`].
     fn refresh(&self, shell: &AppShell, hotkey: &HotkeyStatus) {
         let status = match shell.status() {
             Ok(status) => status,
@@ -2010,6 +2411,339 @@ mod tests {
         let path = tauri_dir().join(file);
         let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {file}: {e}"));
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("parsing {file}: {e}"))
+    }
+
+    /// **The webview's permissions are exactly the three it needs, and a new one is a decision.**
+    ///
+    /// The capability file used to grant the folder picker (`dialog:allow-open`) and the notification
+    /// plugin's defaults, neither of which the page uses: the picker and the toast are driven from
+    /// Rust, which the permission system does not gate. A permission the page does not use is only
+    /// reach for a page that has been compromised, and the dialog's `open` is the worse kind: the
+    /// plugin widens the asset protocol's read scope to whatever the user picks, which is exactly
+    /// the widening `choose_clips_dir` exists to keep out of the webview's hands.
+    ///
+    /// Adding a permission here has to be a change to this list, and so to the security notes that
+    /// describe it.
+    #[test]
+    fn the_webview_holds_only_the_permissions_it_uses() {
+        let capability = config("capabilities/default.json");
+        let permissions: Vec<&str> = capability["permissions"]
+            .as_array()
+            .expect("permissions is a list")
+            .iter()
+            .map(|p| p.as_str().expect("a permission is a string"))
+            .collect();
+
+        assert_eq!(
+            permissions,
+            [
+                "core:default",
+                "updater:allow-check",
+                "updater:allow-download-and-install"
+            ],
+            "the capability changed: update docs/SECURITY.md's account of what the webview may do"
+        );
+        let description = capability["description"].as_str().unwrap();
+        for claimed_absent in ["dialog", "notification"] {
+            assert!(
+                description.contains(claimed_absent),
+                "the description must say that {claimed_absent} is not granted"
+            );
+        }
+    }
+
+    /// The part of this file that ships: everything before the test module.
+    fn production_source() -> &'static str {
+        let source = include_str!("lib.rs");
+        let end = source
+            .find("\n#[cfg(test)]\nmod tests")
+            .expect("the test module follows the production code");
+        &source[..end]
+    }
+
+    /// **An exit request flushes the recorder first, off the event loop where it can be held.**
+    #[test]
+    fn an_exit_is_held_for_the_flush_unless_it_cannot_be_or_already_happened() {
+        // A quit, a close of the application, a request from code: hold, flush, ask again.
+        assert_eq!(exit_action(None, false), ExitAction::FlushThenExit);
+        assert_eq!(exit_action(Some(0), false), ExitAction::FlushThenExit);
+        // The request the flush thread makes itself must go through, or the app never ends.
+        assert_eq!(exit_action(None, true), ExitAction::Proceed);
+        assert_eq!(exit_action(Some(0), true), ExitAction::Proceed);
+        // Tauri ignores `prevent_exit` for a restart, so the flush cannot be deferred.
+        assert_eq!(
+            exit_action(Some(tauri::RESTART_EXIT_CODE), false),
+            ExitAction::FlushInline
+        );
+        assert_eq!(
+            exit_action(Some(tauri::RESTART_EXIT_CODE), true),
+            ExitAction::Proceed
+        );
+    }
+
+    /// **The glue the wave-1 modules were written for is called.** The wiring needs a desktop to
+    /// run, so this reads the source, as the guard above does.
+    #[test]
+    fn the_startup_and_exit_glue_is_wired() {
+        let source = production_source();
+        assert!(
+            !source.contains("reveal_command("),
+            "reveal sites must spawn `background::reveal_process`, which quotes for Explorer"
+        );
+        assert!(source.contains("reveal_process("));
+        let tracing = source.find("let log_path = init_tracing();").unwrap();
+        let report = source.find("config::log_migration_report();").unwrap();
+        let open = source.find("open_state(&app_data_dir").unwrap();
+        assert!(
+            tracing < report && report < open,
+            "the migration report is replayed once logging is up, before the state opens"
+        );
+        assert!(source.contains("background::is_background_launch(std::env::args_os())"));
+        assert!(
+            source.contains("RunEvent::ExitRequested") && source.contains("RunEvent::Exit if"),
+            "the run loop must flush the recorder on both exit events"
+        );
+        let migrate = source.find("store.migrate()").unwrap();
+        let repair = source.find("config::repair_legacy_index_paths(").unwrap();
+        let ffmpeg = source.find("FfmpegBinaries::discover(None)").unwrap();
+        assert!(
+            migrate < repair && repair < ffmpeg,
+            "the index paths are repaired after the migration and before the library is read"
+        );
+    }
+
+    /// **No command may block the UI thread, except the one that has to start a drag there.**
+    ///
+    /// Tauri runs a plain `fn` command on the thread that owns the window. A command that blocks
+    /// (on ffmpeg, on the encoder, on a lock another command holds across ffmpeg) froze every
+    /// window for as long as it blocked; the health page's poll behind a stopping recording was the
+    /// reported case, and `combine_clips`, `export_clip` and `extract_clip` ran their ffmpeg right
+    /// there. So every command is either an `async fn` or carries `#[tauri::command(async)]`, and
+    /// this reads the source to keep it so.
+    ///
+    /// The one exception, `drag_clip_out`, begins an OS drag loop that has to start on the UI
+    /// thread, and says so where it is defined.
+    #[test]
+    fn every_command_but_the_drag_runs_off_the_ui_thread() {
+        let marker = format!("#[{}::command(", "tauri");
+        let source = include_str!("lib.rs");
+        let mut lines = source.lines().peekable();
+        let mut on_ui_thread = Vec::new();
+        while let Some(line) = lines.next() {
+            let attribute = line.trim_start();
+            if !attribute.starts_with(&marker) {
+                continue;
+            }
+            let off_thread = attribute.contains("async");
+            // The item the attribute is on: the next line that is not another attribute or a doc line.
+            let item = lines
+                .by_ref()
+                .find(|l| {
+                    let l = l.trim_start();
+                    !l.starts_with("#[") && !l.starts_with("///")
+                })
+                .unwrap_or_default()
+                .trim_start();
+            if !off_thread && !item.starts_with("async fn") {
+                on_ui_thread.push(item.to_string());
+            }
+        }
+
+        assert_eq!(
+            on_ui_thread.len(),
+            1,
+            "commands left on the UI thread: {on_ui_thread:?}"
+        );
+        assert!(
+            on_ui_thread[0].starts_with("fn drag_clip_out("),
+            "the only command allowed on the UI thread is the drag, not {:?}",
+            on_ui_thread[0]
+        );
+    }
+
+    /// The tray's callbacks run on the UI thread and must not call the refresh.
+    ///
+    /// `TrayWiring::refresh` holds the `rendering` lock across round trips to the UI thread, so a
+    /// refresh from the UI thread that has to wait for the lock while another refresh holds it and
+    /// waits for the UI thread is a deadlock of the whole window. The menu callback and the window
+    /// event callback hand their refresh to a thread (`off_event_loop`) instead. This reads those
+    /// two closures out of the source and checks that every refresh in them is inside one.
+    #[test]
+    fn the_event_loop_callbacks_never_refresh_the_tray_themselves() {
+        let source = include_str!("lib.rs");
+        let code = &source[..source.find("#[cfg(test)]\nmod tests").unwrap()];
+        for (name, start, end) in [
+            (
+                "the tray menu callback",
+                ".on_menu_event(",
+                ".build(&shell.app)?;",
+            ),
+            (
+                "the window event callback",
+                "window.on_window_event(",
+                "wiring.refresh(&shell",
+            ),
+        ] {
+            let from = code.find(start).unwrap_or_else(|| panic!("{name} moved"));
+            let region = &code[from..];
+            let to = region.find(end).unwrap_or_else(|| panic!("{name} moved")) + end.len();
+            let region = &region[..to];
+            let mut rest = region;
+            while let Some(at) = rest.find(".refresh(") {
+                let before = &region[..region.len() - rest.len() + at];
+                let handed_off = before.rfind("off_event_loop(");
+                assert!(
+                    handed_off.is_some_and(|open| !before[open..].contains("});")),
+                    "{name} calls the tray refresh on the event loop: wrap it in `off_event_loop`"
+                );
+                rest = &rest[at + ".refresh(".len()..];
+            }
+        }
+    }
+
+    /// `off_event_loop` returns at once, whatever the work does.
+    #[test]
+    fn handing_work_off_the_event_loop_does_not_wait_for_it() {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (finished, done) = std::sync::mpsc::channel::<()>();
+
+        off_event_loop("test-off-loop", move || {
+            let _ = wait.recv();
+            let _ = finished.send(());
+        });
+
+        // Still here, and the work is still waiting: the caller was not held for it.
+        assert!(done.try_recv().is_err());
+        release.send(()).unwrap();
+        done.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the work ran on its own thread");
+    }
+
+    /// **A slow command must not hold the index.**
+    ///
+    /// `with_deps` holds the store's lock for the whole call, so `combine_clips`, `export_clip` and
+    /// `extract_clip` (each running ffmpeg inside it) kept every other index command waiting for as
+    /// long as the encode took. `with_deps_detached` copies what it needs, lets go of every lock and
+    /// opens its own connection, so the two neither wait for each other nor deadlock.
+    #[test]
+    fn a_detached_command_neither_waits_for_nor_holds_the_index_lock() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let state =
+            Arc::new(AppState::open(&dir.path().join("replayed"), storage(), log_path()).unwrap());
+
+        // A command holding the index lock, as the ffmpeg commands used to.
+        let (holding_tx, holding_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let holder = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state
+                    .with_deps(|_| {
+                        holding_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        holding_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+        // A detached command answers while the lock is held.
+        let (answered_tx, answered_rx) = mpsc::channel();
+        {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let clips = state.with_deps_detached(commands::list_clips);
+                let _ = answered_tx.send(clips.map(|c| c.len()));
+            });
+        }
+        let answered = answered_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert_eq!(
+            answered
+                .expect("the detached command waited for the index lock")
+                .unwrap(),
+            0
+        );
+
+        // And while a detached command is running, the locked path is not held up either.
+        let (inside_tx, inside_rx) = mpsc::channel();
+        let (leave_tx, leave_rx) = mpsc::channel::<()>();
+        let detached = {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                state
+                    .with_deps_detached(|_| {
+                        inside_tx.send(()).unwrap();
+                        leave_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        inside_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (listed_tx, listed_rx) = mpsc::channel();
+        {
+            let state = Arc::clone(&state);
+            std::thread::spawn(move || {
+                let _ = listed_tx.send(state.with_deps(commands::list_clips).map(|c| c.len()));
+            });
+        }
+        let listed = listed_rx.recv_timeout(Duration::from_secs(5));
+        leave_tx.send(()).unwrap();
+        detached.join().unwrap();
+        assert_eq!(
+            listed
+                .expect("a detached command held a lock the index needs")
+                .unwrap(),
+            0
+        );
+    }
+
+    /// **A clips directory the asset scope was taken off cannot silently come back.**
+    ///
+    /// Taking a directory out of the asset protocol's scope is irreversible for the life of the
+    /// process, and the forbid beats a later allow. Moving the clips directory away and back used to
+    /// leave a library whose files would not play with nothing to say why. The state now remembers
+    /// what it withdrew and refuses the move back, naming the cause.
+    #[test]
+    fn a_withdrawn_clips_directory_is_refused_until_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("replayed");
+        let state = AppState::open(&app_dir, storage(), log_path()).unwrap();
+        let old = dir.path().join("old-clips");
+
+        state
+            .check_clips_dir_not_withdrawn(old.to_str().unwrap())
+            .unwrap();
+        state.withdraw_clips_root(&old);
+
+        let again = state
+            .check_clips_dir_not_withdrawn(old.to_str().unwrap())
+            .unwrap_err();
+        assert_eq!(again.code, ErrorCode::InvalidInput);
+        assert!(again.message.contains("restart"), "{}", again.message);
+        assert!(
+            state
+                .check_clips_dir_not_withdrawn(old.join("sub").to_str().unwrap())
+                .is_err(),
+            "the forbid is recursive, so a folder inside it is refused too"
+        );
+        assert!(
+            state
+                .check_clips_dir_not_withdrawn(dir.path().to_str().unwrap())
+                .is_err(),
+            "a folder that contains it would be only partly readable"
+        );
+        // Another directory, and the default (empty), are untouched.
+        state
+            .check_clips_dir_not_withdrawn(dir.path().join("other").to_str().unwrap())
+            .unwrap();
+        state.check_clips_dir_not_withdrawn("").unwrap();
     }
 
     /// The tray icons, decoded. They are committed binary assets, and a corrupt one is a tray with
@@ -2266,6 +3000,24 @@ mod tests {
         let clips = second.with_deps(commands::list_clips).unwrap();
         assert_eq!(clips.len(), 1, "the second open reads what the first wrote");
         assert_eq!(clips[0].id, id);
+    }
+
+    /// The thumbnail cache is cleaned of files no clip owns when the shell opens, because retention
+    /// and the CLI delete clips without telling it (the cache was keyed by rowid and never cleared).
+    #[test]
+    fn opening_the_shell_sweeps_thumbnails_no_clip_owns() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_dir = dir.path().join("replayed");
+        let first = AppState::open(&app_dir, storage(), log_path()).unwrap();
+        let thumbs = first.paths.lock().unwrap().thumbnails_dir.clone();
+        std::fs::create_dir_all(&thumbs).unwrap();
+        let orphan = thumbs.join(commands::thumbnail_file_name(41, 1, 0));
+        std::fs::write(&orphan, b"x").unwrap();
+        drop(first);
+
+        let _second = AppState::open(&app_dir, storage(), log_path()).unwrap();
+
+        assert!(!orphan.exists(), "a thumbnail of a clip that is gone stays");
     }
 
     #[test]

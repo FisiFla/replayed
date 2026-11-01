@@ -309,6 +309,13 @@ pub fn update_settings_file(
     // Only a value that actually changed can demand a restart: re-applying the same fps is a no-op,
     // not a reason to stop a recording.
     let mut engine_changed = Vec::new();
+    // The recording in flight was started with the directory it found: its engine writes every
+    // clip there until it is restarted. The shell's own paths move at once (so the library lists
+    // the new directory), which made the panel say "saved" while new clips kept landing in the old
+    // folder, with nothing to say why the two disagreed.
+    if update.clips_dir.is_some() && after.clips_dir != before.clips_dir {
+        engine_changed.push("storage.clips_dir");
+    }
     if update.fps.is_some() && after.fps != before.fps {
         engine_changed.push("encode.fps");
     }
@@ -987,10 +994,35 @@ mod tests {
             running.restart_reason
         );
 
-        let storage_only = update_settings_file(dir.path(), &path, &clips, true).unwrap();
+        // The running engine keeps writing clips into the directory it started with, so a changed
+        // clips directory is a restart too, and the reason names it.
+        let moved = update_settings_file(dir.path(), &path, &clips, true).unwrap();
         assert!(
-            !storage_only.restart_required,
-            "the clips directory applies without the engine"
+            moved.restart_required,
+            "the running recorder still writes to the old clips directory"
+        );
+        assert!(
+            moved
+                .restart_reason
+                .as_deref()
+                .unwrap()
+                .contains("storage.clips_dir"),
+            "the reason names the key: {:?}",
+            moved.restart_reason
+        );
+        let moved_while_idle = update_settings_file(
+            dir.path(),
+            &path,
+            &SettingsUpdate {
+                clips_dir: Some("/tmp/clips-2".to_string()),
+                ..Default::default()
+            },
+            false,
+        )
+        .unwrap();
+        assert!(
+            !moved_while_idle.restart_required,
+            "idle: the next start picks the directory up"
         );
 
         // Re-applying the value already on disk changes nothing, so it demands nothing.

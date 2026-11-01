@@ -43,8 +43,8 @@ stream.set_write_timeout(Some(timeout))?;
 
 ### Where it has already happened here
 
-1. **`crates/encoder/src/ffmpeg.rs::accept_within`** — the encoder's loopback-TCP audio
-   transport. The listener is non-blocking to bound the "ffmpeg never connected" wait; the
+1. **The audio link's accept loop** (originally `ffmpeg.rs::accept_within`, now in
+   `crates/encoder/src/audio_link.rs`) — the encoder's audio transport. The listener is non-blocking to bound the "ffmpeg never connected" wait; the
    accepted socket then went non-blocking and `write_all` failed with `WouldBlock` as soon
    as ffmpeg's receive buffer filled. Fixed by `stream.set_nonblocking(false)` after accept
    (commit `82578bd fix(encoder): force the accepted audio socket to blocking mode`); the
@@ -74,3 +74,19 @@ stream.set_write_timeout(Some(timeout))?;
 Each site already has a comment explaining this. They were added *when the bug was fixed*,
 which is too late for the next person about to write socket code somewhere else. This file
 is the place to look **first**.
+
+---
+
+## Trap 2 — `LOCAL_PEERPID` can say "not connected" for a connection that is about to be fine (macOS)
+
+**The rule: when asking the kernel who is on the other end of a just-accepted Unix socket, expect
+`ENOTCONN` for a moment on macOS, and retry that one error briefly.**
+
+The audio link authenticates its peer (`crates/encoder/src/audio_link.rs`): the encoder uses a
+connection only if the operating system says the connecting process is the ffmpeg child it spawned.
+On Linux `SO_PEERCRED` answers at once. On macOS `accept` can return a socket whose peer is not yet
+recorded, and `LOCAL_PEERPID` answers `ENOTCONN`; the first run of the microphone tests refused
+ffmpeg's own connection because of it. The code retries that error (and only that error) for about
+100 ms, then refuses the peer like any other it cannot identify. It does not fall back to an
+unauthenticated link. On Windows the same check reads the system TCP table instead
+(`GetExtendedTcpTable`) and has no such race.

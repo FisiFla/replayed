@@ -38,6 +38,7 @@ import type {
   PruneOutcome,
   RecordedClip,
   RecordingStatus,
+  UpdatePreparation,
   SessionDto,
   SessionEvent,
   SettingsDto,
@@ -279,8 +280,11 @@ export interface ClipSource {
    * Validate and write the encoder settings, and answer with the values that were written.
    *
    * The whole table travels in one object — there is no partial update — because the backend
-   * validates it as a whole and refuses a combination it cannot record with. A refusal comes
-   * back as a rejection carrying the reason, which the panel shows.
+   * validates it as a whole and refuses a combination it cannot record with. A caller that
+   * means to change a few fields reads the table again just before and lays only those over
+   * it (see `EncoderPanel`), since `fps` and `output_size` are written from the settings
+   * panel's Capture group as well. A refusal comes back as a rejection carrying the reason,
+   * which the panel shows.
    */
   updateEncoderSettings(settings: EncoderSettings): Promise<EncoderSettings>;
   /**
@@ -335,19 +339,57 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   try {
     // Same arity as a direct `invoke`: `ipc.test.ts` asserts which commands are called with
     // no arguments at all, and passing a stray `undefined` would blur that.
-    return args === undefined ? await tauriInvoke<T>(command) : await tauriInvoke<T>(command, args);
+    const answer =
+      args === undefined ? await tauriInvoke<T>(command) : await tauriInvoke<T>(command, args);
+    // An answer ends an episode of failing: the next failure is news again.
+    lastFailure.delete(command);
+    return answer;
   } catch (err) {
     // Not through the log's own command: if `log_from_frontend` fails there is nowhere left
     // to say so, and reporting it through itself is a rejection loop.
-    if (command !== 'log_from_frontend') {
-      void tauriInvoke('log_from_frontend', {
-        level: 'error',
-        message: `${command} failed`,
-        detail: errorMessage(err),
-      }).catch(() => {});
-    }
+    if (command !== 'log_from_frontend') logFailure(command, err);
     throw err;
   }
+}
+
+/**
+ * Refusals that are the user's own answer rather than a fault, by command and error code.
+ *
+ * The health page's "recent problems" reads the log's tail for `ERROR` and `WARN` lines, so a
+ * line written at the wrong level is a false problem on that page: cancelling the folder
+ * picker is `InvalidInput` ("no folder was chosen") and nothing is wrong. These are written at
+ * `info`. The list is by command *and* code, not by code alone, so a real `InvalidInput` from
+ * any other command is still an error.
+ */
+const EXPECTED_REFUSALS: Record<string, ErrorCode[]> = {
+  choose_clips_dir: ['invalid_input'],
+  // "A recording is running": the answer that sends the updater to ask the user, not a fault.
+  prepare_for_update: ['recording_active'],
+};
+
+/** The last failure logged for each command, to say a repeating one once. */
+const lastFailure = new Map<string, string>();
+
+/**
+ * Write a failed command into the application log, once per episode.
+ *
+ * The recorder status is read every half second and the health page every five. A command that
+ * keeps failing (a poisoned lock, say) would write two error lines a second for as long as it
+ * lasted, and the log's tail is 256 KiB: the one real error from an hour ago would be pushed out
+ * of the health page by lines saying the same thing. So an identical failure of the same command
+ * is logged the first time and not again until that command has answered once.
+ */
+function logFailure(command: string, err: unknown): void {
+  const detail = errorMessage(err);
+  if (lastFailure.get(command) === detail) return;
+  lastFailure.set(command, detail);
+  const code = errorCode(err);
+  const expected = code !== null && (EXPECTED_REFUSALS[command] ?? []).includes(code);
+  void tauriInvoke('log_from_frontend', {
+    level: expected ? 'info' : 'error',
+    message: `${command} failed`,
+    detail,
+  }).catch(() => {});
 }
 
 /** The real IPC, backed by the Tauri runtime. */
@@ -406,6 +448,27 @@ export const tauriIpc: ClipSource = {
     invoke<void>('log_from_frontend', { level, message, detail }),
   assetUrl: (path) => convertFileSrc(path),
 };
+
+/**
+ * Get the recording out of the way of an update install (`prepare_for_update`).
+ *
+ * The updater's installer ends this process, so a recording that is running is cut off where it
+ * stands. The window asks here before it installs, and installs only when this resolved:
+ *
+ * - nothing recording: resolves with both flags false;
+ * - recording and `stopRecording` false: **rejects** with code `recording_active` and touches
+ *   nothing, which is how the window finds out it has to ask the user;
+ * - recording and `stopRecording` true: the recording is stopped and finalised as the Stop
+ *   button does it, and this resolves with `stopped` true. A stop that fails rejects.
+ *
+ * A function of its own rather than a `ClipSource` method: the source is the seam the library
+ * and recorder views are driven through (and that the screenshot harness fakes), and the
+ * updater is neither of those: it talks to the plugin directly, so this is how it reaches the
+ * one command it needs.
+ */
+export function prepareForUpdate(stopRecording: boolean): Promise<UpdatePreparation> {
+  return invoke<UpdatePreparation>('prepare_for_update', { stop_recording: stopRecording });
+}
 
 /**
  * The source a component talks to when it has none of its own.

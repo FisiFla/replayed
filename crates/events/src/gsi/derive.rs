@@ -9,7 +9,7 @@
 //! |---|---|
 //! | nothing was in a game, now there is | `GameStart` |
 //! | a game was in progress, now there is not (`map.phase == "gameover"`, Dota 2's `POST_GAME`, or an empty map) | `GameEnd` |
-//! | `player.match_stats.kills` (Dota 2: `player.kills`) went up | `Kill` |
+//! | `player.match_stats.kills` (Dota 2: `player.kills`) went up, for the local player, outside warmup | `Kill` |
 //! | `deaths` went up | `Death` |
 //! | `assists` went up | `Assist` |
 //! | `map.round` went up | `RoundStart` |
@@ -17,11 +17,23 @@
 //! | the bomb state became `"planted"` / `"defused"` | `BombPlanted` / `BombDefused` |
 //! | anything else | nothing |
 //!
-//! Three rules make it survive real payloads:
+//! Five rules make it survive real payloads:
 //!
 //! * A delta, not a count. Scoreboards are totals, so the tracker keeps a baseline, and it
 //!   must be the same player's: `steamid` is compared, and a payload for a different player (a
 //!   spectator switching view) re-baselines silently instead of reporting their kills as a jump.
+//! * The local player, not whoever is on screen. Counter-Strike's `player` block describes the
+//!   player being *observed*, which is the user only while alive; once dead the game follows a
+//!   teammate and that teammate's totals arrive in the same block. `provider.steamid` is the
+//!   client's own id, so a Counter-Strike scoreboard only counts when `player.steamid` is it, and
+//!   the baseline moves silently otherwise. When the document carries no `player.steamid` at all
+//!   (a `.cfg` installed before `player_id` was subscribed) the player is taken to be the local
+//!   one, because the only alternative is to drop every kill; that is the one case where
+//!   spectating cannot be told apart, which is why the installed file should be refreshed (see
+//!   [`crate::gsi::integration`]).
+//! * Warmup is not a match. Counter-Strike's `map.phase == "warmup"` is practice against bots and
+//!   free respawns; its kills are neither worth a clip nor part of the match scoreboard, so the
+//!   baseline follows them without reporting.
 //! * A jump is one event. Two kills inside one POST window are one `Kill` with `"delta": 2`;
 //!   two clips for one payload would invent events never separately observed.
 //! * Transitions, not values. Round and bomb events fire on the edge, so the heartbeat that
@@ -92,7 +104,7 @@ impl Baseline {
         let player = snapshot.player.first();
         Self {
             game: Some(game),
-            steamid: player.and_then(player_steamid),
+            steamid: watched_steamid(snapshot, game),
             kills: player.and_then(Player::kills),
             deaths: player.and_then(Player::deaths),
             assists: player.and_then(Player::assists),
@@ -106,10 +118,10 @@ impl Baseline {
     /// Whether `snapshot` describes the same player as this baseline, so a scoreboard delta is
     /// meaningful. A document naming no steam id cannot be compared and is treated as a different
     /// player, not as a zero.
-    fn same_player(&self, snapshot: &GsiSnapshot) -> bool {
+    fn same_player(&self, snapshot: &GsiSnapshot, game: Game) -> bool {
         match (
             self.steamid.as_deref(),
-            snapshot.player.first().and_then(player_steamid),
+            watched_steamid(snapshot, game).as_deref(),
         ) {
             (Some(previous), Some(current)) => previous == current,
             _ => false,
@@ -119,6 +131,43 @@ impl Baseline {
 
 fn player_steamid(player: &Player) -> Option<String> {
     player.steamid.clone().filter(|id| !id.is_empty())
+}
+
+/// The client's own steam id (`provider.steamid`): the local user, whatever the game is showing.
+fn local_steamid(snapshot: &GsiSnapshot) -> Option<String> {
+    snapshot
+        .provider
+        .steamid
+        .clone()
+        .filter(|id| !id.is_empty())
+}
+
+/// Whose scoreboard the `player` block carries, for comparing one document with the next.
+///
+/// The block's own `steamid` when it has one. Counter-Strike omits it unless `player_id` is
+/// subscribed, and a `.cfg` installed before that block was added still does, so for Counter-Strike
+/// the client's id stands in: with nobody else named, the local player is the best attribution and
+/// the alternative is to drop every kill. Dota 2 has no such stand-in: its `player` block names
+/// the player, and an observer's provider id is not any of the listed players.
+fn watched_steamid(snapshot: &GsiSnapshot, game: Game) -> Option<String> {
+    let named = snapshot.player.first().and_then(player_steamid);
+    match game {
+        Game::Cs2 => named.or_else(|| local_steamid(snapshot)),
+        Game::Dota2 => named,
+    }
+}
+
+/// Whether the scoreboard in `snapshot` is the local user's, as opposed to a player they are
+/// spectating (Counter-Strike shows a teammate once the user is dead). A document with no client
+/// id cannot be checked and is left to the same-player comparison.
+fn is_local_player(snapshot: &GsiSnapshot, game: Game) -> bool {
+    if game != Game::Cs2 {
+        return true;
+    }
+    match (local_steamid(snapshot), watched_steamid(snapshot, game)) {
+        (Some(local), Some(watched)) => local == watched,
+        _ => true,
+    }
 }
 
 /// The bomb state, preferring the detailed root `bomb` block and falling back to `round.bomb`
@@ -242,9 +291,17 @@ fn scoreboard_events(baseline: &Baseline, snapshot: &GsiSnapshot, game: Game) ->
     let Some(player) = snapshot.player.first() else {
         return Vec::new();
     };
-    if !baseline.same_player(snapshot) {
+    if !baseline.same_player(snapshot, game) {
         // A different player's scoreboard (or no steam id): nothing can be attributed to the watched
         // player, so nothing is reported; the baseline moves on in `observe`.
+        return Vec::new();
+    }
+    if !is_local_player(snapshot, game) {
+        // The user is dead and the game is showing a teammate. Their kills are not the user's.
+        return Vec::new();
+    }
+    if game == Game::Cs2 && snapshot.map.phase == "warmup" {
+        // Practice kills against bots: the baseline follows them, nothing is reported.
         return Vec::new();
     }
 
@@ -386,6 +443,9 @@ mod tests {
     use crate::gsi::payload::parse;
 
     const CS2_COMPETITIVE: &str = include_str!("../../tests/fixtures/gsi_cs2_competitive.json");
+    /// What a `.cfg` installed before `player_id` was subscribed produces: `player` has `state` and
+    /// `match_stats` but no `steamid` or `name`, and `auth` is the last key as in a real payload.
+    const CS2_NO_PLAYER_ID: &str = include_str!("../../tests/fixtures/gsi_cs2_no_player_id.json");
     const CS2_MENU: &str = include_str!("../../tests/fixtures/gsi_cs2_menu.json");
     const DOTA_IN_GAME: &str = include_str!("../../tests/fixtures/gsi_dota_in_game.json");
     const DOTA_OBSERVER: &str = include_str!("../../tests/fixtures/gsi_dota_observer.json");
@@ -526,23 +586,107 @@ mod tests {
             "a different player's scoreboard is a re-baseline, not a set of events"
         );
 
-        // And the *next* delta for that player is reported, from the new baseline.
+        // And that player's next kill is not reported either: the provider's id is the user's, and
+        // this is somebody else.
         player_of(&mut other).match_stats.kills = Some(31);
-        assert_eq!(kinds(&tracker.observe(&other)), vec![EventKind::Kill]);
+        assert!(tracker.observe(&other).is_empty());
     }
 
     #[test]
-    fn a_payload_with_no_steam_id_never_reports_a_scoreboard_delta() {
+    fn a_payload_that_names_nobody_never_reports_a_scoreboard_delta() {
+        // Neither `player.steamid` nor `provider.steamid`: there is no one to attribute a delta to.
+        let mut anonymous = cs2();
+        player_of(&mut anonymous).steamid = None;
+        anonymous.provider.steamid = None;
+        let mut tracker = Tracker::default();
+        tracker.observe(&anonymous);
+
+        player_of(&mut anonymous).match_stats.kills = Some(99);
+        assert!(
+            tracker.observe(&anonymous).is_empty(),
+            "there is no player to attribute a delta to"
+        );
+    }
+
+    #[test]
+    fn a_payload_without_player_id_is_attributed_to_the_client_in_provider() {
+        // A `.cfg` installed before `player_id` was subscribed: `player` has stats but no steam id.
+        // Dropping every kill would make the integration look broken, so the provider's id (the
+        // client's own) stands in for the player.
+        let before = document(CS2_NO_PLAYER_ID);
+        assert!(
+            before
+                .player
+                .first()
+                .expect("a player block")
+                .steamid
+                .is_none(),
+            "the fixture is the case under test"
+        );
+        let mut tracker = Tracker::default();
+        tracker.observe(&before);
+
+        let mut after = before.clone();
+        player_of(&mut after).match_stats.kills = Some(13);
+        assert_eq!(kinds(&tracker.observe(&after)), vec![EventKind::Kill]);
+    }
+
+    #[test]
+    fn a_teammate_spectated_after_dying_is_not_the_users_kill_death_or_assist() {
+        // Alive, the `player` block is the user. Dead, the game follows a teammate, and the block now
+        // carries that teammate's totals under their own steam id while `provider.steamid` stays the
+        // user's. None of it is the user's, and neither is the first document after respawn.
         let mut tracker = Tracker::default();
         tracker.observe(&cs2());
 
-        let mut nameless = cs2();
-        player_of(&mut nameless).steamid = None;
-        player_of(&mut nameless).match_stats.kills = Some(99);
+        let mut spectating = cs2();
+        let teammate = player_of(&mut spectating);
+        teammate.steamid = Some("76561198000000042".into());
+        teammate.match_stats.kills = Some(7);
+        teammate.match_stats.deaths = Some(2);
+        teammate.match_stats.assists = Some(3);
+        assert!(tracker.observe(&spectating).is_empty());
+
+        // The teammate gets a kill while the user watches: still not the user's.
+        player_of(&mut spectating).match_stats.kills = Some(8);
         assert!(
-            tracker.observe(&nameless).is_empty(),
-            "there is no player to attribute a delta to"
+            tracker.observe(&spectating).is_empty(),
+            "the spectated player's kill is not the user's"
         );
+
+        // Back to the user (next round): their own totals were never lost, so the move back is a
+        // re-baseline and not a jump.
+        assert!(tracker.observe(&cs2()).is_empty());
+        let mut again = cs2();
+        player_of(&mut again).match_stats.kills = Some(13);
+        assert_eq!(kinds(&tracker.observe(&again)), vec![EventKind::Kill]);
+    }
+
+    #[test]
+    fn warmup_kills_are_not_highlights_and_the_match_that_follows_starts_clean() {
+        let mut warm = cs2();
+        warm.map.phase = "warmup".into();
+        warm.map.round = 0;
+        let mut tracker = Tracker::default();
+        tracker.observe(&warm);
+
+        player_of(&mut warm).match_stats.kills = Some(15);
+        player_of(&mut warm).match_stats.deaths = Some(9);
+        player_of(&mut warm).match_stats.assists = Some(5);
+        assert!(
+            tracker.observe(&warm).is_empty(),
+            "bot kills in warmup are not a highlight, and neither are the deaths or assists"
+        );
+
+        // The match starts, scores reset (below the warmup totals, so no delta) and kills count.
+        let mut live = cs2();
+        live.map.round = warm.map.round;
+        player_of(&mut live).match_stats.kills = Some(0);
+        player_of(&mut live).match_stats.deaths = Some(0);
+        player_of(&mut live).match_stats.assists = Some(0);
+        assert!(tracker.observe(&live).is_empty());
+        player_of(&mut live).match_stats.kills = Some(1);
+        assert_eq!(kinds(&tracker.observe(&live)), vec![EventKind::Kill]);
     }
 
     #[test]

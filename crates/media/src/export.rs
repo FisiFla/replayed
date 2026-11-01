@@ -15,7 +15,7 @@
 
 use crate::binaries::{run_with_timeout, FfmpegBinaries};
 use crate::edit::COPY_FLOOR;
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::Path;
 use std::time::Duration;
 
@@ -90,6 +90,12 @@ pub fn export_budget(duration_ms: u64) -> Duration {
 /// The video is always re-encoded; the audio is re-encoded with it (AAC) for the two video
 /// presets, and dropped for the GIF, which cannot carry it. `-movflags +faststart` puts the index
 /// first so the file can be played while it downloads, which is what a chat client does.
+///
+/// A video export has one audio track, and it carries the voice. Left to its default stream
+/// selection ffmpeg keeps one audio track, the game audio, so a recording with a microphone
+/// lost the voice in the very presets made to be shared. A clip that leads with its mix
+/// (`edit::MIX_TITLE`) exports that track; a file with the game audio and the microphone and no
+/// mix (a full session, or a clip saved before the mix existed) has the two mixed here.
 pub fn export(
     bin: &FfmpegBinaries,
     src: &Path,
@@ -97,18 +103,26 @@ pub fn export(
     preset: ExportPreset,
     duration_ms: u64,
 ) -> Result<()> {
-    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
-    cmd.args(["-v", "error", "-y", "-i"])
-        .arg(src)
-        .args(preset_arguments(preset))
-        .arg(dst);
     let describe = format!("the {} export of {}", preset.as_str(), src.display());
-    let out = run_with_timeout(cmd, export_budget(duration_ms))
-        .map_err(|e| e.context(format!("running {describe}")))?;
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
+    cmd.args(["-v", "error", "-y", "-i"]).arg(src);
+    if preset != ExportPreset::Gif {
+        let audio_streams = crate::probe::stream_layout(bin, src)
+            .with_context(|| format!("{describe} could not read the source's audio tracks"))?
+            .audio_count();
+        map_export_streams(&mut cmd, audio_streams);
+    }
+    cmd.args(preset_arguments(preset)).arg(dst);
+    // A timeout returns through here too: the kill leaves a truncated file at `dst`, which is
+    // removed like the one a failed exit leaves.
+    let out = run_with_timeout(cmd, export_budget(duration_ms)).map_err(|e| {
+        crate::edit::remove_partial(dst);
+        e.context(format!("running {describe}"))
+    })?;
     if !out.status.success() {
         // A partial export is not a file to hand anyone; removing it keeps a failed attempt from
         // looking like a result.
-        let _ = std::fs::remove_file(dst);
+        crate::edit::remove_partial(dst);
         bail!(
             "{describe} failed: {}",
             String::from_utf8_lossy(&out.stderr).trim()
@@ -121,6 +135,22 @@ pub fn export(
         );
     }
     Ok(())
+}
+
+/// The first video track and one audio track: the game audio and the microphone mixed when
+/// the source has the two and no mix, else its first audio track (a clip's mix, or the game
+/// audio alone).
+fn map_export_streams(cmd: &mut std::process::Command, audio_streams: usize) {
+    cmd.args(["-map", "0:v:0"]);
+    match audio_streams {
+        0 => {}
+        2 => {
+            cmd.args(["-filter_complex", crate::edit::MIX_FILTER, "-map", "[mix]"]);
+        }
+        _ => {
+            cmd.args(["-map", "0:a:0"]);
+        }
+    }
 }
 
 /// The preset's own ffmpeg flags: one table, so the command that runs and the command a caller

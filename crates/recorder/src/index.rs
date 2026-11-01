@@ -9,10 +9,8 @@ use replayed_events::GameEvent;
 use replayed_media::edit::Chapter;
 use replayed_replay::splice::ClipMetadata;
 use replayed_store::prune::{clip_is_missing, session_is_missing};
-use replayed_store::retention::{
-    execute_retention, plan_retention, RetentionOutcome, RetentionPolicy, RetentionRules,
-};
-use replayed_store::{Clip, Event, NewClip, NewEvent, Session, Store};
+use replayed_store::retention::{execute_retention, plan_retention, RetentionOutcome};
+use replayed_store::{Clip, Event, LibraryRoots, NewClip, NewEvent, Session, Store};
 use std::path::{Path, PathBuf};
 
 /// Wall-clock now, in ms since the Unix epoch: the clock `clips.created_at` and the storage age rule use.
@@ -231,23 +229,43 @@ pub struct CleanupReport {
 /// whose index write failed is on disk and in that directory, and the policy plans over the rows.
 /// Without the directory the orphans would be invisible — never counted, never evicted, never
 /// reported — and the directory could grow past its cap without bound.
+///
+/// `sessions_dir` is the sessions area as the recorder resolved it ([`crate::RecorderConfig::sessions_dir`]:
+/// an empty `sessions_dir` setting means `<app data>/sessions`, not a sibling of the clips directory),
+/// because a session's files are only deletable if they sit under the directory they were recorded
+/// into. It is passed in, never derived here, so the pass cannot disagree with the recorder about
+/// where sessions live.
 pub fn cleanup_pass(
     store: &Store,
     storage: &StorageSection,
     clips_dir: &Path,
+    sessions_dir: &Path,
     report: &mut CleanupReport,
 ) -> RetentionOutcome {
-    let policy = RetentionPolicy {
-        clips: RetentionRules {
-            max_total_bytes: storage.max_total_bytes,
-            // Days are `u32` in the retention rules and `u64` in the config; above `u32::MAX` means "never", so clamp rather than wrap.
-            max_age_days: storage.max_age_days.min(u64::from(u32::MAX)) as u32,
-        },
-        sessions: RetentionRules {
-            max_total_bytes: storage.sessions.max_total_bytes,
-            max_age_days: storage.sessions.max_age_days.min(u64::from(u32::MAX)) as u32,
-        },
-    };
+    // Fail closed on the roots. The two directories are the only places this pass may delete from
+    // (see `LibraryRoots`), so a root that is empty or not absolute is not a root: it would name
+    // "the current directory" or nothing at all. Refuse the whole pass rather than guess a
+    // substitute, which is how an earlier stand-in (`clips_dir/../sessions`) pointed retention at a
+    // directory the recorder never wrote to.
+    for (what, dir) in [("clips", clips_dir), ("sessions", sessions_dir)] {
+        if !dir.is_absolute() {
+            tracing::error!(
+                "storage policy: not applied, nothing was deleted: the {what} directory \"{}\" is \
+                 not an absolute path",
+                dir.display()
+            );
+            return RetentionOutcome::default();
+        }
+    }
+    // Fail closed. Zero is not "off" to the retention policy: a zero cap is exceeded by every file and
+    // a zero age by every item, so the plan would be "delete everything that is not a favourite".
+    // `config::validate` refuses such a file at load and at start; this is the same rule at the one
+    // place that deletes, for a policy that arrives some other way.
+    if let Err(err) = crate::config::validate_retention(storage) {
+        tracing::error!("storage policy: not applied, nothing was deleted: {err:#}");
+        return RetentionOutcome::default();
+    }
+    let policy = crate::config::retention_policy(storage);
 
     let clips = match store.list_clips() {
         Ok(clips) => clips,
@@ -294,7 +312,8 @@ pub fn cleanup_pass(
     }
 
     let plan = plan_retention(&live_clips, &live_sessions, &policy, now_ms());
-    let outcome = match execute_retention(store, &plan) {
+    let roots = LibraryRoots::new(clips_dir, sessions_dir);
+    let outcome = match execute_retention(store, &plan, &roots) {
         Ok(outcome) => outcome,
         Err(err) => {
             tracing::warn!("storage policy: the pass could not be completed: {err:#}");
@@ -726,7 +745,13 @@ mod tests {
         // Room for one of the two clips, and a session store with nothing in it.
         let storage = storage(&clips_dir, 1_000, &dir.path().join("sessions"), 1 << 30);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(
+            &store,
+            &storage,
+            &clips_dir,
+            &dir.path().join("sessions"),
+            &mut report,
+        );
 
         let rows = store.list_clips().unwrap();
         assert_eq!(rows.len(), 1, "the cap allows one of the two clips");
@@ -750,10 +775,48 @@ mod tests {
         assert!(outcome.clips.cap_met, "the clips cap is met after the pass");
 
         // A second pass must leave the survivor alone: this pass runs every `CLEANUP_INTERVAL`, so it must be a no-op once the library fits.
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(
+            &store,
+            &storage,
+            &clips_dir,
+            &dir.path().join("sessions"),
+            &mut report,
+        );
         assert_eq!(store.list_clips().unwrap().len(), 1);
         assert!(survivor.is_file(), "an idle pass deletes nothing");
         assert_eq!(outcome.deleted(), 0);
+    }
+
+    /// A zero rule reaching a pass (a struct built in code, a front-end that did not validate) used to
+    /// plan every non-favourite clip for deletion; the pass refuses it instead and deletes nothing.
+    #[test]
+    fn a_zero_retention_rule_deletes_nothing() {
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("clips");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let path = clips_dir.join("clip-1.mp4");
+        std::fs::write(&path, vec![0u8; 1_000]).unwrap();
+        index_clip(&store, &metadata(path.clone(), 1_000), 1_000).unwrap();
+
+        for zero in 0..4 {
+            let mut storage = storage(&clips_dir, 1 << 30, &dir.path().join("sessions"), 1 << 30);
+            match zero {
+                0 => storage.max_total_bytes = 0,
+                1 => storage.max_age_days = 0,
+                2 => storage.sessions.max_total_bytes = 0,
+                _ => storage.sessions.max_age_days = 0,
+            }
+            let outcome = cleanup_pass(
+                &store,
+                &storage,
+                &clips_dir,
+                &dir.path().join("sessions"),
+                &mut CleanupReport::default(),
+            );
+            assert_eq!(outcome.deleted(), 0, "rule {zero}");
+            assert!(path.is_file(), "rule {zero}: the clip survives");
+            assert_eq!(store.list_clips().unwrap().len(), 1);
+        }
     }
 
     #[test]
@@ -779,7 +842,13 @@ mod tests {
         // A cap the live clip exactly fills, and a session store with nothing in it.
         let storage = storage(&clips_dir, 1_000, &dir.path().join("sessions"), 1 << 30);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(
+            &store,
+            &storage,
+            &clips_dir,
+            &dir.path().join("sessions"),
+            &mut report,
+        );
 
         assert_eq!(
             outcome.deleted(),
@@ -859,7 +928,7 @@ mod tests {
         // A clips cap with nothing to do and a sessions cap the live session exactly fills.
         let storage = storage(&clips_dir, 1 << 30, &sessions_dir, 1_000);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &sessions_dir, &mut report);
 
         assert_eq!(outcome.sessions.deleted, 0);
         assert!(
@@ -873,6 +942,92 @@ mod tests {
             "both rows stay: the dead one is pruned on request, never by a retention pass"
         );
         assert!(store.list_sessions().unwrap().iter().any(|s| s.id == dead));
+    }
+
+    /// A finished, over-cap session: its scratch directory and its file, under `sessions_dir`.
+    fn finished_session(store: &Store, sessions_dir: &Path, bytes: u64) -> (PathBuf, PathBuf) {
+        let scratch = sessions_dir.join("session-1");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let final_path = sessions_dir.join("session-1.mp4");
+        std::fs::write(&final_path, vec![0u8; bytes as usize]).unwrap();
+        let id = store
+            .start_session(
+                Some("R6"),
+                replayed_store::SESSION_MODE_SESSION,
+                now_ms() - 2_000,
+                &scratch.display().to_string(),
+                0,
+            )
+            .unwrap();
+        store
+            .end_session(
+                id,
+                now_ms() - 1_000,
+                Some(&final_path.display().to_string()),
+                bytes as i64,
+                0,
+            )
+            .unwrap();
+        (final_path, scratch)
+    }
+
+    /// The sessions area is the recorder's own resolution, not a neighbour of the clips directory.
+    ///
+    /// A stand-in used `clips_dir/../sessions`; with the clips directory moved elsewhere (a second
+    /// drive) and `sessions_dir` left empty (so `<app data>/sessions`), that named a directory
+    /// nothing was recorded into, and every session eviction was refused as outside its root.
+    #[test]
+    fn retention_deletes_sessions_from_the_directory_it_was_given_not_one_beside_the_clips() {
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("second-drive").join("clips");
+        let sessions_dir = dir.path().join("appdata").join("sessions");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let (final_path, scratch) = finished_session(&store, &sessions_dir, 2_000);
+
+        // The setting is empty, as in a default config; the real directory is what the caller resolved.
+        let mut storage = storage(&clips_dir, 1 << 30, &sessions_dir, 1_000);
+        storage.sessions.sessions_dir = String::new();
+        let outcome = cleanup_pass(
+            &store,
+            &storage,
+            &clips_dir,
+            &sessions_dir,
+            &mut CleanupReport::default(),
+        );
+
+        assert_eq!(outcome.sessions.deleted, 1, "{outcome:?}");
+        assert!(!final_path.exists() && !scratch.exists());
+    }
+
+    /// A root that cannot be determined deletes nothing; it does not widen into a guess.
+    #[test]
+    fn a_sessions_root_that_is_not_absolute_deletes_nothing() {
+        let (dir, store) = index_dir();
+        let clips_dir = dir.path().join("clips");
+        let sessions_dir = dir.path().join("sessions");
+        std::fs::create_dir_all(&clips_dir).unwrap();
+        let (final_path, scratch) = finished_session(&store, &sessions_dir, 2_000);
+        let clip_path = clips_dir.join("clip-1.mp4");
+        std::fs::write(&clip_path, vec![0u8; 1_000]).unwrap();
+        index_clip(&store, &metadata(clip_path.clone(), 1_000), 1_000).unwrap();
+
+        // Caps both exceeded, so a pass with usable roots would delete from both libraries.
+        let storage = storage(&clips_dir, 100, &sessions_dir, 100);
+        for (clips, sessions) in [
+            (clips_dir.as_path(), Path::new("")),
+            (clips_dir.as_path(), Path::new("sessions")),
+            (Path::new(""), sessions_dir.as_path()),
+        ] {
+            let outcome = cleanup_pass(
+                &store,
+                &storage,
+                clips,
+                sessions,
+                &mut CleanupReport::default(),
+            );
+            assert_eq!(outcome.deleted(), 0, "{clips:?} / {sessions:?}");
+        }
+        assert!(final_path.is_file() && scratch.is_dir() && clip_path.is_file());
     }
 
     /// The two libraries are evicted independently, and a favourite survives in each.
@@ -930,7 +1085,7 @@ mod tests {
         // Each cap allows exactly one (the favourite) and nothing more.
         let storage = storage(&clips_dir, 1_000, &sessions_dir, 1_000);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &sessions_dir, &mut report);
 
         assert_eq!(store.list_clips().unwrap().len(), 1, "one clip survives");
         assert!(
@@ -1001,7 +1156,7 @@ mod tests {
 
         let storage = storage(&clips_dir, 100, &sessions_dir, 100);
         let mut report = CleanupReport::default();
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &sessions_dir, &mut report);
 
         assert_eq!(
             outcome.deleted(),
@@ -1032,14 +1187,14 @@ mod tests {
             .is_none());
 
         // The report is remembered (an identical pass does not change it); once the immunity is gone the next pass evicts both classes.
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &sessions_dir, &mut report);
         assert_eq!(outcome.deleted(), 0, "still nothing to do: {outcome:?}");
         assert_eq!(report.last_sessions_shortfall, Some(1_900));
 
         // The recording ends and the clip is un-favourited, so the policy now has something it may delete.
         store.end_session(running, 9_000, None, 2_000, 0).unwrap();
         store.set_favourite(clip_id, false).unwrap();
-        let outcome = cleanup_pass(&store, &storage, &clips_dir, &mut report);
+        let outcome = cleanup_pass(&store, &storage, &clips_dir, &sessions_dir, &mut report);
         assert_eq!(
             outcome.deleted(),
             2,

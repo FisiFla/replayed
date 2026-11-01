@@ -15,20 +15,31 @@ use std::time::Duration;
 /// audio; 100ms is ten periods of headroom and still nothing a clip cut notices.
 pub(crate) const LIVE_LAG: Duration = Duration::from_millis(100);
 
-/// The most silence one gap may materialise.
+/// The longest stretch of *late* audio the timeline treats as already covered.
 ///
-/// A gap is padded with a contiguous run of zeroes, so it costs memory in proportion to its
-/// length: 11.9 hours of it is 8TB, and the allocator aborts the process on a request it cannot
-/// serve rather than fail it. A gap past this bound is not a gap the device left out - it is a
-/// stretch the recording cannot account for, such as a device position belonging to another
-/// clock or a session that was suspended - and it is dropped instead of filled.
-///
-/// One second is generous for what a gap really is. The silence fill advances a device period at
-/// a time, so the timeline stays within [`LIVE_LAG`] of the live edge and an ordinary outage is
-/// padded a few milliseconds per poll; only a single jump, one clock reading far from the last,
-/// reaches this bound. It is also small enough to fit in the encoder's audio queue, because a
-/// longer run of silence would push out the real audio that follows it.
+/// A packet that claims to start before the running count was probably overtaken by silence that
+/// ran ahead of it (see [`AudioTimeline::fill_to`]), and its overlapping head is trimmed. A
+/// packet later than this is not overtaken by anything this recording placed: it carries a
+/// timestamp nobody can use, and its audio is kept and appended instead of being trimmed away.
 pub(crate) const MAX_FILL: Duration = Duration::from_secs(1);
+
+/// The most silence one gap may materialise: the longest outage the timeline pads.
+///
+/// Downstream times audio by byte count alone (the encoder discards [`AudioBuffer::pts`]), so a
+/// stretch the timeline does not account for plays everything after it *early* against the video,
+/// for the rest of the recording. The video is on the wall clock (ffmpeg stamps each frame with
+/// the moment the pipe delivered it), so a pump thread that stalled for twenty seconds produced
+/// twenty seconds of frozen video, and the audio has to carry the same twenty seconds. A bound of
+/// one second dropped those stretches instead.
+///
+/// The bound exists because a gap is a contiguous run of zeroes whose size is a timestamp's to
+/// choose: 11.9 hours of it is 8TB, and the allocator aborts the process on a request it cannot
+/// serve. A minute is 11.5MB at 48kHz stereo s16le, which is cheap and transient: the encoder's
+/// audio queue drops what it cannot hold and replaces it with silence later, so the byte count is
+/// preserved. Beyond a minute is not a pump stall: it is a clock the recording cannot follow
+/// (a suspended session, a device position belonging to another clock), and the stretch is
+/// dropped or the timestamp ignored, with a warning, instead of being filled.
+pub(crate) const MAX_PAD: Duration = Duration::from_secs(60);
 
 /// One packet as the source described it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,9 +109,14 @@ impl AudioTimeline {
         u64::from(self.format.sample_rate / 100)
     }
 
-    /// The most silence one gap may materialise, in frames.
+    /// The most lateness treated as already covered, in frames.
     fn max_fill_frames(&self) -> u64 {
         u64::from(self.format.sample_rate).saturating_mul(MAX_FILL.as_secs())
+    }
+
+    /// The most silence one gap may materialise, in frames.
+    fn max_pad_frames(&self) -> u64 {
+        u64::from(self.format.sample_rate).saturating_mul(MAX_PAD.as_secs())
     }
 
     /// The frame index `time` falls on, rounded; anything before the origin is frame 0.
@@ -143,7 +159,11 @@ impl AudioTimeline {
     /// appended, so timestamp jitter never chops a steady stream; a discontinuity is placed exactly
     /// because the engine has said samples are missing.
     ///
-    /// A timestamp the recording cannot account for - further away than [`MAX_FILL`] - is not
+    /// A gap ahead of the running count is padded with silence up to [`MAX_PAD`]: the pump thread
+    /// stalling for several seconds is a gap the recording can account for, and the video carries
+    /// those seconds too.
+    ///
+    /// A timestamp the recording cannot account for - further away than that - is not
     /// obeyed: the packet follows the previous one instead. Such a timestamp is not a gap the
     /// device left silent, it is a reading from another clock, and padding it would ask for
     /// gigabytes of zeroes.
@@ -160,7 +180,7 @@ impl AudioTimeline {
             };
             if at > self.placed.saturating_add(tolerance) {
                 let gap = at - self.placed;
-                if gap <= self.max_fill_frames() {
+                if gap <= self.max_pad_frames() {
                     self.pad(gap);
                 } else {
                     self.note_unusable_timestamp(gap);
@@ -187,15 +207,16 @@ impl AudioTimeline {
     /// Pad with silence up to `LIVE_LAG` before `now`, so a stretch with no packets still advances
     /// the audio at the video's pace instead of arriving later as one burst.
     ///
-    /// A live edge further ahead than [`MAX_FILL`] is a clock the recording cannot follow - the
-    /// session was suspended, or the clock was set - and the stretch is dropped rather than
-    /// filled. The timeline carries on at the live edge, which is where the device's next packet
+    /// A live edge ahead by up to [`MAX_PAD`] is a stall the recording can account for and is
+    /// padded, so the audio never loses wall-clock time the video kept. One further ahead is a
+    /// clock the recording cannot follow - the session was suspended, or the clock was set - and
+    /// the stretch is dropped rather than filled. The timeline carries on at the live edge, which is where the device's next packet
     /// lands.
     pub fn fill_to(&mut self, now: Duration) {
         let at = self.frame_at(now.saturating_sub(LIVE_LAG));
         if at > self.placed {
             let gap = at - self.placed;
-            if gap <= self.max_fill_frames() {
+            if gap <= self.max_pad_frames() {
                 self.pad(gap);
             } else {
                 self.drop_stretch(at);
@@ -241,7 +262,7 @@ impl AudioTimeline {
     fn pad(&mut self, frames: u64) {
         // The last line of defence: a gap is never materialised beyond the bound, whatever a
         // caller asks for, so no allocation can be sized by a timestamp alone.
-        let frames = frames.min(self.max_fill_frames());
+        let frames = frames.min(self.max_pad_frames());
         let start = self.placed;
         let end = start.saturating_add(frames);
         match self.fills.back_mut() {
@@ -383,7 +404,7 @@ mod tests {
 
     /// The most silence the timeline may hold, in bytes.
     fn max_fill_bytes() -> usize {
-        FORMAT.sample_rate as usize * MAX_FILL.as_secs() as usize * 4
+        FORMAT.sample_rate as usize * MAX_PAD.as_secs() as usize * 4
     }
 
     #[test]
@@ -443,6 +464,55 @@ mod tests {
         );
         assert!(frames[silence..].iter().all(|&s| s == 2));
         assert!(timeline.pending.is_empty());
+    }
+
+    #[test]
+    fn a_stall_of_seconds_before_a_packet_is_padded_so_the_audio_is_not_early() {
+        // The pump thread stalled for ten seconds. The video carried those ten seconds (it is on
+        // the wall clock), and the audio is timed by byte count alone, so anything short of the
+        // full ten seconds of silence plays every later sample ten seconds early.
+        let stall = Duration::from_secs(10);
+        let packets = vec![
+            packet(Some(ORIGIN), BLOCK, 1, false),
+            packet(Some(ORIGIN + stall), BLOCK, 2, false),
+        ];
+        let (blocks, timeline) = run(packets);
+        let frames = frames(&blocks);
+        let silence = stall.as_secs() as usize * 48_000 - BLOCK;
+
+        assert_eq!(
+            frames.len(),
+            BLOCK + silence + BLOCK,
+            "the stall is on the timeline, not dropped"
+        );
+        assert!(frames[BLOCK..BLOCK + silence].iter().all(|&s| s == 0));
+        assert!(frames[BLOCK + silence..].iter().all(|&s| s == 2));
+        assert_eq!(timeline.unusable_timestamps, 0, "the timestamp was obeyed");
+    }
+
+    #[test]
+    fn a_live_edge_seconds_ahead_is_padded_not_dropped() {
+        // No packets for twenty seconds (the poll loop was not running): the timeline catches up
+        // with the clock by padding, so the next packet lands where the video says it does.
+        let mut timeline = AudioTimeline::new(FORMAT, ORIGIN);
+        let now = ORIGIN + Duration::from_secs(20);
+        timeline.fill_to(now);
+
+        assert_eq!(timeline.dropped_stretches, 0, "nothing was dropped");
+        assert_eq!(
+            timeline.placed,
+            timeline.frame_at(now - LIVE_LAG),
+            "the timeline is level with the live edge less the lag"
+        );
+        assert_eq!(
+            timeline.emitted, 0,
+            "none of it was skipped over: it is all still to be emitted"
+        );
+        assert_eq!(
+            timeline.pending.len() as u64,
+            timeline.placed * 4,
+            "and it is silence, materialised"
+        );
     }
 
     #[test]

@@ -149,6 +149,102 @@ impl RunConfig {
 }
 
 // ---------------------------------------------------------------------------------------
+// The sandbox: the one directory this harness deletes
+// ---------------------------------------------------------------------------------------
+
+/// The file the harness writes into a work directory it created, and the only evidence it
+/// accepts that a non-empty directory is its own to delete.
+///
+/// `--work-dir` is a path the caller typed, and the run empties it with `remove_dir_all`
+/// before it starts (the engine adopts an existing scratch directory, which would corrupt a
+/// measurement). Without a rule about *which* directory may be emptied, `--work-dir ~` or
+/// `--work-dir .` is a recursive delete of the user's home or of the checkout, reported as a
+/// passing check. A marker the harness wrote itself is the rule that cannot be satisfied by
+/// accident: nobody creates `.replayed-verify-sandbox` in a directory they care about.
+const SANDBOX_MARKER: &str = ".replayed-verify-sandbox";
+
+/// The directories a sandbox may be neither equal to nor contain (it is deleted recursively,
+/// so a directory that merely *contains* one of these would delete it too).
+fn protected_dirs(repo: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut dirs = vec![("this repository's checkout", repo.to_path_buf())];
+    for var in ["HOME", "USERPROFILE"] {
+        if let Some(home) = std::env::var_os(var).filter(|v| !v.is_empty()) {
+            dirs.push(("your home directory", PathBuf::from(home)));
+        }
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        dirs.push(("the current directory", cwd));
+    }
+    dirs
+}
+
+/// What [`vet_sandbox`] found at the work directory.
+#[derive(Debug, PartialEq, Eq)]
+enum Sandbox {
+    /// Nothing there yet: nothing to delete.
+    Absent,
+    /// A directory the harness may delete (the canonical path, so a symlink is judged by
+    /// where it leads and not by what it is called).
+    Removable(PathBuf),
+}
+
+/// Decide whether `dir` may be deleted, **before** anything is deleted. Fails closed: the
+/// answer is "yes" only for a directory that is missing, empty, or carries [`SANDBOX_MARKER`],
+/// and that is not a filesystem or drive root and neither is nor contains a protected
+/// directory (see [`protected_dirs`]).
+fn vet_sandbox(dir: &Path, protected: &[(&'static str, PathBuf)]) -> Result<Sandbox> {
+    let canonical = match dir.canonicalize() {
+        Ok(path) => path,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Sandbox::Absent),
+        Err(err) => bail!("cannot resolve --work-dir {}: {err}", dir.display()),
+    };
+    let refuse = |why: &str| -> Result<Sandbox> {
+        bail!(
+            "refusing to use --work-dir {} ({}): it is deleted recursively on every run, and \
+             {why}",
+            dir.display(),
+            canonical.display()
+        )
+    };
+    // `/`, `C:\`, `\\?\C:\`: no parent means a root.
+    if canonical.parent().is_none() {
+        return refuse("that is a filesystem root");
+    }
+    for (what, path) in protected {
+        let path = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if path.starts_with(&canonical) {
+            return refuse(&format!("it is, or contains, {what} ({})", path.display()));
+        }
+    }
+    if !canonical.is_dir() {
+        return refuse("it is not a directory");
+    }
+    if canonical.join(SANDBOX_MARKER).is_file() {
+        return Ok(Sandbox::Removable(canonical));
+    }
+    let empty = std::fs::read_dir(&canonical)
+        .with_context(|| format!("reading {}", canonical.display()))?
+        .next()
+        .is_none();
+    if empty {
+        return Ok(Sandbox::Removable(canonical));
+    }
+    refuse(&format!(
+        "it is not empty and has no `{SANDBOX_MARKER}` file, so this harness did not create \
+         it. Pick a directory that does not exist, or delete this one yourself"
+    ))
+}
+
+/// Create the (empty) sandbox and write the marker that lets the next run delete it.
+fn mark_sandbox(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    std::fs::write(
+        dir.join(SANDBOX_MARKER),
+        "created by `cargo xtask verify`; the next run deletes this directory\n",
+    )
+}
+
+// ---------------------------------------------------------------------------------------
 // Options
 // ---------------------------------------------------------------------------------------
 
@@ -178,7 +274,11 @@ mouse input — probes the clip it produced, and exits non-zero if any check fai
 options:
   --seconds <N>        how much media to buffer before the self-test clip (default 45)
   --report <PATH>      where the report goes (default target/verify/report.md)
-  --work-dir <PATH>    where the run's data directory goes (default target/verify/work)
+  --work-dir <PATH>    where the run's data directory goes (default target/verify/work).
+                       It is DELETED and recreated at the start of every run, so the
+                       harness only does that to a directory it created itself (it holds a
+                       `.replayed-verify-sandbox` marker) or one that is empty, and refuses
+                       your home directory, a filesystem root and the repository checkout.
   --cli <PATH>         an already-built replayed-cli to test (skips the release build)
   --no-build           do not build; use target/release/replayed-cli as it is
   --dev-software-encoder
@@ -483,6 +583,8 @@ pub fn verify_command(args: &[String]) -> Result<()> {
     }
     let repo = crate::repo_root();
     let opts = parse_options(args, &repo)?;
+    // Before anything runs, so a bad `--work-dir` is a plain refusal and not a report.
+    vet_sandbox(&opts.work_dir, &protected_dirs(&repo))?;
     let strict = opts.strict;
     let mut session = Session::new(opts, repo);
     session.execute();
@@ -591,7 +693,10 @@ impl Session {
     /// Run every check, recording a failed check rather than aborting wherever possible:
     /// a report that stops at the first problem hides the rest.
     fn execute(&mut self) {
-        self.reset_sandbox();
+        // Everything below writes into the sandbox: a run that could not establish one stops.
+        if !self.reset_sandbox() {
+            return;
+        }
         if let Err(err) = self.environment() {
             self.record_step_error("environment", err);
         }
@@ -618,33 +723,57 @@ impl Session {
     /// is right for a user's machine and wrong for a measurement: a second run against a previous
     /// directory would report a non-zero lowest segment without any eviction. A failure to remove
     /// the sandbox is a failed check rather than a silently weakened one.
-    fn reset_sandbox(&mut self) {
+    ///
+    /// Only a directory this harness created is emptied (see [`vet_sandbox`]); anything else is a
+    /// refusal. Returns whether a clean, marked sandbox now exists: `false` stops the run, because
+    /// the steps after this one write into the directory.
+    fn reset_sandbox(&mut self) -> bool {
+        const WHAT: &str = "the run started from a clean sandbox";
+        const CRITERION: &str = "criterion 2 (what makes the eviction evidence real)";
+        const EXPECTED: &str = "the work directory is empty before the run";
         let dir = self.opts.work_dir.clone();
-        match std::fs::remove_dir_all(&dir) {
-            Ok(()) => self.pass(
+        let measured = match vet_sandbox(&dir, &protected_dirs(&self.repo)) {
+            Ok(Sandbox::Absent) => format!("{} did not exist yet", dir.display()),
+            Ok(Sandbox::Removable(path)) => match std::fs::remove_dir_all(&path) {
+                Ok(()) => format!("removed {} first", dir.display()),
+                Err(err) => {
+                    self.fail(
+                        "sandbox",
+                        WHAT,
+                        CRITERION,
+                        EXPECTED,
+                        format!("could not remove {}: {err}", dir.display()),
+                        "a run that adopts a previous run's index and clips would report against \
+                         them, and the eviction and clip checks would be measuring the wrong run",
+                    );
+                    return false;
+                }
+            },
+            Err(err) => {
+                self.fail(
+                    "sandbox",
+                    WHAT,
+                    CRITERION,
+                    EXPECTED,
+                    format!("refused to delete {}", dir.display()),
+                    format!("{err:#}"),
+                );
+                return false;
+            }
+        };
+        if let Err(err) = mark_sandbox(&dir) {
+            self.fail(
                 "sandbox",
-                "the run started from a clean sandbox",
-                "criterion 2 (what makes the eviction evidence real)",
-                "the work directory is empty before the run",
-                format!("removed {} first", dir.display()),
-            ),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => self.pass(
-                "sandbox",
-                "the run started from a clean sandbox",
-                "criterion 2 (what makes the eviction evidence real)",
-                "the work directory is empty before the run",
-                format!("{} did not exist yet", dir.display()),
-            ),
-            Err(err) => self.fail(
-                "sandbox",
-                "the run started from a clean sandbox",
-                "criterion 2 (what makes the eviction evidence real)",
-                "the work directory is empty before the run",
-                format!("could not remove {}: {err}", dir.display()),
-                "a run that adopts a previous run's index and clips would report against \
-                 them, and the eviction and clip checks would be measuring the wrong run",
-            ),
+                WHAT,
+                CRITERION,
+                EXPECTED,
+                format!("could not create {}: {err}", dir.display()),
+                "the run writes its data directory there",
+            );
+            return false;
         }
+        self.pass("sandbox", WHAT, CRITERION, EXPECTED, measured);
+        true
     }
 
     /// Toolchain, ffmpeg discovery, and what is being run where.
@@ -1527,7 +1656,7 @@ impl Session {
                           The run itself is unaffected";
             self.not_performed(
                 "cpu",
-                "steady-state CPU under 5% of one core",
+                "steady-state CPU under 5% of one core on a quiet screen",
                 "criterion 6",
                 "CPU < 5% of ONE core",
                 "no process samples were taken",
@@ -1535,9 +1664,9 @@ impl Session {
             );
             self.not_performed(
                 "rss",
-                "steady-state RSS under 400 MB",
+                "steady-state RSS under 400 MB at the harness's 16 MiB ring",
                 "criterion 6",
-                "RSS < 400 MB",
+                "RSS < 400 MB at the harness's 16 MiB ring",
                 "no process samples were taken",
                 reason,
             );
@@ -1546,7 +1675,7 @@ impl Session {
         if window.len() < 3 {
             self.not_performed(
                 "cpu",
-                "steady-state CPU under 5% of one core",
+                "steady-state CPU under 5% of one core on a quiet screen",
                 "criterion 6",
                 "CPU < 5% of ONE core",
                 format!(
@@ -1558,9 +1687,9 @@ impl Session {
             );
             self.not_performed(
                 "rss",
-                "steady-state RSS under 400 MB",
+                "steady-state RSS under 400 MB at the harness's 16 MiB ring",
                 "criterion 6",
-                "RSS < 400 MB",
+                "RSS < 400 MB at the harness's 16 MiB ring",
                 format!(
                     "only {} samples fell inside the steady-state window",
                     window.len()
@@ -1609,47 +1738,70 @@ impl Session {
             None => String::new(),
         };
 
-        let bound = cpu_bound(offered.map(|(rate, _)| rate));
-        let bound_text = match offered {
-            Some((rate, _)) => format!(
-                "CPU <= {bound:.2}% of one core (an envelope that scales with the {rate:.1} \
-                 frames/s the screen offered)"
+        let cost_per_fps = offered
+            .filter(|(rate, _)| *rate > 0.0)
+            .map(|(rate, _)| {
+                format!(
+                    "; {:.3}% of a core per offered frame/s, and the old fitted envelope \
+                     (informational, fitted to the runs on record, never a bound) would read \
+                     {:.2}%",
+                    cpu_percent / rate,
+                    cpu_envelope_percent(rate)
+                )
+            })
+            .unwrap_or_default();
+        let outcome = match cpu_verdict(offered.map(|(rate, _)| rate)) {
+            CpuVerdict::Judged if cpu_percent <= CPU_TARGET_PERCENT => Outcome::Pass,
+            CpuVerdict::Judged => Outcome::Fail(format!(
+                "the pipeline costs {cpu_percent:.2}% of a core at steady state on a quiet \
+                 screen, against a target of {CPU_TARGET_PERCENT:.1}%{context} (issue #1 \
+                 measured 50.8% at 4K; a regression is what this check is for)"
+            )),
+            CpuVerdict::BusyScreen { offered } => Outcome::NotPerformed(format!(
+                "the display offered {offered:.1} frames/s, above the {QUIET_SCREEN_MAX_OFFERED_FPS:.0} \
+                 a quiet desktop offers, and the pipeline's cost is per frame the display \
+                 presents (issue #93). A bound fitted to a busy run would only describe that \
+                 run, so none is applied: close the animating windows and re-run to judge the \
+                 {CPU_TARGET_PERCENT:.0}% target"
+            )),
+            CpuVerdict::UnknownScreen => Outcome::NotPerformed(
+                "the run's status lines gave no offered frame rate, so it is not known whether \
+                 the screen was quiet enough for the target to apply"
+                    .to_string(),
             ),
-            None => format!("CPU < {bound:.1}% of one core"),
         };
         self.hardware_check(
             "cpu",
-            "steady-state CPU within the bound for what the screen offered",
+            "steady-state CPU under 5% of one core on a quiet screen",
             "criterion 6",
-            "The cost of this pipeline is **per frame the display presents**: Windows Graphics \
-             Capture delivers a frame when the screen changes, so a still desktop offers a few a \
-             second and a 4K60 animating one offers ~60, and the same code reads several times \
-             higher on the second. The bound is therefore `3.5% + 0.08% × offered frames/s` of \
-             ONE core, an envelope fitted to the ledger's measurements (§15's 3.1–4.0% on a quiet \
-             screen, §48's 5.2–7.5% at ~58/s) with margin; with no frame data it falls back to \
-             the pre-2026-10-24 fixed 5% target, which is still reported. Measured on the \
-             replayed-cli process itself — the same one the runbook's `Get-Process replayed-cli` \
-             reads, so the ffmpeg encoder child's own CPU is not counted; Task Manager's \
-             per-process column is normalised across cores and would read 5/N%",
             format!(
-                "{cpu_percent:.2}% of one core over {window_desc}{context}; bound {bound_text}, \
-                 and the old fixed target was 5.00%"
+                "CPU <= {CPU_TARGET_PERCENT:.0}% of ONE core, judged only when the display \
+                 offered <= {QUIET_SCREEN_MAX_OFFERED_FPS:.0} frames/s (a quiet desktop). The \
+                 cost of this pipeline is **per frame the display presents**: Windows Graphics \
+                 Capture delivers a frame when the screen changes, so a still desktop offers a \
+                 few a second and a 4K60 animating one offers ~60, and the same code reads \
+                 several times higher on the second (issue #93). The target is flat and the \
+                 scenario is what is conditioned, because a bound fitted to the data it judges \
+                 cannot fail on it. Measured under this harness's bounded config \
+                 ({fps} fps, {kbps} kbps), not the shipping 60 fps / 20000 kbps. Measured on the \
+                 replayed-cli process itself — the same one the runbook's `Get-Process \
+                 replayed-cli` reads, so the ffmpeg encoder child's own CPU is not counted; \
+                 Task Manager's per-process column is normalised across cores and would read \
+                 5/N%",
+                fps = RUN_CONFIG.fps,
+                kbps = RUN_CONFIG.bitrate_kbps,
             ),
-            if cpu_percent <= bound {
-                Outcome::Pass
-            } else {
-                Outcome::Fail(format!(
-                    "the pipeline costs {cpu_percent:.2}% of a core at steady state against a \
-                     bound of {bound:.2}% for what the screen offered{context} (issue #1 \
-                     measured 50.8% at 4K; a regression is what this check is for)"
-                ))
-            },
+            format!("{cpu_percent:.2}% of one core over {window_desc}{context}{cost_per_fps}"),
+            outcome,
         );
         self.hardware_check(
             "rss",
-            "steady-state RSS under 400 MB",
+            "steady-state RSS under 400 MB at the harness's 16 MiB ring",
             "criterion 6",
-            "RSS < 400 MB (working set)",
+            "RSS < 400 MB (working set), measured with the ring capped at this harness's \
+             16 MiB (`ram_cap_bytes`). It says nothing about the shipping config, whose ring \
+             may grow to 256 MiB: the working set there is the baseline this run measures \
+             plus up to that much footage, and no run here fills it",
             format!("{rss_mb:.1} MB peak over {window_desc}"),
             if rss_mb < 400.0 {
                 Outcome::Pass
@@ -2425,7 +2577,16 @@ impl Session {
         std::fs::write(&report, md).with_context(|| format!("writing {}", report.display()))?;
 
         if self.opts.clean_work {
-            match std::fs::remove_dir_all(&self.opts.work_dir) {
+            // The same rule as the start of the run: only a directory this harness marked.
+            let removal = vet_sandbox(&self.opts.work_dir, &protected_dirs(&self.repo))
+                .map_err(|err| format!("{err:#}"))
+                .and_then(|sandbox| match sandbox {
+                    Sandbox::Absent => Ok(()),
+                    Sandbox::Removable(path) => {
+                        std::fs::remove_dir_all(path).map_err(|err| err.to_string())
+                    }
+                });
+            match removal {
                 Ok(()) => self.note(
                     "Cleanup",
                     format!("removed {}", self.opts.work_dir.display()),
@@ -2488,33 +2649,66 @@ struct Status {
     configured: u32,
 }
 
-/// The CPU bound the criterion uses, given what the display offered the pacer.
+/// The CPU target: 5% of one core, the acceptance criterion's own figure from before any
+/// measurement on the box (the ledger's criterion 6). A flat number, judged only on a quiet
+/// screen (see [`cpu_verdict`]).
+const CPU_TARGET_PERCENT: f64 = 5.0;
+
+/// The most frames a second the display may offer for a run to count as the quiet-desktop
+/// scenario the 5% target was set for.
 ///
-/// **This is an envelope, not a constant, and the reason is measured.** The pipeline's cost is per
-/// frame the screen presents: WGC delivers on change, so a still desktop offers a handful a second
-/// and an animating 4K one offers ~60, and the same code reads several times higher on the second.
-/// The ledger's §15 recorded 3.1–4.0% on a quiet screen; §48 recorded 5.22, 5.49, 5.55 and 7.45%
-/// on the same machine at 58–60 frames/s offered. A fixed target therefore judges the wallpaper.
+/// This defines the *scenario*, not the pass mark: it is a quarter of a 60 Hz display's rate,
+/// which is what "a handful of frames a second" (the ledger's §15 quiet screen) means in a
+/// number. It was chosen without looking at any CPU figure, so no measurement can move it.
+const QUIET_SCREEN_MAX_OFFERED_FPS: f64 = 15.0;
+
+/// What the CPU figure may be judged against, given what the display offered the pacer.
+#[derive(Debug, PartialEq)]
+enum CpuVerdict {
+    /// A quiet screen: the flat [`CPU_TARGET_PERCENT`] applies.
+    Judged,
+    /// A busy screen: the cost is per frame the display presents, and the only thing the
+    /// harness could fit to such a run is the run itself.
+    BusyScreen { offered: f64 },
+    /// The run's status lines gave no frame rate, so whether the screen was quiet is unknown.
+    UnknownScreen,
+}
+
+/// Decide whether a CPU figure can be judged at all.
 ///
-/// `3.5% + 0.08% × offered` passes every one of those five measurements with room, and still fails
-/// a regression: two extra points at 4K60 (8.2%) reads outside it, and the pre-change pipeline's
-/// 50.8% at 4K (issue #1) is nowhere near it. The coefficients are fitted to those measurements and
-/// are **not** derived from first principles; the criterion says so, and the old 5% figure is still
-/// printed beside the verdict so a reader can see both.
+/// **History, because the shape of this check was wrong once.** Issue #93: four runs on the
+/// 4K60 box read 5.2-7.5% against the flat 5% target, because Windows Graphics Capture delivers a
+/// frame when the screen *changes* and that desktop offered ~58 frames/s, where §15's 3.1-4.0%
+/// was a quiet screen. The first answer was an envelope, `3.5% + 0.08% x offered fps`, fitted
+/// "with margin" to the five measurements on record. That could not fail on the data it was fitted
+/// to (6.55% against 8.18% at 58.5/s), allowed 8.3% at 60/s where the target was 5%, and so judged
+/// nothing a regression would not also have to be 60% worse to trip.
 ///
-/// With no frame data (a run whose status lines did not parse) the fixed 5.0% is used: the check
-/// must mean something, and that is the last target that was defensible without context.
-fn cpu_bound(offered_fps: Option<f64>) -> f64 {
-    /// The pipeline's fixed cost: threads, timers, audio and the pacer, which do not scale with
-    /// how often the screen changes. Fitted to the quiet-screen measurements.
-    const FIXED_PERCENT: f64 = 3.5;
-    /// What one frame per second of screen activity costs, in percentage points of one core.
-    const PER_OFFERED_FPS_PERCENT: f64 = 0.08;
-    /// The pre-2026-10-24 target, used when the offer rate is unknown.
-    const NO_FRAME_DATA_PERCENT: f64 = 5.0;
-    offered_fps.map_or(NO_FRAME_DATA_PERCENT, |rate| {
-        FIXED_PERCENT + PER_OFFERED_FPS_PERCENT * rate.max(0.0)
-    })
+/// A bound that is chosen after seeing the measurements it judges is a description of them. This
+/// check therefore keeps the target fixed, **and conditions the verdict on the scenario instead**:
+/// the 5% applies to a quiet screen, where the figure it was set for was measured, and a run on
+/// a busy screen reports its numbers (and the cost per offered frame) without a verdict.
+/// [`cpu_envelope_percent`] survives only as an informational figure printed beside them.
+///
+/// The cost of that honesty: on a desktop that animates, this check is "not performed", and
+/// `--strict` fails the run. Quiet the screen (close the animating windows) to judge it.
+fn cpu_verdict(offered_fps: Option<f64>) -> CpuVerdict {
+    match offered_fps {
+        None => CpuVerdict::UnknownScreen,
+        Some(rate) if rate > QUIET_SCREEN_MAX_OFFERED_FPS => {
+            CpuVerdict::BusyScreen { offered: rate }
+        }
+        Some(_) => CpuVerdict::Judged,
+    }
+}
+
+/// The old fitted envelope, `3.5% + 0.08% x offered fps`: **informational only, never a bound**.
+///
+/// Fitted to five measurements (the ledger's §15 quiet 3.1-4.0%, §48's four busy runs at 58-60/s)
+/// and not derived from anything, so it says "this run looks like the runs on record", which is
+/// useful context and not a pass mark. It is printed so a reader can see how the figure compares.
+fn cpu_envelope_percent(offered_fps: f64) -> f64 {
+    3.5 + 0.08 * offered_fps.max(0.0)
 }
 
 /// The rate the display offered the pacer over the run, and the count it skipped.
@@ -2917,14 +3111,22 @@ fn sample_process(child: &Child) -> Option<(f64, u64)> {
             ticks as f64 / 10_000_000.0 // 100-ns units
         };
         let cpu = to_secs(&kernel) + to_secs(&user);
-        let rss = if K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) != 0 {
-            counters.WorkingSetSize as u64
-        } else {
-            0
-        };
-        (cpu, rss)
+        let queried = K32GetProcessMemoryInfo(handle, &mut counters, counters.cb) != 0;
+        (cpu, queried.then_some(counters.WorkingSetSize as u64))
     };
-    Some((cpu_s, rss_bytes))
+    // A failed query is "could not measure", not "0 bytes": see `measured_working_set`.
+    Some((cpu_s, measured_working_set(rss_bytes)?))
+}
+
+/// A working set that was actually measured: `None` for a failed query and for a zero.
+///
+/// A live process always has a resident set, so zero (or a query that returned an error) means
+/// the read failed. Reporting it as `0.0 MB` made `RSS < 400 MB` a vacuous PASS for every
+/// sample, where the macOS sampler has always refused with `None` ("a fabricated measurement"),
+/// which the caller turns into a *not performed* row. One rule for both, tested here on any host.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn measured_working_set(queried: Option<u64>) -> Option<u64> {
+    queried.filter(|&bytes| bytes > 0)
 }
 
 #[cfg(target_os = "macos")]
@@ -3169,33 +3371,38 @@ mod tests {
     }
 
     #[test]
-    fn the_cpu_bound_scales_with_what_the_screen_offered() {
-        // The five measurements the envelope was fitted to, and the verdict each gets. §15's quiet
-        // screen (3.1–4.0% at a handful of frames/s), §48's four busy-screen runs (5.22, 5.49,
-        // 5.55, 7.45% at 58–60/s), and issue #1's pre-fix 50.8% at 4K.
-        let cases = [
-            (4.0, 3.6),
-            (58.0, 5.22),
-            (60.0, 5.49),
-            (59.4, 5.55),
-            (58.2, 7.45),
-        ];
-        for (offered, measured) in cases {
-            let bound = cpu_bound(Some(offered));
-            assert!(
-                measured <= bound,
-                "{measured}% at {offered}/s should pass a {bound:.2}% bound"
+    fn the_cpu_target_is_flat_and_the_scenario_is_what_is_conditioned() {
+        // Issue #93's runs: §15's quiet screen and §48's four busy ones. The verdict depends on the
+        // screen, never on the CPU figure, so no measurement can move it.
+        assert_eq!(cpu_verdict(Some(4.0)), CpuVerdict::Judged);
+        assert_eq!(
+            cpu_verdict(Some(QUIET_SCREEN_MAX_OFFERED_FPS)),
+            CpuVerdict::Judged
+        );
+        for busy in [58.0, 58.2, 59.4, 60.0] {
+            assert_eq!(
+                cpu_verdict(Some(busy)),
+                CpuVerdict::BusyScreen { offered: busy },
+                "{busy}/s is the animating 4K desktop the target was never set for"
             );
         }
-        // A regression is still caught: two extra points on a 4K60 desktop.
-        assert!(8.2 <= cpu_bound(Some(60.0)), "the bound is the envelope");
-        assert!(
-            10.2 > cpu_bound(Some(60.0)),
-            "and 60/s + 2 points over today's runs is outside it"
-        );
-        assert!(50.8 > cpu_bound(Some(60.0)), "issue #1's 50.8% fails");
-        // No frame data: the old fixed target, so the check still means something.
-        assert_eq!(cpu_bound(None), 5.0);
+        // No frame data: whether the screen was quiet is unknown, and the old fallback to a flat
+        // 5% pretended it was.
+        assert_eq!(cpu_verdict(None), CpuVerdict::UnknownScreen);
+        assert_eq!(CPU_TARGET_PERCENT, 5.0, "the target is the original one");
+    }
+
+    #[test]
+    fn the_old_envelope_is_informational_and_no_longer_a_bound() {
+        // It is still computed, for context beside the numbers: 6.55% against 8.18% at 58.5/s is
+        // the run it was fitted to, which is the reason it cannot be a bound.
+        assert!((cpu_envelope_percent(58.5) - 8.18).abs() < 0.01);
+        assert_eq!(cpu_envelope_percent(-3.0), 3.5);
+        // And a busy run that would have passed the envelope gets no verdict from it.
+        assert!(matches!(
+            cpu_verdict(Some(58.5)),
+            CpuVerdict::BusyScreen { .. }
+        ));
     }
 
     #[test]
@@ -3350,6 +3557,64 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// The engine's real status format string, with every placeholder filled by a number.
+    ///
+    /// The harness reads the recorder's periodic status line by field name, and the line is
+    /// produced by one `tracing::debug!` format string in `crates/recorder/src/lib.rs`. Nothing
+    /// shared ties the two, so a renamed or reordered field left every unit test green (they use
+    /// hand-written fixtures) and was found only by a live run on Windows. This reads the producer's
+    /// source, lifts that format string out and fills it in, so the fixture *is* the engine's
+    /// format. Brittle on purpose: if the producer's macro is reshaped so it cannot be found, the
+    /// test fails and says to update the extraction, which is the moment to look at the parser too.
+    fn engines_status_line() -> String {
+        const ENGINE: &str = include_str!("../../crates/recorder/src/lib.rs");
+        let start = ENGINE
+            .find("\"frames={} segments={}")
+            .expect("the engine's status format string moved: update this extraction");
+        let literal = &ENGINE[start + 1..];
+        let end = literal
+            .find("\",\n")
+            .expect("the engine's status format string has no closing quote");
+        // Rust's `\<newline><indent>` continuation joins the pieces with no whitespace between.
+        let mut joined = String::new();
+        let mut lines = literal[..end].split('\n');
+        joined.push_str(lines.next().unwrap_or_default().trim_end_matches('\\'));
+        for line in lines {
+            joined.push_str(line.trim_start().trim_end_matches('\\'));
+        }
+        joined.replace("{:.1}", "1.5").replace("{}", "7")
+    }
+
+    #[test]
+    fn the_harness_parses_the_status_line_the_engine_actually_prints() {
+        let line = engines_status_line();
+        let status = parse_status(&line)
+            .unwrap_or_else(|| panic!("the harness cannot parse the engine's status line: {line}"));
+        // Every field the harness judges on must be present as a token in the producer, not
+        // defaulted by the parser's optional-field fallbacks (`evicted`, `configured`).
+        for key in ["evicted", "configured", "skipped", "span", "dropped_audio"] {
+            assert!(
+                field(&line, key).is_some(),
+                "the engine's status line has no `{key}=`: {line}"
+            );
+        }
+        assert_eq!(
+            status.configured, 7,
+            "`configured=` was read, not defaulted"
+        );
+        assert_eq!(status.evicted, 7, "`evicted=` was read, not defaulted");
+        assert_eq!(status.skipped, 7);
+    }
+
+    #[test]
+    fn a_failed_or_zero_working_set_is_not_a_measurement() {
+        // The Windows sampler used to substitute 0 when `K32GetProcessMemoryInfo` failed, so
+        // every sample read 0.0 MB and `RSS < 400 MB` passed without measuring anything.
+        assert_eq!(measured_working_set(None), None);
+        assert_eq!(measured_working_set(Some(0)), None);
+        assert_eq!(measured_working_set(Some(48 << 20)), Some(48 << 20));
+    }
+
     #[test]
     fn the_ps_time_column_is_parsed() {
         assert_eq!(parse_ps_time("0:03.45"), Some(3.45));
@@ -3388,6 +3653,199 @@ mod tests {
         assert_eq!(opts.report, PathBuf::from("/tmp/r.md"));
         assert!(opts.dev_software && opts.clean_work);
         assert!(opts.strict);
+    }
+
+    /// A repository checkout and a home directory side by side in one scratch tree, as
+    /// `(scratch, repo, home, protected)`.
+    fn sandbox_world() -> (
+        tempfile::TempDir,
+        PathBuf,
+        PathBuf,
+        Vec<(&'static str, PathBuf)>,
+    ) {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("home/me/src/replayed");
+        let home = tmp.path().join("home/me");
+        std::fs::create_dir_all(&repo).unwrap();
+        let protected = vec![
+            ("this repository's checkout", repo.clone()),
+            ("your home directory", home.clone()),
+        ];
+        (tmp, repo, home, protected)
+    }
+
+    fn refusal(dir: &Path, protected: &[(&'static str, PathBuf)]) -> String {
+        vet_sandbox(dir, protected)
+            .expect_err("this directory must not be deleted")
+            .to_string()
+    }
+
+    #[test]
+    fn the_home_directory_and_everything_above_it_are_never_a_sandbox() {
+        // `--work-dir ~` was a recursive delete of the home directory, reported as a passing
+        // check. The home directory is refused even when it is empty of anything but a marker,
+        // and so is a directory that merely contains it.
+        let (tmp, _repo, home, protected) = sandbox_world();
+        // Only the home entry, so the label under test is the one that fires (the checkout
+        // lives inside the home directory here, as it usually does).
+        let protected = &protected[1..];
+        std::fs::write(
+            home.join(SANDBOX_MARKER),
+            "a marker does not make home removable",
+        )
+        .unwrap();
+        assert!(refusal(&home, protected).contains("your home directory"));
+        assert!(refusal(&tmp.path().join("home"), protected).contains("your home directory"));
+    }
+
+    #[test]
+    fn the_repository_checkout_and_its_parents_are_never_a_sandbox() {
+        let (_tmp, repo, home, protected) = sandbox_world();
+        assert!(refusal(&repo, &protected).contains("repository"));
+        // The parent of the checkout is also the parent of whatever else lives beside it.
+        assert!(refusal(&repo.join("../.."), &protected).contains("it is, or contains"));
+        assert!(refusal(&home.join("src"), &protected).contains("repository"));
+        // `.` resolved against the checkout is the checkout.
+        assert!(refusal(&repo.join("."), &protected).contains("repository"));
+    }
+
+    #[test]
+    fn a_filesystem_root_is_never_a_sandbox() {
+        let root = std::env::current_dir()
+            .unwrap()
+            .ancestors()
+            .last()
+            .unwrap()
+            .to_path_buf();
+        assert!(root.parent().is_none(), "the test needs a real root");
+        assert!(refusal(&root, &[]).contains("filesystem root"));
+    }
+
+    #[test]
+    fn a_non_empty_directory_this_harness_did_not_create_is_refused_and_left_alone() {
+        let (tmp, _repo, _home, protected) = sandbox_world();
+        let videos = tmp.path().join("Videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        std::fs::write(videos.join("holiday.mp4"), b"irreplaceable").unwrap();
+
+        let err = refusal(&videos, &protected);
+        assert!(
+            err.contains(SANDBOX_MARKER),
+            "the error names the rule: {err}"
+        );
+        assert!(
+            videos.join("holiday.mp4").is_file(),
+            "vetting deletes nothing"
+        );
+    }
+
+    #[test]
+    fn a_missing_an_empty_and_a_marked_directory_may_be_deleted() {
+        let (tmp, _repo, _home, protected) = sandbox_world();
+        let missing = tmp.path().join("fresh");
+        assert_eq!(vet_sandbox(&missing, &protected).unwrap(), Sandbox::Absent);
+
+        let empty = tmp.path().join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(matches!(
+            vet_sandbox(&empty, &protected).unwrap(),
+            Sandbox::Removable(_)
+        ));
+
+        // What a previous run leaves: a marker and a data directory it filled.
+        let marked = tmp.path().join("marked");
+        mark_sandbox(&marked).unwrap();
+        std::fs::create_dir_all(marked.join("appdata/clips")).unwrap();
+        assert!(matches!(
+            vet_sandbox(&marked, &protected).unwrap(),
+            Sandbox::Removable(_)
+        ));
+    }
+
+    #[test]
+    fn a_marker_that_is_a_directory_is_not_a_marker() {
+        let (tmp, _repo, _home, protected) = sandbox_world();
+        let dir = tmp.path().join("work");
+        std::fs::create_dir_all(dir.join(SANDBOX_MARKER)).unwrap();
+        assert!(refusal(&dir, &protected).contains(SANDBOX_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_judged_by_where_it_leads() {
+        // `--work-dir ./work` where `work` is a link to the home directory is the home directory.
+        let (tmp, _repo, home, protected) = sandbox_world();
+        let link = tmp.path().join("work");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(refusal(&link, &protected).contains("it is, or contains"));
+    }
+
+    #[test]
+    fn the_default_work_directory_is_allowed_to_be_created_and_then_re_run() {
+        let (_tmp, repo, _home, protected) = sandbox_world();
+        let work = repo.join("target/verify/work");
+        assert_eq!(vet_sandbox(&work, &protected).unwrap(), Sandbox::Absent);
+        mark_sandbox(&work).unwrap();
+        assert!(matches!(
+            vet_sandbox(&work, &protected).unwrap(),
+            Sandbox::Removable(_)
+        ));
+    }
+
+    fn session_with_work_dir(repo: &Path, work_dir: PathBuf) -> Session {
+        Session::new(
+            Options {
+                report: repo.join("report.md"),
+                work_dir,
+                seconds: 45,
+                dev_software: false,
+                no_build: false,
+                cli: None,
+                clean_work: false,
+                strict: false,
+            },
+            repo.to_path_buf(),
+        )
+    }
+
+    #[test]
+    fn reset_sandbox_refuses_a_directory_it_did_not_create_and_stops_the_run() {
+        let (tmp, repo, _home, _protected) = sandbox_world();
+        let videos = tmp.path().join("Videos");
+        std::fs::create_dir_all(&videos).unwrap();
+        std::fs::write(videos.join("holiday.mp4"), b"irreplaceable").unwrap();
+
+        let mut session = session_with_work_dir(&repo, videos.clone());
+        assert!(!session.reset_sandbox(), "the run must not go on");
+        assert!(videos.join("holiday.mp4").is_file(), "nothing was deleted");
+        assert!(
+            !videos.join(SANDBOX_MARKER).exists(),
+            "and nothing was claimed"
+        );
+        assert!(
+            matches!(session.checks[0].outcome, Outcome::Fail(_)),
+            "the refusal is a failed check, not a pass"
+        );
+    }
+
+    #[test]
+    fn reset_sandbox_empties_its_own_directory_and_marks_the_new_one() {
+        let (tmp, repo, _home, _protected) = sandbox_world();
+        let work = tmp.path().join("work");
+        mark_sandbox(&work).unwrap();
+        std::fs::write(work.join("stale-index.db"), b"from the last run").unwrap();
+
+        let mut session = session_with_work_dir(&repo, work.clone());
+        assert!(session.reset_sandbox());
+        assert!(
+            !work.join("stale-index.db").exists(),
+            "the last run is gone"
+        );
+        assert!(
+            work.join(SANDBOX_MARKER).is_file(),
+            "the next run may repeat this"
+        );
+        assert!(matches!(session.checks[0].outcome, Outcome::Pass));
     }
 
     #[test]

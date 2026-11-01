@@ -23,14 +23,30 @@
 //! |---|---|
 //! | `ChampionKill` | `Kill` / `Death` / `Assist`, by comparing `KillerName` / `VictimName` / `Assisters` against the watched player's names |
 //! | `DragonKill`, `BaronKill`, `HeraldKill`, `TurretKilled` / `FirstBrick`, `InhibKilled` | `Dragon`, `Baron`, `Herald`, `Turret`, `Inhibitor` |
-//! | `EpicMonsterKill` (by `MonsterType`), `HordeKill`, `FirstBlood`, `Ace`, `Multikill` | the matching sub-kind, else `Objective` |
+//! | `EpicMonsterKill` (by `MonsterType`) | the matching sub-kind, else `Objective` |
+//! | `HordeKill`, `FirstBlood`, `Ace`, `Multikill` | `Objective`, only when the watched player is the one named (killer or assister, `Recipient`, `Acer`, killer) |
 //! | `GameStart`, `GameEnd` | the state machine above, never the table |
 //! | anything else (`MinionsSpawning`, a future name) | nothing |
 //!
 //! A `ChampionKill` involving nobody the document names as the watched player is not emitted
-//! (a fight the user was not in is not a clip). When the document names no player at all (the
-//! loading screen, or a patch that moved the field) there is nothing to compare, and the kill is
-//! emitted as `Kill` with the names in its payload rather than dropped.
+//! (a fight the user was not in is not a clip), and neither is a personal milestone
+//! (`Multikill`, `FirstBlood`, `Ace`, `HordeKill`) somebody else earned: a clip records the
+//! user's own screen, which shows nothing of an enemy's multikill.
+//!
+//! When the document names no player at all there is nobody to compare against, and nothing
+//! personal is emitted. That is the shape of a spectated game or a replay (`activePlayer` is
+//! empty), where treating every `ChampionKill` as the user's own turned all ten players' kills
+//! into a clip each, and of the loading screen (no events yet). The cost is that a patch which
+//! moved the identity field would silence personal events until this module learns the new
+//! spelling; that shows in the `GameStart` payload (`"identity": false`, as of the attach; a loading
+//! screen may not have named the player yet) rather than as a flood of clips of footage that
+//! is not the user's. Game-level milestones (a baron, a
+//! turret) do not depend on identity and are still emitted.
+//!
+//! A document that already carries its own `GameEnd` line describes a finished game. Whether
+//! the tracker was in that game (it emits the end, once) or not (it never attached), the
+//! client keeps serving that document for a few seconds, and re-reading it must not start a
+//! game that is already over.
 
 use crate::lol::payload::{GameSnapshot, StreamEvent};
 use crate::{EventKind, GameEvent, Source};
@@ -71,6 +87,12 @@ impl Tracker {
         };
 
         if !self.in_game {
+            // The client keeps serving a finished game's document (its own `GameEnd` line included)
+            // for a few seconds after the end. `seen` was cleared with the game, so reading it again
+            // as a fresh attach would invent a `GameStart`, and the 404 after it a second `GameEnd`.
+            if has_game_end(snapshot) {
+                return Vec::new();
+            }
             return self.start_game(snapshot);
         }
         // The player quit and requeued faster than the endpoint stopped answering, so this is a
@@ -98,15 +120,19 @@ impl Tracker {
                 }
                 // The document sometimes carries the end of the game as an event. Treat it as the end so the
                 // 404 that follows does not report it again.
+                //
+                // The lines before it in this document were derived above and are delivered ahead of the
+                // end: the last poll of a game is where the Multikill, the Ace and the final kill are.
                 "GameEnd" => {
                     self.in_game = false;
                     self.seen.clear();
-                    let result = entry.result.clone();
-                    return vec![end_event(
+                    self.last_game_time = 0.0;
+                    out.push(end_event(
                         snapshot.game_time(),
                         snapshot.scoreboard(),
-                        result,
-                    )];
+                        entry.result.clone(),
+                    ));
+                    return out;
                 }
                 name => {
                     self.seen.insert(key);
@@ -191,6 +217,14 @@ impl Tracker {
     }
 }
 
+/// Whether the document carries the game's own `GameEnd` line.
+fn has_game_end(snapshot: &GameSnapshot) -> bool {
+    snapshot
+        .event_stream()
+        .iter()
+        .any(|entry| entry.event_name == "GameEnd")
+}
+
 /// How an event is identified for the "have I seen this?" question.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum EventKey {
@@ -239,30 +273,29 @@ impl EventKey {
     }
 }
 
+/// Whether `candidate` is one of the names the document gives the watched player.
+fn is_watched(names: &[&str], candidate: Option<&str>) -> bool {
+    candidate.is_some_and(|c| names.contains(&c.trim()))
+}
+
 /// The documented `EventName` → [`EventKind`] mapping (see the module docs).
 fn classify(name: &str, entry: &StreamEvent, names: &[&str]) -> Option<EventKind> {
     match name {
-        // A champion kill is about the watched player, when the document names one.
+        // A champion kill is about the watched player, and only when the document names one: with
+        // nobody to compare against (a spectated game, a replay) a kill is somebody's, not the
+        // user's.
         "ChampionKill" => {
-            if names.is_empty() {
-                // Nothing to compare against: the kill is real, so report it with both names in the payload.
+            if is_watched(names, entry.killer_name.as_deref()) {
                 return Some(EventKind::Kill);
             }
-            if entry
-                .killer_name
-                .as_deref()
-                .is_some_and(|k| names.contains(&k))
-            {
-                return Some(EventKind::Kill);
-            }
-            if entry
-                .victim_name
-                .as_deref()
-                .is_some_and(|v| names.contains(&v))
-            {
+            if is_watched(names, entry.victim_name.as_deref()) {
                 return Some(EventKind::Death);
             }
-            if entry.assisters.iter().any(|a| names.contains(&a.as_str())) {
+            if entry
+                .assisters
+                .iter()
+                .any(|a| is_watched(names, Some(a.as_str())))
+            {
                 return Some(EventKind::Assist);
             }
             // Somebody else's kill: not a clip. The hotkey exists for those moments.
@@ -277,7 +310,21 @@ fn classify(name: &str, entry: &StreamEvent, names: &[&str]) -> Option<EventKind
         // The client folds the epic monsters into one name on some patches; the monster type says
         // which. An epic monster this build cannot name stays a plain objective.
         "EpicMonsterKill" => Some(epic_monster_kind(entry.monster_type.as_deref())),
-        "HordeKill" | "FirstBlood" | "Ace" | "Multikill" => Some(EventKind::Objective),
+        // Personal milestones: an enemy's multikill, the other team's ace and somebody else's first
+        // blood are not moments of the user's own screen. Each names its player in a different field.
+        "Multikill" => {
+            is_watched(names, entry.killer_name.as_deref()).then_some(EventKind::Objective)
+        }
+        "FirstBlood" => {
+            is_watched(names, entry.recipient.as_deref()).then_some(EventKind::Objective)
+        }
+        "Ace" => is_watched(names, entry.acer.as_deref()).then_some(EventKind::Objective),
+        "HordeKill" => (is_watched(names, entry.killer_name.as_deref())
+            || entry
+                .assisters
+                .iter()
+                .any(|a| is_watched(names, Some(a.as_str()))))
+        .then_some(EventKind::Objective),
         // The lifecycle is the state machine's business; pacing events are not clip-worthy, and an
         // unknown name is a patch this build has not seen.
         _ => None,
@@ -316,6 +363,12 @@ fn event_payload(source: &str, name: &str, entry: &StreamEvent, game_time: f64) 
     }
     if let Some(victim) = &entry.victim_name {
         map.insert("victim".into(), json!(victim));
+    }
+    if let Some(recipient) = &entry.recipient {
+        map.insert("recipient".into(), json!(recipient));
+    }
+    if let Some(acer) = &entry.acer {
+        map.insert("acer".into(), json!(acer));
     }
     if !entry.assisters.is_empty() {
         map.insert("assisters".into(), json!(entry.assisters));
@@ -361,6 +414,12 @@ fn start_event(snapshot: &GameSnapshot, adopted: u64) -> GameEvent {
         json!(round_tenth(snapshot.game_time())),
     );
     map.insert("adopted_in_progress_events".into(), json!(adopted));
+    // Whether the document named the watched player. `false` is a spectated game, a replay or a
+    // patch that moved the field, and means no personal event (kill, death, assist) will follow.
+    map.insert(
+        "identity".into(),
+        json!(!snapshot.player_names().is_empty()),
+    );
     GameEvent::new(Source::Lol, EventKind::GameStart, Value::Object(map))
 }
 
@@ -592,22 +651,98 @@ mod tests {
     }
 
     #[test]
-    fn without_a_named_player_a_champion_kill_is_reported_as_a_kill() {
-        // The document names no player (loading screen, or a patch that moved the field): a real kill
-        // is reported rather than dropped, with both names in the payload.
+    fn without_a_named_player_no_champion_kill_is_the_users() {
+        // A spectated game, a replay or a patch that moved the field: the document names no player.
+        // Every kill used to become the user's own `Kill`, so a replay clipped all ten players.
         let mut tracker = Tracker::default();
-        // Attach on a game that has happened to report no events yet …
+        let start = tracker.observe(
+            crate::lol::payload::parse(br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"}}"#)
+                .unwrap()
+                .as_ref(),
+        );
+        assert!(
+            start[0]
+                .payload
+                .as_deref()
+                .unwrap()
+                .contains("\"identity\":false"),
+            "the attach says it had no identity"
+        );
+        // The document names no player but reports a kill, and a baron (which needs no identity).
+        let body = br#"{"gameData":{"gameTime":100.0,"mapName":"Map11"},
+                       "events":{"Events":[
+                         {"EventID":11,"EventName":"ChampionKill","EventTime":95.0,"KillerName":"Somebody","VictimName":"Someone"},
+                         {"EventID":12,"EventName":"Multikill","EventTime":96.0,"KillerName":"Somebody","KillStreak":2},
+                         {"EventID":13,"EventName":"BaronKill","EventTime":97.0,"KillerName":"Somebody"}]}}"#;
+        let events = tracker.observe(crate::lol::payload::parse(body).unwrap().as_ref());
+        assert_eq!(
+            kinds(&events),
+            vec![EventKind::Baron],
+            "no personal event without an identity; the game-level milestone still counts"
+        );
+        // The shipped no-identity fixture (an `activePlayer` with no name) behaves the same.
+        let mut tracker = Tracker::default();
         tracker.observe(
             crate::lol::payload::parse(br#"{"gameData":{"gameTime":-20.0,"mapName":"Map11"}}"#)
                 .unwrap()
                 .as_ref(),
         );
-        // … and then the document that names no player but does report a kill.
-        let events = tracker.observe(snapshot(NO_IDENTITY).as_ref());
-        assert_eq!(kinds(&events), vec![EventKind::Kill]);
-        let payload = payload_of(&events, EventKind::Kill);
-        assert!(payload.contains("\"killer\":\"Somebody\""), "got {payload}");
-        assert!(payload.contains("\"victim\":\"Someone\""), "got {payload}");
+        assert!(tracker.observe(snapshot(NO_IDENTITY).as_ref()).is_empty());
+    }
+
+    #[test]
+    fn personal_milestones_are_clipped_only_for_the_watched_player() {
+        let me = ["TestPlayer#EUW", "TestPlayer"];
+        let entry = |json: &str| -> StreamEvent { serde_json::from_str(json).unwrap() };
+        for (name, mine, theirs) in [
+            (
+                "Multikill",
+                r#"{"EventName":"Multikill","KillerName":"TestPlayer","KillStreak":3}"#,
+                r#"{"EventName":"Multikill","KillerName":"EnemyMid","KillStreak":3}"#,
+            ),
+            (
+                "FirstBlood",
+                r#"{"EventName":"FirstBlood","Recipient":"TestPlayer#EUW"}"#,
+                r#"{"EventName":"FirstBlood","Recipient":"EnemyTop"}"#,
+            ),
+            (
+                "Ace",
+                r#"{"EventName":"Ace","Acer":"TestPlayer","AcingTeam":"ORDER"}"#,
+                r#"{"EventName":"Ace","Acer":"EnemyAdc","AcingTeam":"CHAOS"}"#,
+            ),
+            (
+                "HordeKill",
+                r#"{"EventName":"HordeKill","KillerName":"TestPlayer"}"#,
+                r#"{"EventName":"HordeKill","KillerName":"AllyJungle"}"#,
+            ),
+        ] {
+            assert_eq!(
+                classify(name, &entry(mine), &me),
+                Some(EventKind::Objective),
+                "{name} by the watched player"
+            );
+            assert_eq!(
+                classify(name, &entry(theirs), &me),
+                None,
+                "{name} by somebody else is not a clip of this screen"
+            );
+            assert_eq!(
+                classify(name, &entry(mine), &[]),
+                None,
+                "{name} with no identity cannot be called the user's"
+            );
+        }
+        // Assisting a horde kill is taking part in it.
+        assert_eq!(
+            classify(
+                "HordeKill",
+                &entry(
+                    r#"{"EventName":"HordeKill","KillerName":"AllyJungle","Assisters":["TestPlayer"]}"#
+                ),
+                &me
+            ),
+            Some(EventKind::Objective)
+        );
     }
 
     #[test]
@@ -663,19 +798,15 @@ mod tests {
     }
 
     #[test]
-    fn objectives_are_derived_for_every_milestone_the_client_names() {
+    fn game_level_milestones_are_derived_whoever_did_them() {
         for (name, kind) in [
             ("DragonKill", EventKind::Dragon),
             ("BaronKill", EventKind::Baron),
             ("HeraldKill", EventKind::Herald),
             ("EpicMonsterKill", EventKind::Objective),
-            ("HordeKill", EventKind::Objective),
             ("TurretKilled", EventKind::Turret),
             ("InhibKilled", EventKind::Inhibitor),
             ("FirstBrick", EventKind::Turret),
-            ("FirstBlood", EventKind::Objective),
-            ("Ace", EventKind::Objective),
-            ("Multikill", EventKind::Objective),
         ] {
             assert_eq!(
                 classify(name, &StreamEvent::default(), &["me"]),
@@ -777,6 +908,58 @@ mod tests {
             tracker.observe(None).is_empty(),
             "the endpoint going quiet is not a second end"
         );
+    }
+
+    #[test]
+    fn the_last_poll_before_the_end_keeps_its_events_and_the_repeated_document_starts_nothing() {
+        // The final document: the player's kill and a baron, then the game's own `GameEnd`. Those
+        // events used to be derived and then thrown away by the `return`, and the same document,
+        // served for a few more seconds, re-attached as a new game (a second `GameStart`) whose
+        // `GameEnd` the 404 then reported again.
+        let body = br#"{"gameData":{"gameTime":2400.0,"mapName":"Map11"},
+                       "activePlayer":{"summonerName":"TestPlayer#EUW"},
+                       "events":{"Events":[
+                         {"EventID":38,"EventName":"ChampionKill","EventTime":2395.0,"KillerName":"TestPlayer#EUW","VictimName":"ZedMain"},
+                         {"EventID":39,"EventName":"BaronKill","EventTime":2398.0,"KillerName":"SupportMain"},
+                         {"EventID":40,"EventName":"GameEnd","EventTime":2400.0,"Result":"Win"}]}}"#;
+        let document = crate::lol::payload::parse(body).unwrap();
+
+        let mut tracker = Tracker::default();
+        let mut all = tracker.observe(snapshot(IN_PROGRESS).as_ref());
+        let last = tracker.observe(document.as_ref());
+        assert_eq!(
+            kinds(&last),
+            vec![EventKind::Kill, EventKind::Baron, EventKind::GameEnd],
+            "the events before the end are delivered, ahead of it"
+        );
+        all.extend(last);
+        // The client keeps serving the finished game; then the endpoint goes quiet.
+        for _ in 0..3 {
+            all.extend(tracker.observe(document.as_ref()));
+            assert!(!tracker.in_game(), "a finished game is not re-entered");
+        }
+        all.extend(tracker.observe(None));
+        all.extend(tracker.observe(None));
+        let count = |kind| all.iter().filter(|e| e.kind == kind).count();
+        assert_eq!(count(EventKind::GameStart), 1, "one game, one start");
+        assert_eq!(count(EventKind::GameEnd), 1, "one game, one end");
+
+        // And the next game is still recognised.
+        let next = tracker.observe(snapshot(IN_PROGRESS).as_ref());
+        assert_eq!(kinds(&next), vec![EventKind::GameStart]);
+    }
+
+    #[test]
+    fn attaching_to_a_document_that_already_ended_starts_no_game() {
+        // replayed was started in the seconds after a game ended, while the client still serves
+        // its last document: there is no game to attach to.
+        let body = br#"{"gameData":{"gameTime":2400.0,"mapName":"Map11"},
+                       "events":{"Events":[{"EventID":40,"EventName":"GameEnd","EventTime":2400.0}]}}"#;
+        let document = crate::lol::payload::parse(body).unwrap();
+        let mut tracker = Tracker::default();
+        assert!(tracker.observe(document.as_ref()).is_empty());
+        assert!(!tracker.in_game());
+        assert!(tracker.observe(None).is_empty());
     }
 
     #[test]

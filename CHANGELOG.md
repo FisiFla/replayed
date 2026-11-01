@@ -8,6 +8,221 @@ what has and has not been *verified* on real hardware, read
 
 ## [Unreleased]
 
+This is the production-readiness hardening pass after 0.2.1: a code review of the whole tree, and the
+fixes it produced. Almost all of it has been verified on the development host and on the Windows test
+machine's unit and integration suites. **None of it has been exercised against a real game, and a
+signed update has never been offered to an installed copy**; the ledger
+(`docs/verification-status.md`) says what each run did and did not prove.
+
+### Security
+- **The audio link authenticates its peer process.** ffmpeg reads the game's and the microphone's PCM
+  from a local socket, and the first thing to connect used to win. Another program dialling freshly
+  opened loopback ports (one was seen doing exactly that) could become the audio input and be fed the
+  recording. The encoder now uses a connection only if the operating system says its peer is the
+  ffmpeg child it spawned: on Windows by reading the TCP table (`GetExtendedTcpTable`, no process is
+  opened), elsewhere through a Unix socket in a `0700` directory and the kernel's peer credentials. A
+  stranger is dropped and the wait goes on; a peer whose owner cannot be determined is refused. There
+  is no unauthenticated fallback.
+- **Retention and cleanup delete only inside the library.** The unattended passes read paths from an
+  editable database and used to check only that they were absolute. They now go through a
+  `LibraryRoots`: a clip's file must be inside the clips directory, a session's file inside the
+  sessions directory, and a session's scratch directory a `session-<n>` child of the sessions
+  directory. Canonical paths are compared, so a planted symlink cannot lead out. A shared
+  `[buffer] scratch_dir` is never removed as if it were a session's. A row that fails the check costs
+  the row, not a file.
+- **A zero retention limit is rejected instead of deleting everything.** `max_age_days = 0` or
+  `max_total_bytes = 0` used to mark every non-favourite clip and session for deletion at the next
+  cleanup. Both are now a configuration error, as are the other zero limits the engine cannot honour
+  (`segment_time`, `post_seconds`, `fps`).
+- **The GSI listener cannot be starved by a stalled peer or a web page.** Connections are collected
+  without blocking, the game's own requests (recognised by their token) wait in a lane of their own
+  that the anonymous rate limit does not charge, and a request a browser made (it carries `Sec-Fetch-*` headers) is refused with `403`.
+  See `SECURITY.md`.
+- **The legacy shared GSI token is no longer copied to both games.** Each game gets a fresh token, so a
+  token read from one game's folder cannot forge the other's events. The installed
+  `gamestate_integration_replayed.cfg` has to be refreshed: the desktop app does it for installs it
+  finds when a recording starts, otherwise install it again (see Upgrading below).
+- **No synthetic input in the shipped binary.** The binary guard found `SendInput` in the desktop
+  executable's import table through two dependencies. `tao` and `muda` are now vendored and patched
+  (`apps/desktop/src-tauri/vendor/`), the shell raises its window through `window_focus.rs` instead of
+  `set_focus`, and the guard scans the vendored sources and the built binary against an empty
+  allowlist.
+- **The webview's permissions are narrower.** `capabilities/default.json` now grants only
+  `core:default` and the updater's check and install; the dialog and notification permissions are
+  gone, because the folder picker and the "clip saved" toast are driven from Rust.
+- **The `--work-dir` of `cargo xtask verify` is only emptied if the harness made it** (a marker file),
+  so a mistyped path can no longer be recursively deleted. Sidecar downloads refuse a redirect to
+  anything but HTTPS and are size- and time-bounded.
+
+### Added
+- **Installing an update asks before it stops a recording.** The install used to end the process under
+  a running recording. Now the shell refuses while one is running, the Updates panel asks, and
+  agreeing stops and finalises the recording first. Declining installs nothing.
+- **Quitting flushes a recording.** Quit from the tray, or any other exit that goes through the
+  application's exit events, stops the recorder and finalises the in-flight segment instead of cutting
+  it off. The updater's own exit skips this path, which is why the install asks first. The flush has
+  not been checked on a real desktop (the ledger lists it as a smoke test).
+- **Graceful shutdown for the CLI.** Ctrl+C, Ctrl+Break, closing the console and SIGTERM finish a clip
+  in flight, write a full session out and exit `0`. A second Ctrl+C quits at once.
+- **Start with Windows starts hidden.** The autostart entry passes `--background`, so a login start
+  puts replayed in the tray; a normal launch, or a second launch handing over to a running copy,
+  shows the window.
+- **One recorder per data directory** (`recorder.lock`, an advisory file lock the operating system
+  releases when the process exits, so a crash never leaves it stuck). A CLI started while the desktop
+  app is recording is refused instead of "recovering" the desktop's live session and deleting the
+  directory ffmpeg is writing into.
+- **A microphone that disappears no longer ends the recording.** The outage is padded with silence
+  (the pad is capped at 60 seconds), so the voice track stays aligned with the video, and the
+  microphone is reopened when the device returns. Only the first open is fatal: a recording that asks
+  for a microphone and never had one is still refused at start.
+- **A recording follows its capture target when it is resized.** A replay buffer starts a fresh buffer
+  at the new size and loses its pre-roll (clips already waiting are cut first). A full session holds its
+  output size and scales the new picture to it, so a change of aspect ratio stretches. A zero-copy session,
+  and a replay buffer that also saves its session, cannot follow: they end cleanly with a message and keep
+  what was recorded.
+- **A closed game window ends the recording cleanly, not as a failure.** The window shows "The recording
+  ended: ..." with the reason, and "No new frames for N s" after 5 s without a frame (a minimised or
+  unchanging window). A graphics device that is lost for good is still a failure, with its reason.
+  None of this has been watched on a real game; it is covered by tests with a fake capture.
+- **Hotkeys are registered with `MOD_NOREPEAT` and debounced** (300 ms, at most 8 presses queued), so
+  holding the chord saves one clip and a stalled consumer cannot fire a burst afterwards.
+- **The CS2 integration subscribes to `player_id`**, and the desktop app rewrites an installed `.cfg`
+  that lacks it, so a spectated player's scoreboard can be told apart from the user's. CS2 warmup
+  kills no longer produce clips.
+- **A data-directory migration report.** The move from `localplay` is per entry, resumable and merges
+  directories present on both sides; anything left behind is logged and written next to the data. The
+  paths inside the index that still name `localplay` are repaired in one transaction after a backup.
+- **Library schema v7** adds the `pending_deletes` table: a file whose row was removed but whose unlink
+  failed is retried by the next pass instead of escaping the index and the size cap for good.
+
+### Changed
+- **A/V start alignment.** Audio and video now share one origin, the first video frame: audio from
+  before it is cut away and audio that starts later is preceded by silence for the gap, instead of the
+  audio running ahead of or behind the picture for the whole file.
+- **Frame scheduling drains a stall's lag.** After a capture stall the frames are paced out from the
+  capture clock again instead of staying behind by the length of the stall.
+- **The encoder probe caches only successes.** A probe that failed (a busy GPU, a driver hiccup) used to
+  be remembered and read as "no hardware encoder"; it is now asked again.
+- **Hardware encoder failures surface.** A Media Foundation encoder that failed mid-run used to die
+  silently; the error now propagates out of the encoder to its caller.
+- **NV12 requests fail closed.** An encoder opened on NV12 used to be fed BGRA frames at the first
+  input. It now refuses an input format the texture does not match, so a recording cannot come out as
+  garbage or empty.
+- **Variable-bitrate peak is 150% of the mean** (it was pinned to the mean, which made VBR behave as
+  constant bitrate).
+- **A `%` in `scratch_dir` (or in the account name) works.** ffmpeg expanded `%` sequences in the whole
+  segment path; every `%` in the directory is now escaped.
+- **Recovery drops a truncated tail.** A session whose last segment was cut off by a crash is
+  concatenated from the segments that are readable, instead of failing for good.
+- **Retention runs off the capture thread**, a clip's window is anchored at the event rather than at the
+  moment the clip was cut, and a post-roll no longer blocks Stop.
+- **Hotkey rules.** A letter or digit needs Ctrl or Alt (Shift alone is not enough); a function key can
+  be bound bare. The letter `F` can now be bound as a key. A bare letter in `[hotkeys]` is no longer
+  registered: the CLI refuses to start, and the desktop app reports that no hotkey was installed.
+- **A process-name match means the game is open**, not that a match is in progress; the guide and the
+  README now say so. League's presence is read from `/liveclientdata/gamestats` and the body has to
+  name a game, so a `200` with an empty document is not one.
+- **The CLI applies the same engine validation as the desktop.** It used to carry its own copy of the
+  checks; both now call the recorder library's, so a value one refuses the other refuses, with the same
+  message.
+- **Retention deletes a session only under the configured sessions directory**, and an empty
+  `sessions_dir` means `<app data>/sessions`. Before, with the clips directory moved, session cleanup
+  looked for sessions in a folder beside the clips directory and refused every eviction, so the sessions
+  cap was never enforced.
+- **The desktop ignores `[audio] enabled` and `[recorder] mode`.** They are read by the CLI only; the
+  settings panel and the documentation now say so.
+- **Changing the clips directory while a recording is running needs a restart** for the recorder
+  (it keeps writing where it started); the panel says so. A clips directory the window's file scope
+  has already been withdrawn from cannot be moved back to until replayed restarts, because the scope
+  can only be narrowed for the life of the process, and Settings refuses the move with the reason
+  instead of leaving clips that do not play.
+- **Copy diagnostics shortens the Windows profile name out of paths** (`%LOCALAPPDATA%`,
+  `%USERPROFILE%`), writes UTF-8 to the clipboard so a non-ASCII profile or game title survives, and
+  says in its own heading that it is not safe to publish unread: game names and window titles are
+  still in it.
+- **The thumbnail cache is keyed by clip id and creation time**, so a recycled id no longer shows the
+  previous clip's frame; thumbnails nothing owns are swept once at start-up.
+- **Failed trims and combines remove the file they claimed**, and two identical commands in the same
+  millisecond get different names.
+- **CPU criterion.** `cargo xtask verify` judges CPU against a flat 5% of one core on a quiet screen
+  (an offered rate of 15 fps or less).
+- **`npm audit` runs at `--audit-level=moderate`** and covers dev dependencies.
+- **"Show in folder" selects the file in Explorer.** The path was quoted for `/select,` in a way
+  `CreateProcess` rewrote, so Explorer opened a default folder instead; the argument is now passed as
+  it is, from every place that reveals a file.
+- **The Steam install is found from its registered path**, `HKCU\Software\Valve\Steam` (`SteamPath`,
+  a read of the user's own hive through `reg.exe`), as well as the default locations, so a Steam on
+  another drive is found without a manual copy of the integration file. The containment rule for
+  where the file may be written is unchanged.
+- **The CLI claims its hotkey before it starts the recorder.** It used to start first, and crash
+  recovery in a second copy could "recover" the live session of the copy that held the chord.
+
+### Release
+- **`release.yml` is four jobs: gate, build, sign and publish**, each holding only the authority it
+  needs. The build job has no secret, so the code that runs every build script holds neither the
+  updater key nor a write token; the sign job is the only one with the key and runs in the `release`
+  environment; the publish job creates a draft, checks what GitHub stored, and only then publishes.
+  A tag containing `-` is published as a pre-release and can never become `releases/latest`. The
+  gate refuses a commit whose `CI` run has not passed, a tag that is not on the default branch, and
+  a tag that disagrees with any of the six version sources
+  (`scripts/check-release-version.py`). Every cargo command is `--locked`.
+- **The assets are `replayed_<version>_x64-setup.exe`, its `.sig`, `SHA256SUMS` and `latest.json`.**
+  Tauri 2 signs the installer itself, so there is no `.nsis.zip`. See `docs/packaging.md`.
+
+### Fixed
+- **The microphone could be recorded and never heard.** It was a separate second audio track,
+  and the app's player (like most players a clip is shared to) plays only the first, so the
+  voice was in the file and nobody heard it. And an export kept one audio track, the game
+  audio, so the Discord and Vertical presets dropped the voice altogether. A saved clip with a
+  microphone now leads with a **Game + Mic** mix, followed by the game audio and the microphone
+  as recorded; only the mix is encoded again. An export carries the voice, mixing the two
+  tracks itself when the source has no mix (a full session, or a clip saved before this).
+- **The microphone's start line named the default device even when another was configured.**
+  It now says whether the device was the default communications microphone or the one in
+  `[mic] device`; the endpoint id beside it was already right.
+- **A library moved from the old `localplay` directory no longer lists every clip as missing.** The
+  index stores absolute paths and they still named the old directory; they are repaired (see above).
+- **Video-only clips can be trimmed**: the trim mapped an audio stream unconditionally and failed on a
+  clip with none.
+- **A spectated teammate's kills are not counted as the user's** (CS2 shows the observed player's
+  scoreboard once the user is dead). Unverified against a real payload.
+- **A clip favourited while the cleanup plan was being made is no longer deleted.**
+- **The Capture settings and the Encoder panel no longer overwrite each other's frame rate and output
+  size with stale drafts.**
+- **The log's lock is held on `replayed.lock`**, not on the log that rotation renames.
+- **A chatty ffmpeg no longer stalls a timed-out media command.** Its output pipes are drained while
+  waiting, so a trim or probe fails with ffmpeg's own error instead of "timed out".
+- **Closing a hardware encoder no longer crashes the process.** NVIDIA's Media Foundation encoder
+  still has work queued when it is released, and says it has shut down anyway; the work then ran in
+  freed memory (an access violation, about one test run in three). A closed encoder's last
+  references are now held for 100 ms before they are released, which adds that much to a stop or a
+  resize.
+- **Screen capture no longer crashes when its last capture session closes.** COM unloaded the
+  capture components while their threads were still exiting; the process now keeps its COM apartment
+  for its whole life.
+- **The hardware encoder is taken from the GPU the capture runs on**, and from the requested vendor's
+  encoders only. On a machine with two GPUs it used to be whichever encoder sorted first, which could
+  be another GPU's (one that cannot see the captured frame) or another vendor's than the one asked for.
+  `encode.zero_copy = true` with no matching encoder on the capture's GPU is refused, and the message
+  names that GPU.
+- **Intel Quick Sync encodes through the zero-copy path.** Its encoder asks for three frames at once
+  and only the first request was kept, so the second frame waited for a request that had already
+  come; and it answers `E_UNEXPECTED` to the read right after a format change, which ended the
+  recording at its second frame.
+- **A hotkey listener that is closed gives its chords back.** Its thread waited for messages for the
+  life of the process, so a chord stayed registered after its listener was dropped, and claiming
+  the same chord again in that process was refused as "already registered". Dropping the listener
+  now stops the thread, which unregisters the chords before it ends.
+
+### Upgrading
+- **Reinstall the CS2 and Dota 2 integration if the game does not react.** The old shared token is not
+  reused. Recording from the desktop app rewrites an existing
+  `gamestate_integration_replayed.cfg` it finds in a detected Steam library; with the CLI, or a game
+  outside one, copy the file again from `gsi\<game>\` in the data directory, then restart the game.
+- **A bare letter or digit hotkey, or a zero retention limit, is now refused.** The CLI will not start
+  on either; the desktop app reports that no hotkey was installed, and does not start a recording with
+  a zero limit. The error names the key.
+
 ## [0.2.1] - 2026-10-24
 
 The production-readiness and Outplayed-parity work from the 2026-10-24 plan: the stale index and
@@ -275,7 +490,7 @@ than it supports.
   the webview can no longer widen the asset protocol's read scope to any path it names.
 
 ### Fixed
-- **The game state integration can no longer be squatted, go stale, or be forged with another game's token.** Each game now has its own token and its own path, and the listener refuses a payload whose provider app id is not that game's, so a token lifted from one game's installed `.cfg` cannot forge the other game's events. The listener is bound before any `.cfg` is written, and every `.cfg` -- in the app's data directory and in the game's own folder -- names the port it actually bound rather than the configured one. The desktop shell no longer re-reads the token file on its own: the installed `.cfg` is written from the live binding, it is written atomically, it is refreshed when the listener's port moves, and an install is refused outright when no listener is running. `[events] gsi_ephemeral_port` opts into an unguessable port for anyone who does not need a fixed one. The old single token file is migrated into the per-game files, so an existing install keeps working.
+- **The game state integration can no longer be squatted, go stale, or be forged with another game's token.** Each game now has its own token and its own path, and the listener refuses a payload whose provider app id is not that game's, so a token lifted from one game's installed `.cfg` cannot forge the other game's events. The listener is bound before any `.cfg` is written, and every `.cfg` -- in the app's data directory and in the game's own folder -- names the port it actually bound rather than the configured one. The desktop shell no longer re-reads the token file on its own: the installed `.cfg` is written from the live binding, it is written atomically, it is refreshed when the listener's port moves, and an install is refused outright when no listener is running. `[events] gsi_ephemeral_port` opts into an unguessable port for anyone who does not need a fixed one. The old single token file is migrated into the per-game files, so an existing install keeps working. *(Superseded in the Unreleased section above: the legacy token is no longer carried over, and the installed `.cfg` has to be refreshed.)*
 
 - **The installer writes where the library is, not where the game folder is.** The destination
   must be exactly a known library's `steamapps/common/<game folder>`, and the containment root

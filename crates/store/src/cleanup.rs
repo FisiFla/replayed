@@ -6,7 +6,9 @@
 //! is committed before the file is unlinked, and no file is unlinked unless a committed row
 //! delete handed back its path.
 
-use crate::{Clip, Store};
+use crate::retention::{record_cleanup, settle};
+use crate::roots::Target;
+use crate::{Clip, Eviction, LibraryRoots, Store};
 use anyhow::Result;
 use std::path::{Component, Path, PathBuf};
 
@@ -16,11 +18,39 @@ const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 /// The `[storage]` policy knobs as the storage manager sees them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CleanupPolicy {
-    /// Total bytes the clips directory may occupy, favourites included.
+    /// Total bytes the clips directory may occupy, favourites included. Must be non-zero (see
+    /// [`CleanupPolicy::validate`]).
     pub max_total_bytes: u64,
-    /// A non-favourited clip whose `created_at` is more than this many days old is deleted. `0`
-    /// means every clip created before `now_ms` is over the limit: "older than", not "at least as old as".
+    /// A non-favourited clip whose `created_at` is more than this many days old is deleted. Must be
+    /// non-zero (see [`CleanupPolicy::validate`]); `1` is the shortest retention there is.
     pub max_age_days: u64,
+}
+
+impl CleanupPolicy {
+    /// Refuse a policy with a zero limit.
+    ///
+    /// A `0` used to be a literal limit: `max_age_days = 0` made every clip "older than now" and
+    /// `max_total_bytes = 0` evicted every non-favourite, at the next startup and without a prompt,
+    /// from a config value most people read as "unlimited" or "off". Nothing in the config example
+    /// or the guide said otherwise, and the loss is irreversible. So zero is not a limit any more:
+    /// [`plan_cleanup`] plans **nothing** for such a policy (failing closed, with a warning), and a
+    /// caller that wants to say why, or to refuse to start, asks here. "Delete everything" is not a
+    /// retention policy; a user who wants it deletes the clips.
+    pub fn validate(&self) -> Result<()> {
+        if self.max_age_days == 0 {
+            anyhow::bail!(
+                "max_age_days = 0 is not a limit: it would delete every clip that is not a \
+                 favourite. Use at least 1 day"
+            );
+        }
+        if self.max_total_bytes == 0 {
+            anyhow::bail!(
+                "max_total_bytes = 0 is not a limit: it would delete every clip that is not a \
+                 favourite. Use a positive size"
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Why one clip is in a plan. Both flags can be set (the age and size rules can each select it),
@@ -85,6 +115,8 @@ impl CleanupPlan {
 ///
 /// A clip both rules select appears once, flagged with both reasons.
 ///
+/// A policy with a zero limit is refused: the plan is empty (see [`CleanupPolicy::validate`]).
+///
 /// # When the cap cannot be met
 ///
 /// The reachable floor is the favourites. When that floor is above the cap no deletion can satisfy
@@ -103,6 +135,17 @@ impl CleanupPlan {
 /// indexed in the same millisecond) are broken by id, so a plan is deterministic for a given
 /// library and `now_ms`.
 pub fn plan_cleanup(clips: &[Clip], policy: &CleanupPolicy, now_ms: i64) -> CleanupPlan {
+    if let Err(reason) = policy.validate() {
+        tracing::warn!("cleanup: the policy is invalid and nothing will be deleted: {reason:#}");
+        return CleanupPlan {
+            deletions: Vec::new(),
+            cap_bytes: policy.max_total_bytes,
+            bytes_after: clips
+                .iter()
+                .fold(0, |total, c| total.saturating_add(c.size_bytes)),
+            over_cap_by_bytes: 0,
+        };
+    }
     let max_age_ms = (policy.max_age_days as i64).saturating_mul(MS_PER_DAY);
 
     // Oldest-created first, deterministic under ties. Both rules walk this one order.
@@ -196,11 +239,22 @@ pub struct CleanupOutcome {
     pub orphaned: Vec<PathBuf>,
     /// Paths a deleted row named that were already absent. The end state is right, but a row pointing at nothing is worth reporting.
     pub already_missing: Vec<PathBuf>,
-    /// Total size of the store after the pass, re-read from the database.
-    pub bytes_after: u64,
-    /// Whether the store is at or under the plan's cap after the pass.
+    /// Paths a deleted row named that were deliberately not removed: outside the clips directory,
+    /// relative, or re-adopted by a live row (see [`LibraryRoots`]). The row is gone, the file is
+    /// exactly where it was, and the caller is told.
+    pub refused: Vec<PathBuf>,
+    /// Planned deletions skipped because the clip became a favourite after the plan was made. The
+    /// clip and its file are untouched.
+    pub protected: usize,
+    /// Size of the planned population after the pass: the plan's forecast plus the bytes of every
+    /// planned deletion that did not happen (failed, or protected since planning).
     ///
-    /// Measured, not forecast: a failed row delete or unlink leaves more bytes than the plan predicted.
+    /// Not a re-read of every row in the database: the plan is made over the rows whose file exists
+    /// (a row whose file is gone holds no bytes to reclaim), and a re-read that counted those rows
+    /// again made `cap_met` false for a library the pass had brought under its cap.
+    pub bytes_after: u64,
+    /// Whether the planned population is at or under the plan's cap after the pass: measured
+    /// against what the pass actually did, not forecast.
     pub cap_met: bool,
 }
 
@@ -211,33 +265,77 @@ pub(crate) fn is_absolute_and_clean(path: &Path) -> bool {
     path.is_absolute() && !path.components().any(|c| matches!(c, Component::ParentDir))
 }
 
-/// Apply a plan: for each id, delete the row and commit, then unlink the path that committed
-/// delete handed back.
+/// Apply a plan: for each id, evict the row and commit, then remove the path that committed
+/// eviction handed back.
 ///
 /// The ordering is the safety property. Deleting the row first means the index never names a
 /// file that is gone, the failure a user cannot recover from since the file is the only copy.
 /// The reverse failure (a file whose row is gone) is recoverable, invisible and wastes disk, so
-/// it is reported at WARN with its path rather than swallowed or retried blindly.
+/// it is reported at WARN with its path, **and retried**: the eviction queues the path in
+/// `pending_deletes` in the same transaction as the row delete, and a path that could not be
+/// removed stays queued until a later pass removes it. Every pass starts by working through that
+/// queue, whatever its own plan holds.
 ///
-/// The only path ever unlinked is the one [`Store::delete_clip_returning_path`] returned for this
-/// id, and that returns a path only when its own `DELETE` removed a row, so a plan id whose row
-/// already disappeared deletes nothing.
+/// Three guards stand between a plan and a `remove_file`:
+///
+/// * **Favourites.** The row is evicted by [`Store::evict_clip`], which refuses a favourite under
+///   the same write lock it deletes under, so a clip starred after the plan was made survives
+///   (counted in [`CleanupOutcome::protected`]).
+/// * **Containment.** The path must be inside `roots`' clips directory, resolved through symlinks
+///   (see [`LibraryRoots`]). A row naming anything else costs the user the row, never the file, and
+///   the path is reported in [`CleanupOutcome::refused`].
+/// * **Provenance.** The only path ever removed is one a committed eviction queued, so a plan id
+///   whose row already disappeared deletes nothing.
 ///
 /// Errors are per-row: a failed row is counted in [`CleanupOutcome::failed`] and logged instead
-/// of ending the pass. The returned `Err` is reserved for the final re-read of the store.
-pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutcome> {
+/// of ending the pass. The returned `Err` is reserved for failures this function cannot attribute to a row.
+pub fn execute_cleanup(
+    store: &Store,
+    plan: &CleanupPlan,
+    roots: &LibraryRoots,
+) -> Result<CleanupOutcome> {
     let mut outcome = CleanupOutcome::default();
 
+    match store.pending_deletes() {
+        Ok(pending) => {
+            for tombstone in pending.iter().filter(|t| t.target == Target::ClipFile) {
+                let removal = settle(store, roots, tombstone);
+                record_cleanup(&mut outcome, &tombstone.path, removal, None);
+            }
+        }
+        Err(err) => tracing::warn!("cleanup: could not read the queued removals: {err:#}"),
+    }
+
+    // The planned bytes that are still in the library at the end: failed and protected deletions.
+    let mut unreclaimed: u64 = 0;
     for entry in &plan.deletions {
-        let path = match store.delete_clip_returning_path(entry.id) {
-            Ok(Some(path)) => path,
-            Ok(None) => {
+        match store.evict_clip(entry.id) {
+            Ok(Eviction::Evicted(tombstone)) => {
+                // Committed before this line, together with the queued path.
+                outcome.deleted += 1;
+                let removal = settle(store, roots, &tombstone);
+                record_cleanup(
+                    &mut outcome,
+                    &tombstone.path,
+                    removal,
+                    Some(entry.size_bytes),
+                );
+            }
+            Ok(Eviction::Protected) => {
+                // The user favourited it after the plan was made.
+                tracing::info!(
+                    "cleanup: clip #{} became a favourite after the plan was made; it was kept",
+                    entry.id
+                );
+                outcome.protected += 1;
+                unreclaimed = unreclaimed.saturating_add(entry.size_bytes);
+            }
+            Ok(Eviction::Gone) => {
                 // No committed row delete, so nothing names a file: leave it exactly where it is.
                 tracing::debug!(
                     "cleanup: clip #{} had no row left to delete; nothing was unlinked",
                     entry.id
                 );
-                continue;
             }
             Err(err) => {
                 tracing::warn!(
@@ -245,48 +343,12 @@ pub fn execute_cleanup(store: &Store, plan: &CleanupPlan) -> Result<CleanupOutco
                     entry.id
                 );
                 outcome.failed += 1;
-                continue;
-            }
-        };
-        // That DELETE ran in autocommit: it is committed before this line.
-        outcome.deleted += 1;
-        let path = PathBuf::from(path);
-        if !is_absolute_and_clean(&path) {
-            tracing::warn!(
-                "cleanup: clip #{} was deleted from the index but its recorded path {} is \
-                 relative or contains `..`; nothing was unlinked",
-                entry.id,
-                path.display()
-            );
-            outcome.orphaned.push(path);
-            continue;
-        }
-        match std::fs::remove_file(&path) {
-            Ok(()) => {
-                outcome.bytes_reclaimed = outcome.bytes_reclaimed.saturating_add(entry.size_bytes)
-            }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                tracing::warn!(
-                    "cleanup: clip #{} was deleted from the index but its file was already \
-                     gone: {}",
-                    entry.id,
-                    path.display()
-                );
-                outcome.already_missing.push(path);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    "cleanup: clip #{} was deleted from the index but {} could not be \
-                     unlinked ({err}); it is orphaned on disk and needs a sweep",
-                    entry.id,
-                    path.display()
-                );
-                outcome.orphaned.push(path);
+                unreclaimed = unreclaimed.saturating_add(entry.size_bytes);
             }
         }
     }
 
-    outcome.bytes_after = store.total_bytes()?;
+    outcome.bytes_after = plan.bytes_after.saturating_add(unreclaimed);
     outcome.cap_met = outcome.bytes_after <= plan.cap_bytes;
     Ok(outcome)
 }
@@ -347,15 +409,35 @@ mod tests {
         );
     }
 
+    /// A zero limit used to be literal: `max_age_days = 0` made every clip "older than now" and
+    /// `max_total_bytes = 0` evicted every non-favourite, at the next startup, from a config value
+    /// most people read as "off". Now a zero limit plans nothing, and says why on request.
+    #[test]
+    fn a_zero_limit_fails_closed_and_plans_nothing() {
+        let now = 1_000 * DAY;
+        let clips = vec![
+            clip(1, now - 400 * DAY, 100, false),
+            clip(2, now - 300 * DAY, 100, false),
+        ];
+        for zero in [policy(0, 30), policy(1_000, 0), policy(0, 0)] {
+            assert!(zero.validate().is_err(), "{zero:?} is rejected by validate");
+            let plan = plan_cleanup(&clips, &zero, now);
+            assert!(
+                plan.deletions.is_empty(),
+                "{zero:?} must not delete anything: {:?}",
+                plan.deletions
+            );
+            assert_eq!(plan.bytes_after, 200, "the library is left as it was");
+        }
+        assert!(policy(1, 1).validate().is_ok());
+    }
+
     #[test]
     fn an_empty_library_plans_nothing() {
-        let plan = plan_cleanup(&[], &policy(0, 0), 5 * DAY);
+        let plan = plan_cleanup(&[], &policy(1, 1), 5 * DAY);
 
         assert!(plan.deletions.is_empty());
-        assert!(
-            plan.cap_met(),
-            "0 bytes against a 0 byte cap is exactly at the cap"
-        );
+        assert!(plan.cap_met(), "0 bytes is under any cap");
         assert_eq!(plan.bytes_after, 0);
     }
 
@@ -472,13 +554,13 @@ mod tests {
         assert_eq!(plan.bytes_after, 50);
         assert!(plan.cap_met());
 
-        // A cap no combination of evictions can meet: everything evictable goes.
-        let plan = plan_cleanup(&clips, &policy(0, 3_650), now);
+        // A cap smaller than any clip: everything evictable goes.
+        let plan = plan_cleanup(&clips, &policy(1, 3_650), now);
         assert_eq!(plan.ids(), vec![1, 2, 3, 4]);
         assert_eq!(plan.bytes_after, 0);
         assert!(
             plan.cap_met(),
-            "with no favourites, 0 bytes meets a 0 byte cap"
+            "with no favourites, 0 bytes is under a 1 byte cap"
         );
     }
 

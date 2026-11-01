@@ -2,9 +2,10 @@
 
 use anyhow::{bail, Context, Result};
 use std::ffi::OsStr;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::Duration;
 
 /// Name of the directory holding `ffmpeg`/`ffprobe`, in every layout replayed runs in.
@@ -222,14 +223,95 @@ fn which_dir(binary: &str) -> Option<PathBuf> {
     std::env::split_paths(&path).find(|dir| dir.join(exe(binary)).is_file())
 }
 
+/// How much of a child's stderr is kept: its tail, which is where ffmpeg puts the reason it
+/// stopped.
+const STDERR_TAIL_BYTES: usize = 64 * 1024;
+
+/// How long to wait for a pipe's reader to finish once the child has exited or been killed.
+///
+/// Normally immediate, because the child's end of the pipe closed with it. It is bounded because a
+/// grandchild that inherited the pipe would hold it open, and a reader that never ends must not
+/// become the hang the deadline exists to prevent.
+const DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Read `pipe` to its end on its own thread, delivering the bytes on the returned channel.
+///
+/// `keep_tail` bounds memory for a chatty stream: only the last that many bytes are kept, but the
+/// pipe is still read to its end, since a pipe that is not read is what stalls the child.
+fn drain<R: Read + Send + 'static>(mut pipe: R, keep_tail: Option<usize>) -> Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        loop {
+            match pipe.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    out.extend_from_slice(&chunk[..n]);
+                    // Trimmed at twice the cap, so the copy is amortised rather than per read.
+                    if let Some(cap) = keep_tail.filter(|&cap| out.len() > cap * 2) {
+                        out.drain(..out.len() - cap);
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        if let Some(cap) = keep_tail.filter(|&cap| out.len() > cap) {
+            out.drain(..out.len() - cap);
+        }
+        let _ = tx.send(out);
+    });
+    rx
+}
+
+/// Wait for `child` under `timeout` while draining its stdout and stderr, then collect them.
+///
+/// The pipes have to be read *while* waiting. They are bounded (64KiB on the development host, as
+/// little as 4KiB for a Windows anonymous pipe), so a child that writes more than that blocks on
+/// the write and never exits: ffmpeg over a damaged input emits a warning per packet, which is far
+/// more. Reading them only afterwards, as `wait_with_output` does, turned that into a stall to the
+/// full deadline that then reported only "timed out" with the real reason discarded. On a timeout
+/// the stderr tail read so far is put in the error for the same reason.
+fn finish(mut child: Child, timeout: Duration) -> Result<Output> {
+    let stdout = child.stdout.take().map(|pipe| drain(pipe, None));
+    let stderr = child
+        .stderr
+        .take()
+        .map(|pipe| drain(pipe, Some(STDERR_TAIL_BYTES)));
+    let waited = wait_with_deadline(&mut child, timeout);
+    let collect = |rx: Option<Receiver<Vec<u8>>>| {
+        rx.and_then(|rx| rx.recv_timeout(DRAIN_GRACE).ok())
+            .unwrap_or_default()
+    };
+    let stdout = collect(stdout);
+    let stderr = collect(stderr);
+    if let Err(e) = waited {
+        let tail = String::from_utf8_lossy(&stderr);
+        let tail = tail.trim();
+        if tail.is_empty() {
+            return Err(e);
+        }
+        bail!("{e}; it had written: {tail}");
+    }
+    let status = child.wait().context("collecting ffmpeg output")?;
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
 /// Run a child with stdin closed and a hard timeout, capturing stdout/stderr.
+///
+/// The output is drained while the child runs, so a child that writes more than a pipe holds
+/// finishes instead of stalling to the deadline. Only the last 64KiB of stderr is kept.
 pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<Output> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let mut child = cmd.spawn().context("spawning ffmpeg child")?;
-    wait_with_deadline(&mut child, timeout)?;
-    child.wait_with_output().context("collecting ffmpeg output")
+    let child = cmd.spawn().context("spawning ffmpeg child")?;
+    finish(child, timeout)
 }
 
 /// Run a child with `input` written to its stdin, then closed, and a hard timeout.
@@ -254,8 +336,7 @@ pub fn run_with_stdin(mut cmd: Command, input: Vec<u8>, timeout: Duration) -> Re
         // Dropping `stdin` at the end of this closure is the child's EOF.
     });
 
-    wait_with_deadline(&mut child, timeout)?;
-    child.wait_with_output().context("collecting ffmpeg output")
+    finish(child, timeout)
 }
 
 /// Poll `child` until it exits, killing it and failing if `timeout` elapses first. Polling is
@@ -590,5 +671,61 @@ mod tests {
         let err = FfmpegBinaries::discover_from(None, std::slice::from_ref(&half))
             .expect_err("half a pair is not a sidecar directory");
         assert!(err.to_string().contains("half"), "{err}");
+    }
+
+    /// A child that writes far more than a pipe holds, to both streams, finishes.
+    ///
+    /// Before the pipes were drained while waiting, this child blocked on its first full pipe and
+    /// was killed at the deadline, reporting only that it had timed out.
+    #[cfg(unix)]
+    #[test]
+    fn a_child_that_writes_more_than_a_pipe_holds_still_finishes() {
+        const MIB: usize = 1024 * 1024;
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "head -c 1048576 /dev/zero; head -c 1048576 /dev/zero >&2; exit 0",
+        ]);
+        let started = std::time::Instant::now();
+        let out = run_with_timeout(cmd, Duration::from_secs(30)).expect("the child finishes");
+        assert!(out.status.success());
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "it must not have waited out its deadline"
+        );
+        assert_eq!(out.stdout.len(), MIB, "stdout is kept whole");
+        assert_eq!(
+            out.stderr.len(),
+            STDERR_TAIL_BYTES,
+            "stderr is bounded to its tail"
+        );
+    }
+
+    /// The same for a child fed through stdin, which is the path the in-memory clip save takes.
+    #[cfg(unix)]
+    #[test]
+    fn a_chatty_child_fed_through_stdin_still_finishes() {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "cat >/dev/null; head -c 1048576 /dev/zero >&2; exit 0",
+        ]);
+        let out = run_with_stdin(cmd, vec![0u8; 256 * 1024], Duration::from_secs(30))
+            .expect("the child finishes");
+        assert!(out.status.success());
+        assert_eq!(out.stderr.len(), STDERR_TAIL_BYTES);
+    }
+
+    /// A timeout names what the child had said, instead of discarding it.
+    #[cfg(unix)]
+    #[test]
+    fn a_timeout_carries_the_stderr_the_child_wrote() {
+        let mut cmd = Command::new("sh");
+        // `exec`, so the sleep is the killed process itself and holds no pipe of its own.
+        cmd.args(["-c", "echo diagnostic-text >&2; exec sleep 30"]);
+        let err = run_with_timeout(cmd, Duration::from_millis(400)).expect_err("it times out");
+        let msg = err.to_string();
+        assert!(msg.contains("timed out"), "{msg}");
+        assert!(msg.contains("diagnostic-text"), "{msg}");
     }
 }

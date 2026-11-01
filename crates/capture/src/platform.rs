@@ -101,22 +101,29 @@ pub fn game_audio_backend(
 
 /// `CoInitializeEx(COINIT_MULTITHREADED)` for the calling thread, shared by both Windows backends.
 ///
-/// Returns whether this call took the apartment, i.e. when the caller owes a matching
-/// `CoUninitialize`. Already-initialised threads (`S_FALSE`) and threads in a different apartment
-/// (`RPC_E_CHANGED_MODE`) report `false`: COM is usable either way and we must not uninitialise it.
+/// Returns whether this call took a reference on the apartment, i.e. when the caller owes a
+/// matching `CoUninitialize` *on this thread*. That is `S_OK` (the thread was not initialised) and
+/// also `S_FALSE` (it already was, as MTA): `S_FALSE` is a success that **still increments the
+/// thread's initialisation count**, so a caller that treated it as "not mine" leaked one reference
+/// per call. Only `RPC_E_CHANGED_MODE`, the one failure that leaves the count alone, reports
+/// `false`: COM is usable there and we must not uninitialise it.
+///
+/// Also makes sure the process's multithreaded apartment is never torn down by the last
+/// `CoUninitialize` of those references; see [`keep_mta_alive`] for why that matters.
 #[cfg(windows)]
 pub(crate) fn init_com() -> Result<bool> {
     use windows::Win32::Foundation::{RPC_E_CHANGED_MODE, S_FALSE, S_OK};
     use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 
+    keep_mta_alive();
     // SAFETY: COM is being initialised for the current thread; a null reserved pointer is the documented value.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
     if hr == S_OK {
         return Ok(true);
     }
     if hr == S_FALSE {
-        tracing::debug!("COM was already initialised on this thread");
-        return Ok(false);
+        tracing::debug!("COM was already initialised on this thread; taking one more reference");
+        return Ok(true);
     }
     if hr == RPC_E_CHANGED_MODE {
         tracing::warn!(
@@ -126,4 +133,108 @@ pub(crate) fn init_com() -> Result<bool> {
         return Ok(false);
     }
     anyhow::bail!("CoInitializeEx(COINIT_MULTITHREADED) failed: {hr:?}");
+}
+
+/// Whether this process holds a reference on the multithreaded apartment that is never given back.
+#[cfg(windows)]
+static MTA_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Hold the process's multithreaded apartment open for the rest of its life.
+///
+/// # Why
+///
+/// Each `CoInitializeEx(COINIT_MULTITHREADED)` / `CoUninitialize` pair on a thread is a reference
+/// on one apartment *shared by the whole process*, and when the last reference goes the apartment
+/// is torn down, and COM then unloads every in-process server DLL it had loaded for it. WGC's
+/// `GraphicsCapture.dll` is one of those. It keeps worker threads of its own, and they wind down
+/// asynchronously after `GraphicsCaptureSession.Close` / `Direct3D11CaptureFramePool.Close` have
+/// returned. A backend that is stopped on the thread that started it ends with the last
+/// `CoUninitialize` in the process, so the DLL can be unmapped under a thread still executing it:
+/// the process dies with `STATUS_ACCESS_VIOLATION` on an instruction fetch at an address inside a
+/// module the dump lists as unloaded. That is the crash this closes. In the `wgc_frame` test
+/// binary, whose four tests each start and stop a capture on a fresh thread, it was about one run
+/// in three, and at a different place every time (a few tests after the stop that set it off).
+///
+/// A reference we never release means the apartment, and the DLLs it loaded, live as long as the
+/// process does. The cost is a few DLLs that stay mapped, which is what the recorder wants anyway:
+/// it creates a capture backend again for every recording.
+///
+/// This does not replace the per-thread `CoInitializeEx`: a thread still needs its own to be in
+/// the apartment, and giving that one back is still the owner thread's job.
+///
+/// A failure is logged and not returned: capture works without it, as it did before, and the
+/// crash it prevents is a race and not a certainty. It is retried on the next call.
+#[cfg(windows)]
+fn keep_mta_alive() {
+    use std::sync::atomic::Ordering;
+    use windows::Win32::System::Com::CoIncrementMTAUsage;
+
+    if MTA_KEPT.load(Ordering::Acquire) {
+        return;
+    }
+    // SAFETY: no arguments; the cookie that comes back is deliberately never passed to
+    // `CoDecrementMTAUsage`, which is the point of the call.
+    match unsafe { CoIncrementMTAUsage() } {
+        Ok(_cookie) => MTA_KEPT.store(true, Ordering::Release),
+        Err(e) => tracing::warn!(
+            "could not keep the COM apartment open ({e}); a stopped capture may unload \
+             GraphicsCapture.dll under its own worker threads"
+        ),
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::init_com;
+    use windows::Win32::System::Com::{
+        CoGetApartmentType, CoUninitialize, APTTYPE, APTTYPEQUALIFIER, APTTYPE_MTA,
+    };
+
+    /// The apartment a thread that never initialised COM finds itself in, if it is in one.
+    ///
+    /// A thread with no `CoInitializeEx` of its own is in the process's *implicit* multithreaded
+    /// apartment when one exists and in none when it does not (`CO_E_NOTINITIALIZED`), which makes
+    /// this a probe for whether the apartment is alive, from a thread that cannot be keeping it so.
+    fn apartment_seen_by_a_thread_that_never_initialised_com() -> windows::core::Result<APTTYPE> {
+        std::thread::spawn(|| {
+            let mut kind = APTTYPE::default();
+            let mut qualifier = APTTYPEQUALIFIER::default();
+            // SAFETY: both are valid out-parameters for the calling thread.
+            unsafe { CoGetApartmentType(&mut kind, &mut qualifier) }.map(|()| kind)
+        })
+        .join()
+        .expect("the probe thread does not panic")
+    }
+
+    /// The regression test for the `GraphicsCapture.dll` unload crash (see [`super::keep_mta_alive`]).
+    ///
+    /// A capture backend that is stopped on the thread that started it ends with the process's last
+    /// `CoUninitialize`. That used to tear the multithreaded apartment down, and COM unloads the
+    /// in-process servers of a torn-down apartment, `GraphicsCapture.dll` among them, under worker
+    /// threads of its own that were still winding down. The apartment has to outlive its last user:
+    /// this takes it and gives it back from a thread of its own, as the backend does, and asks
+    /// from another thread whether it is still there. Without the fix the answer is
+    /// `CO_E_NOTINITIALIZED`.
+    ///
+    /// Needs no desktop and no device: it is COM bookkeeping, so it runs on every Windows host, and
+    /// it is the part of the crash that can be tested without the interactive session the
+    /// `wgc_frame` tests need.
+    #[test]
+    fn the_com_apartment_outlives_the_last_backend_that_took_it() {
+        std::thread::spawn(|| {
+            let owned = init_com().expect("COM can be initialised on a thread of its own");
+            if owned {
+                // SAFETY: `init_com` took a reference on this thread, which this gives back.
+                unsafe { CoUninitialize() };
+            }
+        })
+        .join()
+        .expect("the owner thread does not panic");
+
+        let kind = apartment_seen_by_a_thread_that_never_initialised_com().expect(
+            "the process's multithreaded apartment was torn down when its last user gave it \
+             back, which unloads GraphicsCapture.dll under its own worker threads",
+        );
+        assert_eq!(kind, APTTYPE_MTA);
+    }
 }

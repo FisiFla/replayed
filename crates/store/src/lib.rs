@@ -2,7 +2,9 @@
 //!
 //! The storage policy is built on top of this: [`cleanup`] decides what may be deleted from the
 //! rows this module hands out and applies that decision row-first, file-second, so no file is
-//! unlinked without a committed delete naming it.
+//! unlinked without a committed delete naming it. Every unattended unlink is also confined to a
+//! [`LibraryRoots`] pair (the clips and sessions directories), and one that fails is queued in
+//! `pending_deletes` and retried by the next pass.
 
 // The test bodies use `unwrap()` throughout; production code does not.
 #![cfg_attr(test, allow(clippy::unwrap_used))]
@@ -11,9 +13,13 @@ pub mod cleanup;
 pub mod matches;
 pub mod prune;
 pub mod retention;
+pub mod roots;
+
+pub use roots::LibraryRoots;
+use roots::Target;
 
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -21,8 +27,9 @@ use std::time::Duration;
 /// losing a row (see [`Store::migrate`]): v2 the session columns, v3 the media-clock anchor of a
 /// session's event timeline, v4 the media length that timeline is plotted against, v5 the clip
 /// library's title, game and tags, v6 the kind of artefact a clip row names (a video or a
-/// screenshot).
-const SCHEMA_VERSION: i32 = 6;
+/// screenshot), v7 the `events.clip_id` index and the `pending_deletes` table (see
+/// [`V7_DDL`]).
+const SCHEMA_VERSION: i32 = 7;
 
 /// The mode of a session the ring buffer opened: the row groups the clips and events of one
 /// buffer run, and there is no concatenated session file.
@@ -155,6 +162,31 @@ pub const CLIP_KIND_CLIP: &str = "clip";
 /// A row that names a still image written by the screenshot hotkey.
 pub const CLIP_KIND_SCREENSHOT: &str = "screenshot";
 
+/// The v7 additions: an index on `events.clip_id` and the `pending_deletes` table.
+///
+/// * **The index.** The only index on `events` was `(session_id, at)`, so every clip delete (the
+///   `UPDATE events SET clip_id = NULL WHERE clip_id = ?` that detaches its events, plus SQLite's
+///   foreign-key child lookup) and `events_for_clip` scanned the whole table, inside a write
+///   transaction that holds the lock the recorder's 200 ms size writes are waiting for.
+/// * **The tombstones.** Retention deletes the row first and the file second, because the reverse
+///   order can lose the only copy of footage. The cost is that a *failed* second step (the file is
+///   open in a previewer, a scanner has it, the disk errored) used to leave a file on disk that no
+///   row names: invisible to the library, excluded from the cap, never evicted and never retried.
+///   `evict_*` now writes the path here **in the same transaction as the row delete**, and the
+///   executor removes the tombstone only once the path is gone, so a failure *and* a crash between
+///   the two steps are both retried by the next pass. `target` says what the path is, and so which
+///   containment root vouches for it (see [`LibraryRoots`]).
+const V7_DDL: &str = r#"
+            CREATE INDEX IF NOT EXISTS idx_events_clip ON events(clip_id);
+            CREATE TABLE IF NOT EXISTS pending_deletes (
+                id        INTEGER PRIMARY KEY,
+                target    TEXT NOT NULL
+                          CHECK (target IN ('clip_file', 'session_file', 'session_dir')),
+                path      TEXT NOT NULL,
+                queued_at INTEGER NOT NULL
+            );
+            "#;
+
 /// The v5 tag table: one row per (clip, tag). Tags are normalized by [`normalize_tag`] before
 /// they are written, so the primary key makes a tag set a set.
 const V5_TAGS_DDL: &str = r#"
@@ -209,6 +241,10 @@ pub struct NewClip {
     pub size_bytes: u64,
     pub codec: String,
 }
+
+/// One stored path to change, for [`Store::rewrite_paths`]: `(row id, the value the caller read,
+/// the value to write)`.
+pub type PathRewrite = (i64, String, String);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Clip {
@@ -364,6 +400,27 @@ pub struct SessionPaths {
     pub scratch_dir: String,
 }
 
+/// What an eviction attempt found, so an executor can tell "someone protected it" from "it was
+/// already gone" from "I removed it".
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Eviction<T> {
+    /// This call's own `DELETE` removed the row, and queued these paths for removal in the same
+    /// transaction.
+    Evicted(T),
+    /// The row exists but is a favourite now: it was not when the plan was made. Nothing changed.
+    Protected,
+    /// No such row (another pass, another instance or the user got there first). Nothing changed.
+    Gone,
+}
+
+/// A path a committed eviction named and the pass still has to remove (see [`V7_DDL`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Tombstone {
+    pub(crate) id: i64,
+    pub(crate) target: Target,
+    pub(crate) path: PathBuf,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -415,10 +472,25 @@ impl Store {
     /// applied in order, then the version is stamped. `PRAGMA user_version` is written last, so a
     /// crash part-way leaves a database one step behind, upgraded by the next call, never one
     /// claiming a version it lacks.
+    ///
+    /// # Two processes migrate the same file
+    ///
+    /// The desktop shell and the recorder (and the CLI) each open this database, and the first
+    /// start after an upgrade has all of them calling `migrate` at once. Two things made that race:
+    ///
+    /// * The steps ran in `BEGIN DEFERRED` transactions that read (`column_exists`) before they
+    ///   wrote (`ALTER`), so the loser's read lock could not be promoted and SQLite failed it with
+    ///   `SQLITE_BUSY` at once, *ignoring* the busy timeout; or it passed the check, lost the race
+    ///   and died on `duplicate column name`.
+    /// * Both made the backup, and one's `VACUUM INTO` met the file the other had just created.
+    ///
+    /// Now the whole upgrade is one `BEGIN IMMEDIATE` transaction: the write lock is taken (and
+    /// waited for, with the busy timeout) *before* anything is read, and `user_version` is read
+    /// again under it, so the second process finds the work done and returns. A transaction also
+    /// means an interrupted upgrade rolls back whole rather than leaving a half-built table.
+    /// `foreign_keys` is set before the transaction because SQLite ignores that pragma inside one.
     pub fn migrate(&self) -> Result<()> {
-        let current: i32 = self
-            .conn
-            .query_row("PRAGMA user_version", [], |r| r.get(0))?;
+        let current = self.schema_version()?;
         if current > SCHEMA_VERSION {
             anyhow::bail!(
                 "database schema v{current} is newer than this build supports (v{SCHEMA_VERSION}); \
@@ -429,26 +501,60 @@ impl Store {
             return Ok(());
         }
 
+        // `VACUUM INTO` cannot run inside a transaction, so the backup is taken first, from the
+        // version this process saw. If another process upgraded in between, the backup is of a
+        // newer file than its name says: harmless, and still a restore point.
         self.backup_before_migration(current)?;
-        self.conn.execute_batch(V1_DDL)?;
+        self.conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+
+        let tx = self.immediate_tx()?;
+        let current = tx.query_row("PRAGMA user_version", [], |r| r.get::<_, i32>(0))?;
+        if current > SCHEMA_VERSION {
+            anyhow::bail!(
+                "database schema v{current} is newer than this build supports (v{SCHEMA_VERSION}); \
+                 refusing to downgrade"
+            );
+        }
+        if current == SCHEMA_VERSION {
+            // Another process finished the upgrade while this one waited for the lock.
+            return Ok(());
+        }
+        tx.execute_batch(V1_DDL)?;
         if current < 2 {
-            self.upgrade_to_v2()?;
+            add_columns(&tx, "sessions", &V2_SESSION_COLUMNS)?;
         }
         if current < 3 {
-            self.upgrade_to_v3()?;
+            add_columns(&tx, "sessions", &V3_SESSION_COLUMNS)?;
         }
         if current < 4 {
-            self.upgrade_to_v4()?;
+            add_columns(&tx, "sessions", &V4_SESSION_COLUMNS)?;
         }
         if current < 5 {
-            self.upgrade_to_v5()?;
+            upgrade_to_v5(&tx)?;
         }
         if current < 6 {
-            self.upgrade_to_v6()?;
+            add_columns(&tx, "clips", &V6_CLIP_COLUMNS)?;
         }
-        self.conn
-            .execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        if current < 7 {
+            tx.execute_batch(V7_DDL)?;
+        }
+        tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
+        tx.commit()?;
         Ok(())
+    }
+
+    /// Begin a transaction that takes the write lock now.
+    ///
+    /// Every transaction in this file that writes goes through here (or starts with a write). A
+    /// `BEGIN DEFERRED` transaction that reads first holds a read lock when it asks for the write
+    /// lock, and if another connection holds that lock SQLite refuses the promotion immediately
+    /// instead of invoking the busy handler: the [`BUSY_TIMEOUT`] does not apply. With the recorder
+    /// committing a size write every 200 ms, a desktop tag edit hit that window readily.
+    fn immediate_tx(&self) -> Result<Transaction<'_>> {
+        Ok(Transaction::new_unchecked(
+            &self.conn,
+            TransactionBehavior::Immediate,
+        )?)
     }
 
     /// Copy an existing, populated database aside before upgrading it, so a bad migration costs a
@@ -473,16 +579,31 @@ impl Store {
         }
         let mut name = db_path.as_os_str().to_owned();
         name.push(format!(".v{current}.bak"));
-        let backup = PathBuf::from(name);
-        let _ = std::fs::remove_file(&backup);
+        let backup = PathBuf::from(&name);
+        // Written under a name only this call uses (process id plus a counter, so two threads of one
+        // process are as separate as two processes), then renamed into place. `VACUUM INTO`
+        // refuses an existing target, so writing straight to the shared name made the second of two
+        // simultaneous upgraders fail with "output file already exists" and abort its startup; the
+        // rename is atomic, so a reader never sees a half-written backup either.
+        static STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let unique = STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        name.push(format!(".tmp-{}-{unique}", std::process::id()));
+        let staging = PathBuf::from(name);
+        let _ = std::fs::remove_file(&staging);
         self.conn
-            .execute("VACUUM INTO ?1", [backup.to_string_lossy().as_ref()])
+            .execute("VACUUM INTO ?1", [staging.to_string_lossy().as_ref()])
             .with_context(|| {
                 format!(
                     "backing up the database to {} before migrating",
                     backup.display()
                 )
             })?;
+        std::fs::rename(&staging, &backup).with_context(|| {
+            format!(
+                "moving the database backup into place at {}",
+                backup.display()
+            )
+        })?;
 
         // Retention: keep the two newest `<db>.v*.bak`.
         if let (Some(dir), Some(base)) = (db_path.parent(), db_path.file_name()) {
@@ -503,69 +624,6 @@ impl Store {
                 let _ = std::fs::remove_file(old);
             }
         }
-        Ok(())
-    }
-
-    /// v1 -> v2: `sessions` gains the columns the session recorder needs.
-    fn upgrade_to_v2(&self) -> Result<()> {
-        self.add_session_columns(&V2_SESSION_COLUMNS)
-    }
-
-    /// v2 -> v3: `sessions` gains the media-clock anchor of its event timeline (see [`V3_SESSION_COLUMNS`]).
-    fn upgrade_to_v3(&self) -> Result<()> {
-        self.add_session_columns(&V3_SESSION_COLUMNS)
-    }
-
-    /// v3 -> v4: `sessions` gains the media length its timeline is plotted against (see [`V4_SESSION_COLUMNS`]).
-    fn upgrade_to_v4(&self) -> Result<()> {
-        self.add_session_columns(&V4_SESSION_COLUMNS)
-    }
-
-    /// v4 -> v5: `clips` gains a title and a game, and the tag table appears. The game is back-filled
-    /// from the clip's session where it has one. One transaction, every step idempotent, like
-    /// [`Store::add_session_columns`].
-    fn upgrade_to_v5(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for (column, ddl) in &V5_CLIP_COLUMNS {
-            if !column_exists(&tx, "clips", column)? {
-                tx.execute_batch(ddl)?;
-            }
-        }
-        tx.execute_batch(V5_TAGS_DDL)?;
-        tx.execute_batch(
-            "UPDATE clips SET game = (SELECT game FROM sessions WHERE sessions.id = clips.session_id)
-             WHERE game IS NULL AND session_id IS NOT NULL",
-        )?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// v5 -> v6: `clips` gains the kind of artefact the row names. Idempotent like the others.
-    fn upgrade_to_v6(&self) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for (column, ddl) in &V6_CLIP_COLUMNS {
-            if !column_exists(&tx, "clips", column)? {
-                tx.execute_batch(ddl)?;
-            }
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// Add whichever of `columns` the `sessions` table does not already have.
-    ///
-    /// Idempotent twice over: the version check in [`Store::migrate`] normally skips it, and each
-    /// column is checked against `PRAGMA table_info` first, so a hand-edited or half-upgraded file
-    /// upgrades instead of dying on `duplicate column name`. One transaction, so an interrupted
-    /// upgrade leaves the table as it was.
-    fn add_session_columns(&self, columns: &[(&str, &str)]) -> Result<()> {
-        let tx = self.conn.unchecked_transaction()?;
-        for (column, ddl) in columns {
-            if !column_exists(&tx, "sessions", column)? {
-                tx.execute_batch(ddl)?;
-            }
-        }
-        tx.commit()?;
         Ok(())
     }
 
@@ -689,7 +747,8 @@ impl Store {
         if clean.len() > MAX_TAGS_PER_CLIP {
             anyhow::bail!("a clip carries at most {MAX_TAGS_PER_CLIP} tags");
         }
-        let tx = self.conn.unchecked_transaction()?;
+        // Immediate, not deferred: this reads before it writes (see `Store::immediate_tx`).
+        let tx = self.immediate_tx()?;
         let exists: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM clips WHERE id = ?1)",
             params![id],
@@ -1087,6 +1146,245 @@ impl Store {
             scratch_dir,
         }))
     }
+
+    /// Evict a clip for the storage policy: the row goes, its file is queued as a tombstone in the
+    /// same transaction, and a **favourite is never evicted**, whatever the plan said.
+    ///
+    /// The executors work from a plan made from a snapshot, and between the snapshot and this call
+    /// can lie seconds or minutes (a stat per clip, a multi-gigabyte unlink per deletion). A user who
+    /// stars a clip in that window has made the one request the policy promises to honour, yet the
+    /// unconditional [`Store::delete_clip_returning_path`] deleted it anyway. This method checks and
+    /// deletes under one `BEGIN IMMEDIATE`, so the favourite flag cannot flip between the check and
+    /// the delete (the desktop's `set_favourite` needs the same write lock), and the `DELETE` itself
+    /// repeats `favourite = 0`. The user's explicit delete command keeps the unconditional method.
+    ///
+    /// Events and tags are handled exactly as [`Store::delete_clip_returning_path`] handles them.
+    pub(crate) fn evict_clip(&self, id: i64) -> Result<Eviction<Tombstone>> {
+        let tx = self.immediate_tx()?;
+        let row: Option<(String, bool)> = tx
+            .query_row(
+                "SELECT path, favourite <> 0 FROM clips WHERE id = ?1",
+                params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let path = match row {
+            None => return Ok(Eviction::Gone),
+            Some((_, true)) => return Ok(Eviction::Protected),
+            Some((path, false)) => path,
+        };
+        tx.execute(
+            "UPDATE events SET clip_id = NULL WHERE clip_id = ?1",
+            params![id],
+        )?;
+        tx.execute("DELETE FROM clip_tags WHERE clip_id = ?1", params![id])?;
+        let removed = tx.execute(
+            "DELETE FROM clips WHERE id = ?1 AND favourite = 0",
+            params![id],
+        )?;
+        if removed != 1 {
+            return Ok(Eviction::Gone);
+        }
+        let tombstone = queue_tombstone(&tx, Target::ClipFile, &path)?;
+        tx.commit()?;
+        Ok(Eviction::Evicted(tombstone))
+    }
+
+    /// Evict a session for the storage policy: the row goes and what it owned on disk is queued as
+    /// tombstones in the same transaction. A favourite is never evicted, as for
+    /// [`Store::evict_clip`]; a session still recording is an error, as for
+    /// [`Store::delete_session_returning_paths`].
+    ///
+    /// # What is queued, and what deliberately is not
+    ///
+    /// * the concatenated file, when there is one;
+    /// * the scratch directory, **only for a session-mode row**. A buffer-mode row's `scratch_dir`
+    ///   is the ring's one shared, user-configurable directory, written by no session in particular,
+    ///   so evicting a row that merely *names* it must never remove it: it would take every other
+    ///   file the user keeps there with it. Nor is a directory queued while another row still
+    ///   names it.
+    pub(crate) fn evict_session(&self, id: i64) -> Result<Eviction<Vec<Tombstone>>> {
+        let tx = self.immediate_tx()?;
+        let session: Option<Session> = tx
+            .query_row(
+                &format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE id = ?1"),
+                params![id],
+                read_session,
+            )
+            .optional()?;
+        let Some(Session {
+            ended_at_ms: ended_at,
+            final_path,
+            scratch_dir,
+            mode,
+            favourite,
+            ..
+        }) = session
+        else {
+            return Ok(Eviction::Gone);
+        };
+        if ended_at.is_none() {
+            anyhow::bail!(
+                "session #{id} is still recording (ended_at IS NULL); refusing to evict it — \
+                 its scratch directory is the recording. End it with end_session first."
+            );
+        }
+        if favourite {
+            return Ok(Eviction::Protected);
+        }
+        let shared: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE scratch_dir = ?1 AND id <> ?2)",
+            params![scratch_dir, id],
+            |r| r.get(0),
+        )?;
+        tx.execute(
+            "UPDATE events SET session_id = NULL WHERE session_id = ?1",
+            params![id],
+        )?;
+        tx.execute(
+            "UPDATE clips SET session_id = NULL WHERE session_id = ?1",
+            params![id],
+        )?;
+        let removed = tx.execute(
+            "DELETE FROM sessions WHERE id = ?1 AND favourite = 0 AND ended_at IS NOT NULL",
+            params![id],
+        )?;
+        if removed != 1 {
+            return Ok(Eviction::Gone);
+        }
+        let mut queued = Vec::new();
+        if let Some(final_path) = final_path {
+            queued.push(queue_tombstone(&tx, Target::SessionFile, &final_path)?);
+        }
+        if mode == SESSION_MODE_SESSION && !shared {
+            queued.push(queue_tombstone(&tx, Target::SessionDir, &scratch_dir)?);
+        }
+        tx.commit()?;
+        Ok(Eviction::Evicted(queued))
+    }
+
+    /// Every path an earlier eviction committed and no pass has yet removed, oldest first.
+    pub(crate) fn pending_deletes(&self) -> Result<Vec<Tombstone>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, target, path FROM pending_deletes ORDER BY id")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (id, target, path) = row?;
+            match Target::parse(&target) {
+                Some(target) => out.push(Tombstone {
+                    id,
+                    target,
+                    path: PathBuf::from(path),
+                }),
+                // The CHECK constraint makes this unreachable; a hand-edited file is skipped, not trusted.
+                None => tracing::warn!(
+                    "pending delete #{id} has an unknown target {target:?}; ignoring it"
+                ),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Drop a tombstone once its path is gone (or was refused: a path that will never be admitted
+    /// must not be retried for ever).
+    pub(crate) fn forget_pending(&self, id: i64) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM pending_deletes WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    /// Whether a live row names `path` as what `target` is. A tombstone whose path a *new* row has
+    /// since adopted (the same file name re-recorded while the old unlink kept failing) must not be
+    /// removed: it is somebody's footage again.
+    pub(crate) fn path_is_indexed(&self, target: Target, path: &Path) -> Result<bool> {
+        let sql = match target {
+            Target::ClipFile => "SELECT EXISTS(SELECT 1 FROM clips WHERE path = ?1)",
+            Target::SessionFile => "SELECT EXISTS(SELECT 1 FROM sessions WHERE final_path = ?1)",
+            Target::SessionDir => "SELECT EXISTS(SELECT 1 FROM sessions WHERE scratch_dir = ?1)",
+        };
+        Ok(self
+            .conn
+            .query_row(sql, params![path.to_string_lossy()], |r| r.get(0))?)
+    }
+
+    /// Rewrite stored paths, each one **only if the row still holds the value the caller read**,
+    /// in one transaction. Each item is `(row id, expected current value, new value)`; the three
+    /// slices are `clips.path`, `sessions.final_path` and `sessions.scratch_dir`. Returns how many
+    /// columns were changed, so a caller can compare it with what it asked for.
+    ///
+    /// For repairing paths that a move left stale (the data directory was renamed, a library was
+    /// relocated). The caller decides *which* rows move, after looking at the disk; this applies
+    /// that decision without trusting that nothing happened in between. A row that has since been
+    /// rewritten, edited or deleted no longer matches its expected value, and is **left exactly as
+    /// it is** (it is not counted and it is not an error): a bulk rewrite computed from an old read
+    /// must not overwrite a newer fact, which is the fail-closed side of a compare-and-set. This is
+    /// also why it takes explicit rows rather than a prefix: a prefix would move every row under it
+    /// whether or not the file is at the new place, and strand the ones it is not.
+    ///
+    /// Every new value must be an absolute path with no `..`, checked before anything is written:
+    /// a relative path in the index would be refused by every executor later and would silently
+    /// match a different file depending on the working directory. Moving the files is the
+    /// caller's job and is done first. Thumbnails are not in the index (the shell keys its cache by
+    /// clip), so nothing here has to follow them.
+    ///
+    /// All-or-nothing: a `UNIQUE` violation (a row already at the destination) rolls everything back
+    /// and is returned, rather than leaving half a library moved.
+    pub fn rewrite_paths(
+        &self,
+        clips: &[PathRewrite],
+        session_finals: &[PathRewrite],
+        session_scratch: &[PathRewrite],
+    ) -> Result<usize> {
+        for (_, _, new) in clips.iter().chain(session_finals).chain(session_scratch) {
+            if !cleanup::is_absolute_and_clean(Path::new(new)) {
+                anyhow::bail!("the new path {new} must be an absolute path with no `..`");
+            }
+        }
+        let tx = self.immediate_tx()?;
+        let mut changed = 0usize;
+        for (sql, rows) in [
+            (
+                "UPDATE clips SET path = ?3 WHERE id = ?1 AND path = ?2",
+                clips,
+            ),
+            (
+                "UPDATE sessions SET final_path = ?3 WHERE id = ?1 AND final_path = ?2",
+                session_finals,
+            ),
+            (
+                "UPDATE sessions SET scratch_dir = ?3 WHERE id = ?1 AND scratch_dir = ?2",
+                session_scratch,
+            ),
+        ] {
+            let mut stmt = tx.prepare(sql)?;
+            for (id, expected, new) in rows {
+                changed += stmt.execute(params![id, expected, new])?;
+            }
+        }
+        tx.commit()?;
+        Ok(changed)
+    }
+}
+
+/// Record a path an eviction is handing to the executor, inside the eviction's own transaction.
+fn queue_tombstone(tx: &Transaction<'_>, target: Target, path: &str) -> Result<Tombstone> {
+    tx.execute(
+        "INSERT INTO pending_deletes (target, path, queued_at) VALUES (?1, ?2, ?3)",
+        params![target.as_str(), path, now_ms()],
+    )?;
+    Ok(Tombstone {
+        id: tx.last_insert_rowid(),
+        target,
+        path: PathBuf::from(path),
+    })
 }
 
 /// The `sessions` columns [`read_session`] expects, in order: one definition, so a query and its reader cannot drift.
@@ -1122,6 +1420,33 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
         }
     }
     Ok(false)
+}
+
+/// Add whichever of `columns` the named table does not already have.
+///
+/// Idempotent twice over: the version check in [`Store::migrate`] normally skips it, and each
+/// column is checked against `PRAGMA table_info` first, so a hand-edited or half-upgraded file
+/// upgrades instead of dying on `duplicate column name`. The caller's transaction makes an
+/// interrupted upgrade leave the table as it was.
+fn add_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+    for (column, ddl) in columns {
+        if !column_exists(conn, table, column)? {
+            conn.execute_batch(ddl)?;
+        }
+    }
+    Ok(())
+}
+
+/// v4 -> v5: `clips` gains a title and a game, and the tag table appears. The game is back-filled
+/// from the clip's session where it has one. Idempotent like [`add_columns`].
+fn upgrade_to_v5(conn: &Connection) -> Result<()> {
+    add_columns(conn, "clips", &V5_CLIP_COLUMNS)?;
+    conn.execute_batch(V5_TAGS_DDL)?;
+    conn.execute_batch(
+        "UPDATE clips SET game = (SELECT game FROM sessions WHERE sessions.id = clips.session_id)
+         WHERE game IS NULL AND session_id IS NOT NULL",
+    )?;
+    Ok(())
 }
 
 fn read_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
@@ -2450,7 +2775,7 @@ mod tests {
 
         store.migrate().unwrap();
 
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
         let clips = store.list_clips().unwrap();
         assert_eq!(clips.len(), 1, "no row lost");
         assert_eq!(clips[0].id, id);
@@ -2463,7 +2788,7 @@ mod tests {
         let db = dir.path().join("replayed.db");
         let store = v1_database(&db);
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
 
         let clips = store.list_clips().unwrap();
         assert_eq!(clips.len(), 1);
@@ -2486,11 +2811,428 @@ mod tests {
         );
     }
 
+    /// `set_clip_tags` reads (does the clip exist?) and then writes. In a deferred transaction that
+    /// is a read lock being promoted to a write lock, which SQLite refuses at once when another
+    /// connection holds the write lock, without ever calling the busy handler: the five-second
+    /// timeout the rest of this file relies on does not apply, and the desktop's tag edit failed with
+    /// "database is locked" whenever it landed inside one of the recorder's 200 ms size writes.
+    #[test]
+    fn a_tag_edit_waits_for_the_write_lock_instead_of_failing_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("replayed.db");
+        let recorder = Store::open(&db).unwrap();
+        recorder.migrate().unwrap();
+        let id = recorder.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        let desktop = Store::open(&db).unwrap();
+
+        recorder.conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        recorder
+            .conn
+            .execute("UPDATE clips SET size_bytes = 2 WHERE id = ?1", params![id])
+            .unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let editor = std::thread::spawn(move || {
+            let _ = tx.send(desktop.set_clip_tags(id, &["ace".to_string()]));
+        });
+        assert!(
+            matches!(
+                rx.recv_timeout(Duration::from_millis(300)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "the tag edit must wait for the lock, not fail with SQLITE_BUSY"
+        );
+        recorder.conn.execute_batch("COMMIT").unwrap();
+        let result = rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the edit finishes once the lock is released");
+        assert!(result.expect("and succeeds"));
+        editor.join().unwrap();
+    }
+
+    /// The desktop, the recorder and the CLI all call `migrate` on first start after an upgrade.
+    /// Both must succeed and the file must end at the current version, with no staging file left
+    /// beside the backups.
+    #[test]
+    fn two_processes_migrating_the_same_old_database_both_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("replayed.db");
+        {
+            let s = Store::open(&db).unwrap();
+            s.migrate().unwrap();
+            s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        }
+        for round in 0..8 {
+            // Put the file back to what a v5 build left, every round, so the race is run repeatedly.
+            {
+                let s = Store::open(&db).unwrap();
+                s.conn.execute_batch("PRAGMA user_version = 5").unwrap();
+                let _ = s.conn.execute_batch(
+                    "DROP TABLE IF EXISTS pending_deletes; DROP INDEX IF EXISTS idx_events_clip;",
+                );
+                if column_exists(&s.conn, "clips", "kind").unwrap() {
+                    s.conn
+                        .execute_batch("ALTER TABLE clips DROP COLUMN kind")
+                        .unwrap();
+                }
+            }
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let workers: Vec<_> = (0..2)
+                .map(|_| {
+                    let (db, barrier) = (db.clone(), barrier.clone());
+                    std::thread::spawn(move || {
+                        let s = Store::open(&db).unwrap();
+                        barrier.wait();
+                        s.migrate()
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker
+                    .join()
+                    .unwrap()
+                    .unwrap_or_else(|err| panic!("round {round}: a migrator failed: {err:#}"));
+            }
+            let s = Store::open(&db).unwrap();
+            assert_eq!(s.schema_version().unwrap(), SCHEMA_VERSION);
+            assert_eq!(s.list_clips().unwrap().len(), 1);
+        }
+        let stray: Vec<String> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp-"))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "no staging file is left behind: {stray:?}"
+        );
+    }
+
+    #[test]
+    fn v7_adds_the_events_clip_index_and_the_pending_deletes_table_without_losing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("replayed.db");
+        let store = Store::open(&db).unwrap();
+        store.migrate().unwrap();
+        let id = store.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        // Put the file back to v6: no index, no table.
+        store
+            .conn
+            .execute_batch(
+                "DROP TABLE pending_deletes; DROP INDEX idx_events_clip; PRAGMA user_version = 6;",
+            )
+            .unwrap();
+
+        store.migrate().unwrap();
+
+        assert_eq!(store.schema_version().unwrap(), SCHEMA_VERSION);
+        let index: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_events_clip'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(index, 1, "events.clip_id is indexed");
+        let table: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM pending_deletes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(table, 0, "the tombstone table exists and starts empty");
+        assert_eq!(store.list_clips().unwrap()[0].id, id, "no row lost");
+        let plan: String = store
+            .conn
+            .query_row(
+                "EXPLAIN QUERY PLAN UPDATE events SET clip_id = NULL WHERE clip_id = 1",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_events_clip"),
+            "the detach uses it: {plan}"
+        );
+    }
+
+    fn ended_session(s: &Store, mode: &str, scratch: &str, final_path: Option<&str>) -> i64 {
+        let id = s.start_session(None, mode, 1_000, scratch, 0).unwrap();
+        s.end_session(id, 2_000, final_path, 10, 1_000).unwrap();
+        id
+    }
+
+    #[test]
+    fn evicting_a_favourited_clip_deletes_nothing_and_queues_nothing() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        s.set_favourite(id, true).unwrap();
+
+        assert_eq!(s.evict_clip(id).unwrap(), Eviction::Protected);
+
+        assert_eq!(s.list_clips().unwrap().len(), 1, "the favourite survives");
+        assert!(
+            s.pending_deletes().unwrap().is_empty(),
+            "and nothing is queued for removal"
+        );
+    }
+
+    #[test]
+    fn evicting_a_clip_removes_the_row_and_queues_its_path_in_one_commit() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = s.insert_clip(&new_clip("/clips/a.mp4")).unwrap();
+        let tag_id = s.insert_clip(&new_clip("/clips/b.mp4")).unwrap();
+        s.set_clip_tags(tag_id, &["ace".into()]).unwrap();
+
+        let Eviction::Evicted(tombstone) = s.evict_clip(id).unwrap() else {
+            panic!("an ordinary clip is evicted");
+        };
+        assert_eq!(tombstone.path, PathBuf::from("/clips/a.mp4"));
+        assert_eq!(tombstone.target, Target::ClipFile);
+        assert_eq!(s.pending_deletes().unwrap(), vec![tombstone.clone()]);
+        assert_eq!(s.list_clips().unwrap().len(), 1);
+        assert_eq!(
+            s.evict_clip(id).unwrap(),
+            Eviction::Gone,
+            "a second eviction finds nothing"
+        );
+        assert!(
+            matches!(s.evict_clip(tag_id).unwrap(), Eviction::Evicted(_)),
+            "a tagged clip goes too"
+        );
+
+        s.forget_pending(tombstone.id).unwrap();
+        assert_eq!(
+            s.pending_deletes().unwrap().len(),
+            1,
+            "only the forgotten one is dropped"
+        );
+    }
+
+    #[test]
+    fn evicting_a_session_queues_its_file_and_its_own_scratch_directory() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = ended_session(
+            &s,
+            SESSION_MODE_SESSION,
+            "/sessions/session-1",
+            Some("/sessions/session-1.mp4"),
+        );
+
+        let Eviction::Evicted(queued) = s.evict_session(id).unwrap() else {
+            panic!("an ended session is evicted");
+        };
+        let targets: Vec<_> = queued.iter().map(|t| (t.target, t.path.clone())).collect();
+        assert_eq!(
+            targets,
+            vec![
+                (
+                    Target::SessionFile,
+                    PathBuf::from("/sessions/session-1.mp4")
+                ),
+                (Target::SessionDir, PathBuf::from("/sessions/session-1")),
+            ]
+        );
+        assert!(s.list_sessions().unwrap().is_empty());
+    }
+
+    /// The replay buffer's rows name the one shared, user-configurable scratch directory, which
+    /// the row does not own. Evicting such a row must never queue it.
+    #[test]
+    fn evicting_a_buffer_session_never_queues_the_shared_scratch_directory() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let id = ended_session(&s, SESSION_MODE_BUFFER, "/data/Replays", None);
+
+        let Eviction::Evicted(queued) = s.evict_session(id).unwrap() else {
+            panic!("the row is evicted");
+        };
+        assert!(
+            queued.is_empty(),
+            "a buffer row owns no scratch tree: {queued:?}"
+        );
+        assert!(s.pending_deletes().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_scratch_directory_another_row_still_names_is_not_queued() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let first = ended_session(&s, SESSION_MODE_SESSION, "/sessions/session-1", None);
+        let _second = ended_session(&s, SESSION_MODE_SESSION, "/sessions/session-1", None);
+        let Eviction::Evicted(queued) = s.evict_session(first).unwrap() else {
+            panic!("evicted");
+        };
+        assert!(queued.is_empty(), "the second row still owns the directory");
+    }
+
+    #[test]
+    fn evicting_a_favourite_or_a_running_session_changes_nothing() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let fav = ended_session(&s, SESSION_MODE_SESSION, "/sessions/session-1", None);
+        s.set_session_favourite(fav, true).unwrap();
+        assert_eq!(s.evict_session(fav).unwrap(), Eviction::Protected);
+
+        let running = s
+            .start_session(None, SESSION_MODE_SESSION, 5, "/sessions/session-2", 0)
+            .unwrap();
+        assert!(
+            s.evict_session(running).is_err(),
+            "a running session is refused, loudly"
+        );
+        assert_eq!(s.list_sessions().unwrap().len(), 2);
+        assert_eq!(s.evict_session(999).unwrap(), Eviction::Gone);
+        assert!(s.pending_deletes().unwrap().is_empty());
+    }
+
+    fn clip_paths(s: &Store) -> Vec<String> {
+        let mut paths: Vec<String> = s
+            .list_clips()
+            .unwrap()
+            .into_iter()
+            .map(|c| c.path.to_string_lossy().into_owned())
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// A path that is absolute on the host: Windows wants a drive, and a store that refuses
+    /// relative destinations would refuse the bare `/old/a.mp4` there.
+    fn p(unix: &str) -> String {
+        if cfg!(windows) {
+            format!("C:{unix}")
+        } else {
+            unix.to_string()
+        }
+    }
+
+    fn rewrite(id: i64, from: &str, to: &str) -> PathRewrite {
+        (id, from.to_string(), to.to_string())
+    }
+
+    #[test]
+    fn rewrite_paths_moves_exactly_the_rows_whose_value_still_matches() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let a = s.insert_clip(&new_clip(&p("/old/clips/a.mp4"))).unwrap();
+        let b = s.insert_clip(&new_clip(&p("/old/clips/b.mp4"))).unwrap();
+        s.insert_clip(&new_clip(&p("/elsewhere/c.mp4"))).unwrap();
+        let session = ended_session(
+            &s,
+            SESSION_MODE_SESSION,
+            &p("/old/sessions/session-1"),
+            Some(p("/old/sessions/session-1.mp4").as_str()),
+        );
+
+        let changed = s
+            .rewrite_paths(
+                &[
+                    rewrite(a, &p("/old/clips/a.mp4"), &p("/new/clips/a.mp4")),
+                    // b was edited since the caller read it: the expected value is stale.
+                    rewrite(b, &p("/old/clips/gone.mp4"), &p("/new/clips/b.mp4")),
+                ],
+                &[rewrite(
+                    session,
+                    &p("/old/sessions/session-1.mp4"),
+                    &p("/new/sessions/session-1.mp4"),
+                )],
+                &[rewrite(
+                    session,
+                    &p("/old/sessions/session-1"),
+                    &p("/new/sessions/session-1"),
+                )],
+            )
+            .unwrap();
+
+        assert_eq!(changed, 3, "a, and the session's two columns; not b");
+        assert_eq!(
+            clip_paths(&s),
+            vec![
+                p("/elsewhere/c.mp4"),
+                p("/new/clips/a.mp4"),
+                p("/old/clips/b.mp4")
+            ],
+            "b kept its value, because the row no longer held the expected one"
+        );
+        let moved = s.get_session(session).unwrap().unwrap();
+        assert_eq!(moved.scratch_dir, p("/new/sessions/session-1"));
+        assert_eq!(
+            moved.final_path.as_deref(),
+            Some(p("/new/sessions/session-1.mp4").as_str())
+        );
+    }
+
+    #[test]
+    fn rewrite_paths_cannot_overwrite_a_newer_value_or_a_missing_final_path() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let a = s.insert_clip(&new_clip(&p("/old/a.mp4"))).unwrap();
+        let open = s
+            .start_session(
+                None,
+                SESSION_MODE_SESSION,
+                1_000,
+                &p("/old/sessions/session-2"),
+                0,
+            )
+            .unwrap();
+
+        // The first pass moves it; a second pass from the same (now stale) read changes nothing.
+        let plan = [rewrite(a, &p("/old/a.mp4"), &p("/new/a.mp4"))];
+        assert_eq!(s.rewrite_paths(&plan, &[], &[]).unwrap(), 1);
+        assert_eq!(s.rewrite_paths(&plan, &[], &[]).unwrap(), 0);
+        // A session that has no final path yet cannot be matched by an expected value.
+        assert_eq!(
+            s.rewrite_paths(&[], &[rewrite(open, "", &p("/new/s.mp4"))], &[])
+                .unwrap(),
+            0
+        );
+        assert_eq!(s.get_session(open).unwrap().unwrap().final_path, None);
+        assert_eq!(clip_paths(&s), vec![p("/new/a.mp4")]);
+    }
+
+    #[test]
+    fn rewrite_paths_refuses_relative_destinations_and_rolls_back_on_a_collision() {
+        let s = Store::open_in_memory().unwrap();
+        s.migrate().unwrap();
+        let b = s.insert_clip(&new_clip(&p("/old/b.mp4"))).unwrap();
+        let a = s.insert_clip(&new_clip(&p("/old/a.mp4"))).unwrap();
+        s.insert_clip(&new_clip(&p("/new/a.mp4"))).unwrap();
+
+        assert!(s
+            .rewrite_paths(&[rewrite(b, &p("/old/b.mp4"), "relative/b.mp4")], &[], &[])
+            .is_err());
+        assert!(s
+            .rewrite_paths(&[rewrite(b, &p("/old/b.mp4"), &p("/x/../b.mp4"))], &[], &[])
+            .is_err());
+
+        assert!(
+            s.rewrite_paths(
+                &[
+                    rewrite(b, &p("/old/b.mp4"), &p("/new/b.mp4")),
+                    rewrite(a, &p("/old/a.mp4"), &p("/new/a.mp4")),
+                ],
+                &[],
+                &[],
+            )
+            .is_err(),
+            "/old/a.mp4 would land on the row already at /new/a.mp4"
+        );
+        assert_eq!(
+            clip_paths(&s),
+            vec![p("/new/a.mp4"), p("/old/a.mp4"), p("/old/b.mp4")],
+            "nothing moved: b was rewritten before the collision and was rolled back with it"
+        );
+    }
+
     #[test]
     fn the_v5_step_is_safe_to_run_twice() {
         let s = Store::open_in_memory().unwrap();
         s.migrate().unwrap();
-        s.upgrade_to_v5().expect("columns and table already exist");
+        upgrade_to_v5(&s.conn).expect("columns and table already exist");
     }
 
     #[test]

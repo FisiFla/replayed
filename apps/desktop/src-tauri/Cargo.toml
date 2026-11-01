@@ -65,6 +65,9 @@ fs4 = { version = "1.1", features = ["sync"] }
 windows = { version = "0.62", features = [
     "Win32_System_SystemInformation",
     "Wdk_System_SystemServices",
+    # `SetForegroundWindow` and `FlashWindowEx` on our own window: the way `window_focus` raises it
+    # without the Alt keystroke tao's own focus call synthesises.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [build-dependencies]
@@ -91,6 +94,20 @@ base64 = "0.23"
 # neither.
 replayed-recorder = { path = "../../../crates/recorder", features = ["test-encoders"] }
 replayed-encoder = { path = "../../../crates/encoder", features = ["test-encoders"] }
+
+# tao and muda, patched so the shipped binary never imports `SendInput` (docs/anti-cheat.md).
+# tao 0.37.1's `set_focus` presses a synthetic Alt key to win the foreground, and muda 0.20.0's
+# predefined Edit menu items press Ctrl+C/X/V/A/Z/Y; both go through `SendInput`, so merely
+# linking them put the API in the import table of the shipping `replayed-desktop.exe` even
+# though the shell never calls either path (`scripts/check-pe-imports.py` caught it). The
+# copies under `vendor/` are the locked crates.io versions with
+# `scripts/patches/{tao,muda}-*-no-sendinput.patch` applied; `vendor/README.md` says how to
+# re-vendor on an upgrade. Dependabot is told to leave both crates alone for the same reason
+# (`.github/dependabot.yml`), and `scripts/check-forbidden-apis.sh` scans `vendor/` for
+# `SendInput`, so an upgrade that drops the patch fails CI rather than quietly shipping it.
+[patch.crates-io]
+tao = { path = "vendor/tao" }
+muda = { path = "vendor/muda" }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

@@ -182,12 +182,15 @@ impl<R: Read> Framed<R> {
         let mut out = Vec::new();
         loop {
             if self.pos < self.buf.len() {
-                let take = (max.saturating_sub(out.len())).min(self.buf.len() - self.pos);
-                out.extend_from_slice(&self.buf[self.pos..self.pos + take]);
-                self.pos += take;
-                if out.len() > max {
+                // Refuse before copying. The old code clamped the copy to what room was left, so once
+                // `out` held exactly `max` bytes it took zero, `pos` never moved, the `> max` test
+                // below it could never be true, and the loop spun forever on a body one byte over.
+                let available = self.buf.len() - self.pos;
+                if available > max.saturating_sub(out.len()) {
                     bail!("the body exceeds the {max}-byte limit");
                 }
+                out.extend_from_slice(&self.buf[self.pos..]);
+                self.pos = self.buf.len();
                 continue;
             }
             if self.fill()? == 0 {
@@ -277,7 +280,7 @@ impl<R: Read> Framed<R> {
 }
 
 /// Where the head ends within `bytes`, if it does.
-fn find_head_end(bytes: &[u8]) -> Option<usize> {
+pub(crate) fn find_head_end(bytes: &[u8]) -> Option<usize> {
     bytes.windows(4).position(|w| w == b"\r\n\r\n").or_else(|| {
         // A peer that sends bare LFs (tolerated, not encouraged).
         bytes.windows(2).position(|w| w == b"\n\n")
@@ -285,7 +288,7 @@ fn find_head_end(bytes: &[u8]) -> Option<usize> {
 }
 
 /// How many bytes the terminator at `rest` occupies.
-fn terminator_len(rest: &[u8]) -> usize {
+pub(crate) fn terminator_len(rest: &[u8]) -> usize {
     if rest.starts_with(b"\r\n\r\n") {
         4
     } else if rest.starts_with(b"\n\n") {
@@ -295,7 +298,7 @@ fn terminator_len(rest: &[u8]) -> usize {
     }
 }
 
-fn parse_head(bytes: &[u8]) -> Result<Head> {
+pub(crate) fn parse_head(bytes: &[u8]) -> Result<Head> {
     let text = std::str::from_utf8(bytes).context("the message head is not ASCII")?;
     let mut lines = text.split('\n');
     let start_line = lines.next().unwrap_or_default().trim_end_matches('\r');
@@ -408,6 +411,39 @@ mod tests {
         let (head, body) = read_all(raw).expect("a close-delimited response");
         assert_eq!(head.content_length(), None);
         assert_eq!(body, b"{\"a\":1}");
+    }
+
+    #[test]
+    fn a_close_delimited_body_over_the_limit_is_an_error_and_not_an_endless_loop() {
+        // `rest_of_stream` used to clamp its copy to the room left, so a body longer than `max` with
+        // no `Content-Length` filled `out` to exactly `max`, then took zero bytes per pass forever.
+        // Run it on a thread so a regression fails the test instead of hanging the suite.
+        let (done, outcome) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n0123456789ABCDEF";
+            let mut framed = Framed::new(Cursor::new(raw.to_vec()));
+            let head = framed.head().unwrap();
+            let _ = done.send(framed.body(&head, 10).map_err(|e| format!("{e:#}")));
+        });
+        let result = outcome
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the read finished instead of spinning");
+        assert!(
+            result.unwrap_err().contains("exceeds"),
+            "the refusal says the limit was hit"
+        );
+
+        // A body of exactly `max` bytes is still fine, and so is one split across reads.
+        let raw = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n0123456789";
+        let mut framed = Framed::new(Cursor::new(raw.to_vec()));
+        let head = framed.head().unwrap();
+        assert_eq!(framed.body(&head, 10).unwrap(), b"0123456789");
+        let mut framed = Framed::new(OneByteAtATime(raw));
+        let head = framed.head().unwrap();
+        assert_eq!(framed.body(&head, 10).unwrap(), b"0123456789");
+        let mut framed = Framed::new(OneByteAtATime(b"HTTP/1.1 200 OK\r\n\r\n0123456789A"));
+        let head = framed.head().unwrap();
+        assert!(framed.body(&head, 10).is_err());
     }
 
     #[test]

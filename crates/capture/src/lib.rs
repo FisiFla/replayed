@@ -15,6 +15,12 @@ pub mod platform;
 pub mod stub;
 pub mod target;
 
+// What the video backend decides about a capture that is not going to plan (a resize, a quiet
+// target, a lost device). Platform-free so it is tested on every host; only the Windows backend
+// and this crate's own tests use it.
+#[cfg(any(windows, test))]
+mod watch;
+
 pub mod audio_devices;
 
 // The microphone backend is cross-platform so the recorder's microphone path is testable off
@@ -384,6 +390,29 @@ fn agree(pool: Duration, wall: Duration) -> bool {
     }
 }
 
+/// Why a capture ended for good, as a typed error a caller can tell from a failure it cannot name.
+///
+/// Returned inside the [`anyhow::Error`] from [`CaptureBackend::next_frame`]; recover it with
+/// `err.downcast_ref::<CaptureLost>()`. Both variants are final for this backend: the recording
+/// should stop and say why, rather than treat them as a frame that has not arrived yet (`Ok(None)`),
+/// which is what a closed window used to look like.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum CaptureLost {
+    /// The capture target no longer exists: the captured window was closed, or the captured display
+    /// was disconnected. Nothing more will ever be delivered for it.
+    #[error(
+        "the capture target is gone: the captured window was closed or the captured display was \
+         disconnected, so there is nothing left to record"
+    )]
+    TargetClosed,
+    /// The graphics device was lost (a driver reset, a driver update, the adapter removed) and
+    /// could not be rebuilt in the time the backend allows.
+    #[error(
+        "the graphics device was lost and could not be rebuilt after {attempts} attempts: {reason}"
+    )]
+    DeviceLost { attempts: u32, reason: String },
+}
+
 /// Where a capture backend's time has gone since it started.
 ///
 /// See [`CaptureBackend::frame_timings`] for why the two parts are separated.
@@ -708,11 +737,52 @@ pub trait CaptureBackend: Send {
     /// carry no pixels and the encoder refuses them by name rather than writing a zero-length frame.
     fn deliver_textures(&mut self, _textures: bool) {}
 
-    /// The frame geometry this backend delivers.
+    /// The frame geometry this backend delivers *now*.
     ///
-    /// Infallible: the size is fixed at construction (the monitor's native resolution for WGC, the
-    /// configured size for the stub). The encoder declares its rawvideo pipe with exactly this size.
+    /// Infallible, and fixed from construction until [`CaptureBackend::take_size_change`] reports a
+    /// change (the monitor's native resolution for WGC, the configured size for the stub). The
+    /// encoder declares its rawvideo pipe with exactly this size, so a caller that holds an encoder
+    /// built from an earlier answer must not feed it frames of this one.
     fn native_size(&self) -> (u32, u32);
+
+    /// The new frame geometry, once, if the captured thing changed size since the last call.
+    ///
+    /// A window resized, or a display switched to another mode, mid-recording. The rawvideo pipe
+    /// into the encoder is a flat byte stream declared for one size, so a frame of another size is
+    /// not "a bit off": it is read as the start of the next frame and every frame after it is
+    /// garbled. The backend therefore never lets a frame of the old size through after it has
+    /// noticed the change, and it never delivers a crop or a padding of the new content as if it
+    /// were whole.
+    ///
+    /// **Contract for the caller.** Ask after *every* [`CaptureBackend::next_frame`] call, whether
+    /// or not it returned a frame, and before the returned frame is submitted:
+    ///
+    /// * Frames returned before this reports `Some` are of the old geometry.
+    /// * Every frame returned after it reports `Some` is of the new geometry, which is also what
+    ///   [`CaptureBackend::native_size`] now answers.
+    /// * So on `Some((w, h))` the caller finishes the segment the encoder is writing and starts an
+    ///   encoder declared for `w`x`h` (or scales, if its output size is fixed), then submits the
+    ///   frame in hand to *that* one.
+    ///
+    /// A caller that never asks is not silently wrong: the first frame of the new geometry fails the
+    /// pump's size guard, naming both sizes. The default answers `None`, for a backend whose frames
+    /// never change size.
+    fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        None
+    }
+
+    /// How long no frame has arrived, once that is long enough to be worth saying; `None` while
+    /// frames are arriving.
+    ///
+    /// A *state*, not an error. A screen that is not changing presents no frames, so a quiet
+    /// capture is not necessarily a broken one; a minimised window is quiet for as long as it stays
+    /// minimised. The backend logs the start and the end of a stall itself, and this lets a status
+    /// line say "no frames for 12s" rather than show a recording that looks healthy and records a
+    /// frozen picture. A target that is *gone* is not a stall: that is
+    /// [`CaptureLost::TargetClosed`], an error from `next_frame`.
+    fn stalled_for(&self) -> Option<Duration> {
+        None
+    }
 }
 
 pub trait AudioBackend: Send {

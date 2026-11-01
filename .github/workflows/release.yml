@@ -3,95 +3,151 @@
 # ---------------------------------------------------------------------------
 # WHAT IT DOES
 # ---------------------------------------------------------------------------
-# A tag becomes a published GitHub Release carrying the Windows NSIS installer.
+# A version tag becomes a published GitHub Release carrying the Windows NSIS installer, in four
+# jobs that each hold only the authority they need:
 #
-#   - a `push` of a `v*` tag starts the pipeline and publishes that tag;
-#   - `workflow_dispatch` starts it by hand, which is how a release is re-cut: give the tag
-#     in the `tag` input, or dispatch the workflow on the tag itself.
+#   gate     (ubuntu)  decides whether this tag may be released at all. No secret, read-only.
+#   build    (windows) builds the installer from the tagged commit, UNSIGNED. No secret at all:
+#                      this is the job that runs every build script and every dependency, so it
+#                      is the one that must not hold the updater's signing key or a write token.
+#   sign     (ubuntu)  signs the installer with the updater key and proves the signature
+#                      verifies against the key pinned in the app. The only job with the key,
+#                      and it runs nothing but the Tauri CLI's signer.
+#   publish  (ubuntu)  creates a DRAFT release, checks what GitHub stored, then publishes it.
+#                      The only job with a write token, and it has no signing key.
 #
-# The build is the one CI already runs in its `package-windows` job, copied step for step
-# (see `.github/workflows/ci.yml`): the pinned and checksum-verified ffmpeg sidecar, the
-# frontend, and `tauri build` producing the NSIS installer. The installer is inspected
-# before it is published, exactly as CI inspects it.
+# Triggers:
 #
-# Nothing here is signed, because no code-signing certificate exists yet
-# (docs/packaging.md §5.1). That is not hidden: the release body says so, in the place a
-# user reads before running the installer, and it says what to do about the SmartScreen
-# warning the unsigned build produces.
+#   - a `push` of a version tag starts the pipeline and publishes that tag. The tag pattern is
+#     anchored: `v1.2.3` and `v1.2.3-rc.1`, never `vfoo` or `v1.2.3.4`. A tag with a `-` is a
+#     PRE-RELEASE and is published with `--prerelease`, so it can never become the "latest"
+#     release and so can never be what `releases/latest/download/latest.json` serves to every
+#     installed copy of the application;
+#   - `workflow_dispatch` starts it by hand, which is how a release is re-cut: give the tag in
+#     the `tag` input, or dispatch the workflow on the tag itself.
+#
+# ---------------------------------------------------------------------------
+# THE GATE
+# ---------------------------------------------------------------------------
+# Nothing is published unless, for the exact commit the tag names:
+#
+#   - the tag is a version tag, the checkout is the tag's commit, and that commit is reachable
+#     from the default branch (a tag pushed from an unreviewed branch is not a release);
+#   - every place the version is written agrees with the tag, and CHANGELOG.md has its section
+#     (`scripts/check-release-version.py`);
+#   - the `CI` workflow has a SUCCESSFUL run on that commit: the same tests, clippy, `cargo
+#     deny`, anti-cheat guard, `npm audit` and secret scan that gate every merge. This workflow
+#     does not re-run them (they take far longer than the release itself); it refuses to
+#     release a commit they have not passed. If CI is still running it waits, up to 30 minutes.
+#     A `pull_request` run does not count: it tests the merge of the pull request with its
+#     base, not the commit that was tagged.
+#
+# On top of that, the build job fails if the executable inside the installer imports a function
+# that injects into another process, hooks, or synthesises input (`scripts/check-pe-imports.py`,
+# docs/anti-cheat.md): the source guard reads our code, and only the import table of what ships
+# sees a dependency.
 #
 # ---------------------------------------------------------------------------
 # THE ASSETS
 # ---------------------------------------------------------------------------
-#   - `replayed_<version>_x64-setup.exe` — the NSIS installer;
-#   - `SHA256SUMS` — the installer's SHA-256 in `sha256sum -c` format, so the download can
-#     be checked before it is run. The same hash is printed in the release body;
-#   - `replayed_<version>_x64-setup.nsis.zip` — the *updater's* artifact: the installer,
-#     zipped. This is what the installed application downloads;
-#   - `replayed_<version>_x64-setup.nsis.zip.sig` — the minisign signature of that zip,
-#     made with the release key whose public half is pinned in `tauri.conf.json`;
-#   - `latest.json` — the update manifest. It names the zip and its signature, and it is
-#     published under the stable name `releases/latest/download/latest.json`, which is the
-#     one URL the application asks (see `plugins.updater.endpoints`).
+# With `bundle.createUpdaterArtifacts: true` (the Tauri 2 mode) the bundler signs the NSIS
+# installer *itself* and writes `<installer>.sig` beside it. There is no `.nsis.zip`; that is
+# the Tauri 1 layout, produced only under `"v1Compatible"`. An earlier version of this file
+# looked for the zip, found none and could never publish.
 #
-# All of them are uploaded as a workflow artefact as well, *before* the release step, so a
-# failed release still leaves the built installer on the Actions page instead of nowhere.
+#   - `replayed_<version>_x64-setup.exe` — the NSIS installer, and also the updater's artifact:
+#     the installed application downloads this file and runs it;
+#   - `replayed_<version>_x64-setup.exe.sig` — the minisign signature, made with the release
+#     key whose public half is pinned in `tauri.conf.json`, bound to this file name and this
+#     version (`requireSignedVersion`);
+#   - `SHA256SUMS` — the installer's SHA-256 in `sha256sum -c` format;
+#   - `latest.json` — the update manifest. It names the installer and carries its signature,
+#     and is served under the stable name `releases/latest/download/latest.json`, the one URL
+#     the application asks (`plugins.updater.endpoints`).
+#
+# The unsigned installer is also kept as a workflow artefact, so a release that fails to publish
+# still leaves what was built on the Actions page.
 #
 # ---------------------------------------------------------------------------
 # THE SIGNING KEY
 # ---------------------------------------------------------------------------
-# The release needs two repository secrets, and the build fails without them:
+# Two secrets, read by ONE step of ONE job (`sign`), which runs in the `release` environment
+# (GitHub creates it on first use; add required reviewers to it to make every release wait for
+# a human):
 #
 #   - `TAURI_SIGNING_PRIVATE_KEY` — the private minisign key, base64, exactly as
 #     `tauri signer generate` wrote it. It never enters the repository;
 #   - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` — its password.
 #
-# The public half of the same key pair is `plugins.updater.pubkey` in `tauri.conf.json`, and
-# the CLI refuses to sign with a key that does not match it — so a wrong secret fails the
-# release here, and not on a user's machine.
+# `tauri build` and `tauri signer sign` do NOT refuse a key that is not the pinned one: they
+# sign anyway and print a warning. A release signed with the wrong key would publish an update
+# that no installed copy accepts. So the pipeline checks it itself, twice, before and after the
+# draft exists, with `scripts/verify-updater-signature.py`, which repeats what the application's
+# updater does and is stricter (it wants the file name and the version in the signed comment).
+# The `sign` job does no caching and installs with `--ignore-scripts`, so the only code that
+# runs while the key is in the environment is the Tauri CLI that the lockfile pins.
+#
+# ---------------------------------------------------------------------------
+# DRAFT, THEN PUBLISH
+# ---------------------------------------------------------------------------
+# The release is created as a draft, which no one can download and the updater cannot see. The
+# `publish` job then downloads what GitHub actually stored, checks the installer's SHA-256
+# against what was built and verifies the signature on the stored bytes, and only then turns the
+# draft into a release. A re-cut deletes a stale DRAFT of the tag; a release that is already
+# PUBLISHED is never replaced in place (installed copies may already have updated from it):
+# delete it by hand, deliberately, to re-cut.
 #
 # ---------------------------------------------------------------------------
 # PERMISSIONS
 # ---------------------------------------------------------------------------
-# `contents: write`, and nothing else: the workflow creates a release and writes nothing
-# else in the repository. The token is the automatic `GITHUB_TOKEN`, so this workflow runs
-# and publishes with no secret configured at all.
+# Read-only by default. `gate` adds `actions: read` (to read CI's run), `publish` adds
+# `contents: write` (to create the release). Neither the signing key nor a write token is ever
+# in the job that builds.
 #
 # ---------------------------------------------------------------------------
 # ACTION PINS
 # ---------------------------------------------------------------------------
-# Every action is pinned to a full commit SHA, with the human-readable version beside it,
-# for the reason `.github/workflows/ci.yml` sets out: a mutable tag is a moving target that
-# can be repointed at new code without any change in this file. The SHAs below are the ones
-# CI already uses, so the two workflows run the same code. Refresh one with:
+# Every action is pinned to a full commit SHA, with the human-readable version beside it, for
+# the reason `.github/workflows/ci.yml` sets out: a mutable tag can be repointed at new code
+# without any change in this file. Refresh one with:
 #
 #   gh api repos/<owner>/<repo>/commits/<tag> --jq .sha
 #
-# `dtolnay/rust-toolchain` is the awkward one, as in CI: the branch's head pins the action's
-# own code, not the compiler. The setup below names `toolchain: 1.99.1` in its `with:` block,
-# so a release tag is built by the compiler named here — the same one CI tests against.
+# `dtolnay/rust-toolchain` is the awkward one, as in CI: the branch's head pins the action's own
+# code, not the compiler. The setup below names `toolchain: 1.99.1` in its `with:` block, so a
+# release tag is built by the compiler named here — the same one CI tests against.
 #
 # The release itself is published with the GitHub CLI, which is preinstalled on the hosted
-# runner. That is deliberate: a third-party release action would be one more dependency to
-# hand a write token to, and `gh` is already on the image.
+# runner. That is deliberate: a third-party release action would be one more dependency to hand
+# a write token to.
+#
+# ---------------------------------------------------------------------------
+# CARGO IS ALWAYS --locked
+# ---------------------------------------------------------------------------
+# The two `Cargo.lock` files are what `cargo deny` audited. Without `--locked` cargo silently
+# re-resolves a stale one, and the release would be built from a dependency set nobody reviewed.
 
 name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      # Anchored on purpose (`v*` also matched `vfoo`). The gate job applies the full
+      # semantic-version pattern; these two only decide whether the workflow starts.
+      - 'v[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-*'
   # Re-cut a release by hand: either name the tag in the input, or dispatch the workflow
   # on the tag itself. The tag must already exist — this workflow publishes a tag, it does
   # not invent one.
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Tag to publish, e.g. v0.1.0. Leave empty to use the tag the run was dispatched on.'
+        description: 'Tag to publish, e.g. v0.1.0 or v0.2.0-rc.1. Leave empty to use the tag the run was dispatched on.'
         required: false
         type: string
 
 permissions:
-  contents: write
+  contents: read
 
 # A release is never cancelled half-published: `cancel-in-progress` stays false, and the
 # group is keyed on the *tag* so a manual re-cut cannot race the tag's own run.
@@ -103,60 +159,154 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    name: Windows release (NSIS installer)
-    runs-on: windows-latest
+  gate:
+    name: Gate (tag, version, CI)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # The CI workflow's runs are read through the API.
+      actions: read
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.commit.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      prerelease: ${{ steps.tag.outputs.prerelease }}
     steps:
       - name: Resolve the release tag
         id: tag
-        shell: pwsh
+        shell: bash
         env:
           REQUESTED_TAG: ${{ github.event.inputs.tag }}
           REF_NAME: ${{ github.ref_name }}
           REF_TYPE: ${{ github.ref_type }}
         run: |
-          $tag = "$env:REQUESTED_TAG".Trim()
-          if ([string]::IsNullOrWhiteSpace($tag)) { $tag = "$env:REF_NAME".Trim() }
-          if ($tag -notmatch '^v\d+\.\d+\.\d+') {
-            throw ("the release needs a version tag like v0.1.0, and got '$tag'. " +
-              "This run was dispatched on ref '$env:REF_NAME' (ref type: $env:REF_TYPE). " +
-              "Pick the tag in the Ref dropdown, or fill in the 'tag' input.")
-          }
-          Write-Host "releasing tag: $tag"
-          # The artefact name has to be a legal one; a tag may hold characters GitHub
-          # releases allow and artefact names do not.
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-          "slug=$($tag -replace '[^A-Za-z0-9._-]', '_')" >> $env:GITHUB_OUTPUT
+          set -euo pipefail
+          tag="${REQUESTED_TAG:-}"
+          tag="${tag//[[:space:]]/}"
+          if [ -z "$tag" ]; then tag="$REF_NAME"; fi
+          # The whole tag, anchored at both ends: semantic versioning, no build metadata. The
+          # old check anchored only the start, so `v1.2.3 anything` passed it. The pre-release
+          # part is checked here only for its characters; check-release-version.py below applies
+          # the exact semantic-version grammar.
+          semver='^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?$'
+          if ! [[ "$tag" =~ $semver ]]; then
+            echo "::error::the release needs a version tag like v0.1.0 or v0.2.0-rc.1, and got '$tag'. This run was dispatched on ref '$REF_NAME' (ref type: $REF_TYPE). Pick the tag in the Ref dropdown, or fill in the 'tag' input."
+            exit 1
+          fi
+          # A hyphen after the core is a pre-release. It is published as one, so it is never
+          # "the latest release" and never what the updater's stable URL serves.
+          if [[ "$tag" == *-* ]]; then prerelease=true; else prerelease=false; fi
+          echo "releasing tag: $tag (pre-release: $prerelease)"
+          {
+            echo "tag=$tag"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check out
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ steps.tag.outputs.tag }}
-          # The whole history and every tag: the tag's own commit is checked below, and the
-          # release is attached to that commit.
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          # The whole history and every tag: the tag's commit is checked against the default
+          # branch below.
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Resolve the commit the tag points at
         id: commit
-        shell: pwsh
+        shell: bash
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # The tag must exist, and the checkout must be sitting on the commit it names — a
+          # release built from anything else would not be the release of that tag.
+          tag_commit="$(git rev-parse "refs/tags/${TAG}^{commit}")" || {
+            echo "::error::the tag '$TAG' does not exist in the repository"
+            exit 1
+          }
+          head="$(git rev-parse HEAD)"
+          if [ "$tag_commit" != "$head" ]; then
+            echo "::error::the tag '$TAG' points at $tag_commit but the checkout is at $head"
+            exit 1
+          fi
+          # A release is cut from the default branch's history. A tag pushed from an unreviewed
+          # branch would otherwise be built, signed with the release key and published.
+          # (`fetch-depth: 0` above already fetched every branch head.)
+          if ! git merge-base --is-ancestor "$head" "origin/$DEFAULT_BRANCH"; then
+            echo "::error::the tag '$TAG' ($head) is not on '$DEFAULT_BRANCH'. Merge the commit first, then tag it."
+            exit 1
+          fi
+          echo "tag $TAG -> $head (on $DEFAULT_BRANCH)"
+          echo "sha=$head" >> "$GITHUB_OUTPUT"
+
+      - name: Check the version in every place it is written
+        id: version
+        shell: bash
         env:
           TAG: ${{ steps.tag.outputs.tag }}
         run: |
-          # A native command that fails must not stop the script: the failures below are
-          # expected (a tag that is not there yet) and are reported by hand, with a
-          # message of our own.
-          $ErrorActionPreference = 'Continue'
-          # The tag must exist, and the checkout must be sitting on the commit it names —
-          # a release built from anything else would not be the release of that tag.
-          $tagCommit = git rev-parse "refs/tags/$env:TAG^{commit}" 2>$null
-          if ($LASTEXITCODE -ne 0) { throw "the tag '$env:TAG' does not exist in the repository" }
-          $tagCommit = $tagCommit.Trim()
-          $head = (git rev-parse HEAD).Trim()
-          if ($tagCommit -ne $head) {
-            throw "the tag '$env:TAG' points at $tagCommit but the checkout is at $head"
-          }
-          Write-Host "tag $env:TAG -> $head"
-          "sha=$head" >> $env:GITHUB_OUTPUT
+          set -euo pipefail
+          # The tag, Cargo.toml (workspace and desktop shell), package.json, package-lock.json,
+          # tauri.conf.json and the CHANGELOG section must all name one version. `-I`: Python
+          # in isolated mode, so nothing in the working directory can shadow the standard library.
+          python3 -I scripts/check-release-version.py --tag "$TAG" | tee version.txt
+          echo "version=$(sed -n 's/^version=//p' version.txt)" >> "$GITHUB_OUTPUT"
+
+      - name: Require a passing CI run on this commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ steps.commit.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # `push` and `workflow_dispatch` runs test exactly the commit they ran on. A
+          # `pull_request` run tests the merge of the pull request into its base and so says
+          # nothing about this commit, and is not counted.
+          # shellcheck disable=SC2016  # `$ENV` is jq's, not the shell's
+          query='[.workflow_runs[] | select((.event == "push" or .event == "workflow_dispatch") and .head_sha == $ENV.SHA)]
+                 | [ (map(select(.conclusion == "success")) | length),
+                     (map(select(.status != "completed")) | length) ] | @tsv'
+          deadline=$((SECONDS + 1800))
+          while :; do
+            read -r passed pending < <(gh api "repos/${GH_REPO}/actions/workflows/ci.yml/runs?head_sha=${SHA}&per_page=100" --jq "$query")
+            if [ "$passed" -gt 0 ]; then
+              echo "CI passed on $SHA"
+              exit 0
+            fi
+            if [ "$pending" -gt 0 ] && [ "$SECONDS" -lt "$deadline" ]; then
+              echo "CI is still running on $SHA; waiting"
+              sleep 30
+              continue
+            fi
+            if [ "$pending" -gt 0 ]; then
+              echo "::error::CI is still running on $SHA after 30 minutes. Re-run this workflow when it has finished."
+            else
+              echo "::error::there is no successful CI run on $SHA. Merge the commit to the default branch and let CI pass (or run CI by hand on the tag with workflow_dispatch), then re-run this workflow."
+            fi
+            exit 1
+          done
+
+  build:
+    name: Build the installer (unsigned, no secrets)
+    needs: gate
+    runs-on: windows-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      installer: ${{ steps.installer.outputs.name }}
+      sha256: ${{ steps.installer.outputs.sha256 }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The commit the gate checked, not the tag name: a tag can be moved between jobs, a
+          # commit cannot.
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
 
       - name: Set up the Rust toolchain
         uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable (branch head)
@@ -183,7 +333,9 @@ jobs:
 
       - name: Fetch the ffmpeg sidecars
         # Pinned and checksum-verified (sidecars.toml); bundling refuses to run without them.
-        run: cargo xtask sidecars fetch --target x86_64-pc-windows-msvc
+        # `--locked` is a cargo flag and goes before the `xtask` alias.
+        shell: bash
+        run: cargo --locked xtask sidecars fetch --target x86_64-pc-windows-msvc
 
       - name: Install the frontend dependencies
         working-directory: apps/desktop
@@ -197,36 +349,19 @@ jobs:
         working-directory: apps/desktop
         run: npm run build
 
-      - name: Check the signing key is configured
-        # The updater's artifact is signed during the build, and the CLI cannot sign
-        # without the private key. This step says so in words, instead of leaving the
-        # build to fail with a base64 error.
-        shell: pwsh
-        env:
-          SIGNING_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        run: |
-          if ([string]::IsNullOrWhiteSpace($env:SIGNING_KEY)) {
-            throw ("this release needs the updater's signing key: set the repository secret " +
-              "TAURI_SIGNING_PRIVATE_KEY (the base64 private minisign key) and " +
-              "TAURI_SIGNING_PRIVATE_KEY_PASSWORD. The public half of that key pair is the " +
-              "one pinned in plugins.updater.pubkey in tauri.conf.json.")
-          }
-          Write-Host "the signing key is configured"
-
       - name: Build the NSIS installer
-        # The CLI is called directly, not through `npm run tauri --`: PowerShell strips the
-        # `--` and the flags are lost (docs/packaging.md §3). The `nsis` target comes from
-        # tauri.windows.conf.json.
+        # `--no-sign`: this job has no signing key, on purpose. It runs every build script and
+        # every dependency, so a key in its environment would be readable by all of them; the
+        # `sign` job signs the finished installer instead. With the flag the bundler skips the
+        # updater signature and still writes `replayed_<version>_x64-setup.exe`.
         #
-        # `bundle.createUpdaterArtifacts` is on, so this build also produces the updater's
-        # own artifact — the installer, zipped — and signs it with the key below. The
-        # signature is checked against `plugins.updater.pubkey`, so a key that does not
-        # match the pinned one fails here.
+        # `shell: bash`, because PowerShell strips the `--` that separates the CLI's flags
+        # from cargo's (docs/packaging.md §3): everything after the second `--` is passed to
+        # `cargo build`, which is how `--locked` reaches it. The `nsis` target comes from
+        # tauri.windows.conf.json.
+        shell: bash
         working-directory: apps/desktop
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: .\node_modules\.bin\tauri build --target x86_64-pc-windows-msvc
+        run: npm run tauri -- build --target x86_64-pc-windows-msvc --no-sign -- --locked
 
       - name: Check the installer exists and carries the sidecars
         # The check CI runs, before anything is published: the NSIS archive is listed with
@@ -235,8 +370,9 @@ jobs:
         shell: pwsh
         run: |
           $dir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
-          $exe = Get-ChildItem -Path $dir -Filter '*-setup.exe' | Select-Object -First 1
-          if (-not $exe) { throw "no NSIS installer was produced in $dir" }
+          $found = @(Get-ChildItem -Path $dir -Filter 'replayed_*_x64-setup.exe')
+          if ($found.Count -ne 1) { throw "expected exactly one NSIS installer in $dir, found $($found.Count)" }
+          $exe = $found[0]
           Write-Host "installer: $($exe.FullName) ($($exe.Length) bytes)"
           $listing = & 7z l $exe.FullName | Out-String
           foreach ($name in 'ffmpeg.exe', 'ffprobe.exe', 'replayed.exe') {
@@ -245,287 +381,287 @@ jobs:
               throw "the installer does not contain $name"
             }
           }
+          $hash = (Get-FileHash -Algorithm SHA256 -Path $exe.FullName).Hash.ToLowerInvariant()
+          Write-Host "sha256: $hash"
           "path=$($exe.FullName)" >> $env:GITHUB_OUTPUT
           "name=$($exe.Name)" >> $env:GITHUB_OUTPUT
-
-      - name: Stage the release assets
-        id: assets
-        shell: pwsh
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-          INSTALLER: ${{ steps.installer.outputs.name }}
-          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
-        run: |
-          # The version the bundle was built from is the one in tauri.conf.json, and the
-          # tag has to agree with it: a `v0.2.0` release carrying a 0.1.0 installer is
-          # exactly the mistake a release pipeline exists to stop.
-          $version = (Get-Content "apps/desktop/src-tauri/tauri.conf.json" -Raw | ConvertFrom-Json).version
-          $tagVersion = [regex]::Match($env:TAG, '^v(?<core>\d+\.\d+\.\d+)').Groups['core'].Value
-          if ($tagVersion -ne $version) {
-            throw ("the tag $env:TAG says version $tagVersion but the build is version " +
-              "$version. Bump the version in Cargo.toml, package.json and tauri.conf.json, " +
-              "or tag the version that was built.")
-          }
-          if ($env:INSTALLER -notmatch ('_' + [regex]::Escape($version) + '_')) {
-            throw "the installer $($env:INSTALLER) does not carry the version $version"
-          }
-          Write-Host "version: $version"
-
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Copy-Item $env:INSTALLER_PATH -Destination "release/$env:INSTALLER"
-          Write-Host "staged: release/$env:INSTALLER"
-          "version=$version" >> $env:GITHUB_OUTPUT
-
-      - name: Compute the installer's SHA-256
-        id: checksum
-        shell: pwsh
-        env:
-          INSTALLER: ${{ steps.installer.outputs.name }}
-        run: |
-          $path = "release/$env:INSTALLER"
-          $hash = (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
-          # `sha256sum -c` format: the hash, two spaces, the file name. No byte-order
-          # mark, or the first hash would not parse.
-          "$hash  $env:INSTALLER" | Set-Content -Path "release/SHA256SUMS" -Encoding utf8NoBOM
-          # Read the file back and hash it again: a checksum of a file that changed under
-          # us is worse than no checksum at all.
-          $again = (Get-FileHash -Algorithm SHA256 -Path $path).Hash.ToLowerInvariant()
-          if ($again -ne $hash) { throw "the installer changed while it was being hashed" }
-          Write-Host "sha256: $hash"
           "sha256=$hash" >> $env:GITHUB_OUTPUT
 
-      - name: Write the release notes
+      - name: Anti-cheat guard on the executable the installer ships
+        # The binary half of docs/anti-cheat.md. The source guard cannot see a dependency that
+        # calls `SendInput`; the import table of the executable that ships can, and so can the
+        # string scan for a name looked up at run time. The installer is unpacked with 7-Zip and
+        # the `replayed.exe` inside it is the file that is read: that is what a user runs, not
+        # merely what cargo produced. The sidecar `ffmpeg.exe` / `ffprobe.exe` are third-party
+        # binaries and are not checked here.
         shell: pwsh
         env:
-          TAG: ${{ steps.tag.outputs.tag }}
-          VERSION: ${{ steps.assets.outputs.version }}
-          COMMIT: ${{ steps.commit.outputs.sha }}
-          INSTALLER: ${{ steps.installer.outputs.name }}
-          SHA256: ${{ steps.checksum.outputs.sha256 }}
+          INSTALLER_PATH: ${{ steps.installer.outputs.path }}
         run: |
-          # The body of the release, with the facts a user needs before running an
-          # unsigned installer. Nothing here is a promise the build cannot keep.
-          $body = @'
-          # replayed __VERSION__ (__TAG__)
-
-          The Windows installer, built from commit `__COMMIT__` and published as the tag
-          `__TAG__`.
-
-          **`__INSTALLER__`** — the NSIS installer. Per-user install, no UAC prompt, into
-          `%LOCALAPPDATA%\replayed`.
-
-          **SHA-256**
-
-          ```
-          __SHA256__  __INSTALLER__
-          ```
-
-          The same value is attached as `SHA256SUMS`. Check the download before you run it:
-
-          ```powershell
-          Get-FileHash -Algorithm SHA256 .\__INSTALLER__
-          ```
-
-          or, with both files in one directory:
-
-          ```sh
-          sha256sum -c SHA256SUMS
-          ```
-
-          ## What this build is
-
-          - **Local only, no telemetry.** replayed records on this machine and writes clips
-            to your disk. There is no account, no sign-in, no telemetry, no crash reporting,
-            no analytics and no cloud upload. The network traffic it creates is to your own
-            machine, over loopback, with **one exception**: the update check you ask for in
-            Settings → Updates. That asks this project's own GitHub release page once, and
-            what it downloads is checked against the signing key this build was made with
-            before anything is installed.
-          - **It carries its own ffmpeg.** The installer embeds the pinned `ffmpeg` and
-            `ffprobe` pair, so no system ffmpeg is needed and nothing is installed
-            system-wide. They are **LGPL v3 or later** (BtbN's `win64-lgpl` build, without
-            the GPL-only encoders), and the licence and the LGPL source offer are installed
-            beside them.
-          - **Supported systems: Windows 10 1903+ or Windows 11, x86_64**, with a hardware
-            encoder (NVIDIA NVENC, Intel QuickSync or AMD AMF). The installer embeds the
-            WebView2 runtime, so installing it needs no network access.
-
-          ## Windows SmartScreen will say "unknown publisher" — this build is not code-signed
-
-          **replayed is not code-signed yet.** No code-signing certificate has been bought,
-          so Windows SmartScreen cannot vouch for the publisher and hides the installer
-          behind a warning. The warning is about the missing signature, not about the file
-          being malicious — but it is also why checking the SHA-256 above is worth doing
-          before you run it.
-
-          To install:
-
-          1. Download `__INSTALLER__` and, if you want to, check its SHA-256 against the
-             value above.
-          2. Run it. Windows shows "Windows protected your PC".
-          3. Click **More info**.
-          4. Click **Run anyway**.
-
-          Every build will show that warning until the project has a code-signing
-          certificate; the open question is recorded in `docs/packaging.md` §5.1 in the
-          repository.
-          '@
-          $body = $body.Replace('__VERSION__', $env:VERSION)
-          $body = $body.Replace('__TAG__', $env:TAG)
-          $body = $body.Replace('__COMMIT__', $env:COMMIT)
-          $body = $body.Replace('__INSTALLER__', $env:INSTALLER)
-          $body = $body.Replace('__SHA256__', $env:SHA256)
-          $body | Set-Content -Path "release/RELEASE_NOTES.md" -Encoding utf8NoBOM
-          Write-Host $body
-
-      - name: Stage the updater artifact and write the update manifest
-        # The manifest the installed application reads, and the one thing in this project
-        # that the updater depends on.
-        #
-        # Its shape is the one `tauri-plugin-updater` parses:
-        #
-        #   {
-        #     "version": "0.2.0",
-        #     "notes": "…what changed…",
-        #     "pub_date": "2026-10-20T10:00:00.000Z",
-        #     "platforms": {
-        #       "windows-x86_64-nsis": { "signature": "…", "url": "…" },
-        #       "windows-x86_64":      { "signature": "…", "url": "…" }
-        #     }
-        #   }
-        #
-        # The two platform keys are the same artifact under the two names the updater looks
-        # for: it tries `{os}-{arch}-{bundle type}` first — `windows-x86_64-nsis`, which is
-        # what the bundler writes into a released binary — and falls back to `{os}-{arch}`
-        # for a build that has no bundle type recorded, such as a development build.
-        #
-        # The signature is the content of the `.sig` file the CLI wrote next to the zip: the
-        # minisign signature of that exact zip, made with the release key. The application
-        # checks the bytes it downloads against it and the public key pinned in
-        # `tauri.conf.json`; a manifest that names a different artifact, or an artifact that
-        # was swapped, fails that check and nothing is installed.
-        id: updater
-        shell: pwsh
-        env:
-          TAG: ${{ steps.tag.outputs.tag }}
-          VERSION: ${{ steps.assets.outputs.version }}
-          REPO: ${{ github.repository }}
-        run: |
-          $dir = "apps/desktop/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis"
-          # The updater's artifact is the installer, zipped: `bundle.createUpdaterArtifacts`
-          # in tauri.conf.json makes `tauri build` write it beside the installer.
-          $artifact = Get-ChildItem -Path $dir -Filter '*.nsis.zip' | Select-Object -First 1
-          if (-not $artifact) { throw "no updater artifact was produced in $dir" }
-          $signature = Get-ChildItem -Path $dir -Filter '*.nsis.zip.sig' | Select-Object -First 1
-          if (-not $signature) {
-            throw ("the updater artifact was not signed: there is no .sig beside it in $dir. " +
-              "The release needs TAURI_SIGNING_PRIVATE_KEY.")
-          }
-          Write-Host "updater artifact: $($artifact.Name)"
-          Write-Host "signature:        $($signature.Name)"
-
-          Copy-Item $artifact.FullName -Destination "release/$($artifact.Name)"
-          Copy-Item $signature.FullName -Destination "release/$($signature.Name)"
-
-          # The signature, as the manifest carries it: the base64 blob, without a newline.
-          $sig = (Get-Content $signature.FullName -Raw).Trim()
-          if ([string]::IsNullOrWhiteSpace($sig)) { throw "the signature file is empty" }
-
-          # Where the artifact is published. GitHub serves a release asset from this path.
-          $url = "https://github.com/$env:REPO/releases/download/$env:TAG/$($artifact.Name)"
-
-          # The notes: this version's section of the changelog, which is what the update
-          # panel shows. A release with no changelog section is not a failed release, but it
-          # is worth saying out loud.
-          $changelog = Get-Content "CHANGELOG.md" -Raw
-          $pattern = "(?ms)^## \[$([regex]::Escape($env:VERSION))\][^\n]*\n(.*?)(?=^## \[|\z)"
-          $found = [regex]::Match($changelog, $pattern)
-          if ($found.Success) {
-            $notes = $found.Groups[1].Value.Trim()
-          } else {
-            $notes = ""
-            Write-Host "WARNING: CHANGELOG.md has no section for $env:VERSION"
+          $out = Join-Path $env:RUNNER_TEMP 'installer-contents'
+          if (Test-Path $out) { Remove-Item -Recurse -Force $out }
+          & 7z x -y "-o$out" $env:INSTALLER_PATH | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z could not unpack the installer" }
+          $exes = @(Get-ChildItem -Path $out -Recurse -Filter 'replayed.exe' -File)
+          if ($exes.Count -ne 1) { throw "expected one replayed.exe in the installer, found $($exes.Count)" }
+          & bash scripts/check-forbidden-apis.sh --binary $exes[0].FullName
+          if ($LASTEXITCODE -ne 0) {
+            throw "the executable the installer ships names a forbidden Windows API (docs/anti-cheat.md)"
           }
 
-          $platform = [ordered]@{
-            signature = $sig
-            url = $url
-          }
-          $manifest = [ordered]@{
-            version = $env:VERSION
-            notes = $notes
-            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fff") + "Z"
-            platforms = [ordered]@{
-              "windows-x86_64-nsis" = $platform
-              "windows-x86_64" = $platform
-            }
-          }
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content -Path "release/latest.json" -Encoding utf8NoBOM
-          Write-Host "release/latest.json:"
-          Get-Content "release/latest.json" -Raw | Write-Host
-
-          "artifact=$($artifact.Name)" >> $env:GITHUB_OUTPUT
-          "signature=$($signature.Name)" >> $env:GITHUB_OUTPUT
-
-      - name: Upload the release assets
-        # Before the release step, and unconditionally: a release that fails to publish
-        # still leaves the built installer here, on the Actions page, to be fetched by hand.
-        if: always()
+      - name: Keep the unsigned installer
+        # Before anything is signed or published, so a failure further down still leaves the
+        # built installer on the Actions page. Only the installer: nothing here is signed.
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets-${{ steps.tag.outputs.slug }}
-          path: release/
-          # The build may have failed before there was anything to upload; that is a
-          # failure of its own, already reported by the step that failed.
-          if-no-files-found: warn
+          name: installer-${{ needs.gate.outputs.tag }}
+          path: ${{ steps.installer.outputs.path }}
+          if-no-files-found: error
+          retention-days: 14
 
-      - name: Publish the GitHub release
-        shell: pwsh
+  sign:
+    name: Sign the installer (the only job with the key)
+    needs: [gate, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The signing key lives in this environment's scope. Add required reviewers to the
+    # `release` environment (Settings -> Environments) and every release waits here for one.
+    environment: release
+    permissions:
+      contents: read
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Set up Node
+        # No `cache:` — a cache is restored from other runs, including runs on pull requests, and
+        # this is the one job whose environment holds the key.
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Install the Tauri CLI
+        # From the lockfile, with no lifecycle scripts: the only thing that runs in this job
+        # while the key is present is the CLI's own binary.
+        working-directory: apps/desktop
+        run: npm ci --ignore-scripts
+
+      - name: Fetch the unsigned installer
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: installer-${{ needs.gate.outputs.tag }}
+          path: release
+
+      - name: Check it is the installer that was built
+        shell: bash
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ steps.tag.outputs.tag }}
-          VERSION: ${{ steps.assets.outputs.version }}
-          INSTALLER: ${{ steps.installer.outputs.name }}
-          UPDATER_ARTIFACT: ${{ steps.updater.outputs.artifact }}
-          UPDATER_SIGNATURE: ${{ steps.updater.outputs.signature }}
+          INSTALLER: ${{ needs.build.outputs.installer }}
+          EXPECTED_SHA256: ${{ needs.build.outputs.sha256 }}
         run: |
-          # `gh release view` is expected to fail when there is no release for the tag
-          # yet, so a failing native command must not stop the script: the exit code is
-          # read by hand below.
-          $ErrorActionPreference = 'Continue'
-          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
-            throw "the GitHub CLI is not on this runner"
-          }
-          # The updater's own assets go up with the rest: the application downloads the zip
-          # and checks it against the signature, and `latest.json` is the manifest that
-          # names both. `latest.json` is what the stable
-          # `releases/latest/download/latest.json` path serves.
-          $assets = @(
-            "release/$env:INSTALLER",
-            "release/SHA256SUMS",
-            "release/$env:UPDATER_ARTIFACT",
-            "release/$env:UPDATER_SIGNATURE",
-            "release/latest.json"
-          )
-          $title = "replayed $env:VERSION ($env:TAG)"
-          $notes = "release/RELEASE_NOTES.md"
+          set -euo pipefail
+          actual="$(sha256sum "release/$INSTALLER" | cut -d' ' -f1)"
+          if [ "$actual" != "$EXPECTED_SHA256" ]; then
+            echo "::error::release/$INSTALLER is $actual but the build job produced $EXPECTED_SHA256"
+            exit 1
+          fi
+          echo "$actual  $INSTALLER"
 
-          # A re-cut replaces the assets and the notes of the release that is already
-          # there, rather than failing on it: that is what the manual trigger is for.
-          gh release view $env:TAG --json tagName 2>$null | Out-Null
-          if ($LASTEXITCODE -eq 0) {
-            Write-Host "the release $env:TAG already exists; replacing its assets and notes"
-            gh release upload $env:TAG @assets --clobber
-            if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }
-            gh release edit $env:TAG --title $title --notes-file $notes
-            if ($LASTEXITCODE -ne 0) { throw "gh release edit failed" }
+      - name: Sign the installer
+        # The only step that reads either secret. `tauri signer sign` writes `<installer>.sig`.
+        # `--app-version` puts the version into the signed trusted comment, which the app
+        # requires (`requireSignedVersion` in tauri.conf.json).
+        shell: bash
+        working-directory: apps/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          INSTALLER: ${{ needs.build.outputs.installer }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -z "${TAURI_SIGNING_PRIVATE_KEY:-}" ]; then
+            echo "::error::this release needs the updater's signing key: set the repository (or release environment) secret TAURI_SIGNING_PRIVATE_KEY (the base64 private minisign key) and TAURI_SIGNING_PRIVATE_KEY_PASSWORD. The public half of that key pair is the one pinned in plugins.updater.pubkey in tauri.conf.json."
+            exit 1
+          fi
+          ./node_modules/.bin/tauri signer sign --app-version "$VERSION" "../../release/$INSTALLER"
+
+      - name: Verify the signature against the key pinned in the app
+        # No secret in this step. The signer warns and carries on when the key is not the pinned
+        # one; this does not. It also requires the signature to name this file and this version.
+        shell: bash
+        env:
+          INSTALLER: ${{ needs.build.outputs.installer }}
+          VERSION: ${{ needs.gate.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 -I scripts/verify-updater-signature.py \
+            --conf apps/desktop/src-tauri/tauri.conf.json --version "$VERSION" "release/$INSTALLER"
+
+      - name: Keep the signature
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signature-${{ needs.gate.outputs.tag }}
+          path: release/${{ needs.build.outputs.installer }}.sig
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish (draft, verify, release)
+    needs: [gate, build, sign]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      # Creates the release. This job has no signing key.
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.gate.outputs.tag }}
+      VERSION: ${{ needs.gate.outputs.version }}
+      SHA: ${{ needs.gate.outputs.sha }}
+      PRERELEASE: ${{ needs.gate.outputs.prerelease }}
+      INSTALLER: ${{ needs.build.outputs.installer }}
+      INSTALLER_SHA256: ${{ needs.build.outputs.sha256 }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Fetch the installer and its signature
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: '*-${{ needs.gate.outputs.tag }}'
+          path: release
+          merge-multiple: true
+
+      - name: Check what was built is what is being published
+        shell: bash
+        run: |
+          set -euo pipefail
+          actual="$(sha256sum "release/$INSTALLER" | cut -d' ' -f1)"
+          if [ "$actual" != "$INSTALLER_SHA256" ]; then
+            echo "::error::release/$INSTALLER is $actual but the build job produced $INSTALLER_SHA256"
+            exit 1
+          fi
+          ls -l release
+
+      - name: Verify the signature again
+        # The `sign` job checked it; this checks the bytes this job is about to upload, and it
+        # does so with no secret and before any release exists.
+        shell: bash
+        run: |
+          python3 -I scripts/verify-updater-signature.py \
+            --conf apps/desktop/src-tauri/tauri.conf.json --version "$VERSION" "release/$INSTALLER"
+
+      - name: Write the checksum, the update manifest and the release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `sha256sum -c` format: the hash, two spaces, the file name.
+          printf '%s  %s\n' "$INSTALLER_SHA256" "$INSTALLER" > release/SHA256SUMS
+          (cd release && sha256sum -c SHA256SUMS)
+
+          python3 -I scripts/make-update-manifest.py \
+            --version "$VERSION" --tag "$TAG" --repo "$GH_REPO" \
+            --installer "$INSTALLER" --sig "release/$INSTALLER.sig" \
+            --changelog CHANGELOG.md --out release/latest.json
+          cat release/latest.json
+
+          # The notes: a template with placeholders, filled in here. A placeholder left behind
+          # is a bug in the template and fails the release instead of reaching a user.
+          python3 -I - <<'PY'
+          import os, re
+          text = open(".github/release-notes.template.md", encoding="utf-8").read()
+          notice = ""
+          if os.environ["PRERELEASE"] == "true":
+              notice = ("> **Pre-release.** This is a candidate build. It is not the latest release and the\n"
+                        "> in-app updater will not offer it.\n\n")
+          values = {
+              "VERSION": os.environ["VERSION"], "TAG": os.environ["TAG"], "COMMIT": os.environ["SHA"],
+              "INSTALLER": os.environ["INSTALLER"], "SHA256": os.environ["INSTALLER_SHA256"],
+              "PRERELEASE_NOTICE": notice,
           }
-          else {
-            # `--verify-tag`: the tag must already exist in the remote repository, so a
-            # typo cannot publish a release under a tag nobody pushed. The release's
-            # target is that tag, whose commit is the one this job built.
-            gh release create $env:TAG @assets --title $title --notes-file $notes --verify-tag
-            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
-          }
-          gh release view $env:TAG --json url --jq .url
+          for key, value in values.items():
+              text = text.replace("__%s__" % key, value)
+          left = re.findall(r"__[A-Z0-9_]+__", text)
+          if left:
+              raise SystemExit("release notes template has unfilled placeholders: %s" % sorted(set(left)))
+          open("release/RELEASE_NOTES.md", "w", encoding="utf-8", newline="\n").write(text)
+          PY
+
+      - name: Create the draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A release that is already PUBLISHED is never replaced in place: installed copies may
+          # have updated from it, and swapping the bytes under them is exactly what the signature
+          # is there to prevent. A stale DRAFT (an earlier run that failed after creating it) is
+          # this pipeline's own leftover and is replaced.
+          if state="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            if [ "$state" = "true" ]; then
+              echo "a draft release for $TAG is left over from an earlier run; deleting it"
+              gh release delete "$TAG" --yes
+            else
+              echo "::error::the release $TAG is already published. Published releases are not replaced in place; delete it by hand (and think about who has updated from it) to re-cut."
+              exit 1
+            fi
+          fi
+
+          flags=(--draft --verify-tag --title "replayed $VERSION ($TAG)" --notes-file release/RELEASE_NOTES.md)
+          if [ "$PRERELEASE" = "true" ]; then flags+=(--prerelease); fi
+          # `--verify-tag`: the tag must already exist in the remote repository, so a typo cannot
+          # publish a release under a tag nobody pushed.
+          gh release create "$TAG" \
+            "release/$INSTALLER" "release/$INSTALLER.sig" release/SHA256SUMS release/latest.json \
+            "${flags[@]}"
+
+      - name: Verify what GitHub stored
+        # The draft's assets are downloaded again, and the installer's hash and the signature
+        # are checked on those bytes: an upload that was truncated or altered fails here, while
+        # the release is still a draft that nobody can see.
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf stored && mkdir stored
+          gh release download "$TAG" --dir stored
+          want="$(printf '%s\n' "$INSTALLER" "$INSTALLER.sig" SHA256SUMS latest.json | sort)"
+          have="$(cd stored && printf '%s\n' * | sort)"
+          if [ "$want" != "$have" ]; then
+            echo "::error::the draft holds the wrong assets. Expected:"
+            echo "$want"
+            echo "found:"
+            echo "$have"
+            exit 1
+          fi
+          (cd stored && sha256sum -c SHA256SUMS)
+          for f in "$INSTALLER" "$INSTALLER.sig" SHA256SUMS latest.json; do
+            cmp "stored/$f" "release/$f"
+          done
+          python3 -I scripts/verify-updater-signature.py \
+            --conf apps/desktop/src-tauri/tauri.conf.json --version "$VERSION" "stored/$INSTALLER"
+          # The manifest has to name the installer this release carries, with its signature.
+          python3 -I - <<'PY'
+          import json, os
+          m = json.load(open("stored/latest.json", encoding="utf-8"))
+          sig = open("stored/%s.sig" % os.environ["INSTALLER"], encoding="utf-8").read().strip()
+          url = "https://github.com/%s/releases/download/%s/%s" % (
+              os.environ["GH_REPO"], os.environ["TAG"], os.environ["INSTALLER"])
+          assert m["version"] == os.environ["VERSION"], m["version"]
+          for key in ("windows-x86_64-nsis", "windows-x86_64"):
+              p = m["platforms"][key]
+              assert p["url"] == url, p["url"]
+              assert p["signature"] == sig, key
+          print("latest.json names", url)
+          PY
+
+      - name: Publish the release
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release edit "$TAG" --draft=false
+          gh release view "$TAG" --json url,isDraft,isPrerelease --jq '"\(.url)  draft=\(.isDraft)  prerelease=\(.isPrerelease)"'

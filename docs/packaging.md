@@ -8,8 +8,9 @@ and refused to start on a machine without a system ffmpeg — defeating the enti
 pipeline.
 
 What is still **not** true is more important than what is, and §5 lists it in full: the
-artifacts are **unsigned**, the **icon is a placeholder**, there is **no auto-update**, and
-the Windows installer has been **installed and uninstalled on the test machine but never on
+artifacts are **unsigned** (no Authenticode certificate), the **icon is a placeholder**, the
+updater and the release pipeline (§5.10) exist but **no release has ever been cut with them**,
+and the Windows installer has been **installed and uninstalled on the test machine but never on
 a user's machine** (§3.5). Read §5 before repeating anything in §1 as a
 release claim.
 
@@ -23,7 +24,7 @@ This document is written the same way as
 
 | Target | Config | Artifact | Built in this repository? |
 |---|---|---|---|
-| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `better-outplayed_0.1.0_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5) |
+| Windows | `bundle.targets: ["nsis"]` (`src-tauri/tauri.windows.conf.json`) | `replayed_<version>_x64-setup.exe` | **Yes** — built, installed, run, uninstalled and reinstalled on the Windows test machine on 2026-09-26 (§3.5; that build was still named `better-outplayed_0.1.0_x64-setup.exe`, before the rename in §3.3) |
 | macOS | `bundle.targets: ["app"]` (`src-tauri/tauri.macos.conf.json`) | `replayed.app` | **Yes**, on this development host (§4) |
 | macOS | (not enabled) `.dmg` | `replayed_0.2.0_aarch64.dmg` | **No** — `hdiutil` is refused in this environment (§4.3) |
 | Linux | — | — | No target: the capture path is Windows-only (spec §2) |
@@ -35,7 +36,7 @@ rest of the repository rather than invented here:
 |---|---|---|
 | `productName` | `replayed` | the product's own name, and what the installer shows; §3.3 records when it changed and why the install directory follows it |
 | `mainBinaryName` | `replayed` | without it the installed executable would be `replayed-desktop`, the Cargo package name |
-| `version` | `0.2.0` | `[workspace.package] version` in the root `Cargo.toml`, and `package.json` |
+| `version` | `0.2.1` | written in six places that `scripts/check-release-version.py` keeps in step (§5.10) |
 | `identifier` | `io.github.fisifla.replayed` | reverse-DNS of the project's owner (`github.com/FisiFla`, the maintainer's address in the git history). Fixed now on purpose: it is the Windows uninstall key and the macOS bundle id |
 | `publisher` | `FisiFla` | the copyright holder in `LICENSE-MIT` and the GitHub account that owns the repository |
 | `copyright` | `Copyright (c) 2026 FisiFla` | verbatim from `LICENSE-MIT` |
@@ -161,8 +162,8 @@ produced from macOS**, because the installer cannot be built here — §3.5 reco
 that was built on the Windows test machine, and it is named as above):
 
 ```text
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\replayed_0.2.0_x64-setup.exe
-apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\replayed_0.2.0_x64_en-US.msi   # only with --bundles msi
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\nsis\replayed_0.2.1_x64-setup.exe
+apps\desktop\src-tauri\target\x86_64-pc-windows-msvc\release\bundle\msi\replayed_0.2.1_x64_en-US.msi   # only with --bundles msi
 ```
 
 **This is a compile-and-bundle step and nothing else. It does not launch the application.**
@@ -199,7 +200,8 @@ not from a run:
 - it registers no file associations and no URL protocols (none are configured, and the asset
   protocol is an internal Tauri scheme);
 - it installs no service, scheduled task or run-at-startup entry (Tauri's elevated update task
-  is not enabled — there is no updater to drive it);
+  is not enabled; the app writes its own per-user Run entry only if you turn on *Start with
+  Windows*, and the installer does not);
 - it does not check for a GPU or a hardware encoder. replayed fails loudly at *runtime* when
   the machine cannot encode (spec §3.2), which is deliberate;
 - it has no licence page (§1).
@@ -426,16 +428,16 @@ signing step. **The app was not launched to find out what Gatekeeper does with i
 |---|---|---|---|
 | 5.1 | **No code signing.** Neither the Windows installer nor the macOS app is signed with a code-signing certificate | Windows SmartScreen shows "unknown publisher" and hides the app behind *More info → Run anyway*; macOS Gatekeeper refuses the `.app` outright (§4.4) | a Windows Authenticode certificate for NSIS/MSI, an Apple Developer ID + notarisation for macOS (`bundle.macOS.signingIdentity`, `APPLE_CERTIFICATE`/`APPLE_ID` for notarisation)  §5.9 has the exact keys and variables, verified against the schema. **This is separate from the updater's own signature** (5.3), which is a minisign key the release pipeline holds: the updater verifies what it downloads, but a *manual* download of the installer is still unsigned until this row is closed |
 | 5.2 | **No notarisation**, macOS-only, and the same certificate work | an unsigned `.app` cannot be distributed at all, only run locally | the macOS signing flow in Tauri's documentation; needs a paid Apple Developer account  §5.9 has the credential names |
-| 5.3 | ~~**No auto-update mechanism.**~~ **Done 2026-10-20, with the caveat below.** Tauri v2's official updater plugin is installed and configured: `bundle.createUpdaterArtifacts` is on, the endpoint is pinned to this project's own `releases/latest/download/latest.json`, `requireSignedVersion` is on, and the artifact is checked against a minisign public key compiled into the build before anything is installed. The update check is **user-initiated only** — there is no startup check, no polling and no background task, so the updater is the one thing in the application that reaches another machine, and only when a person presses the button | a release is now a download rather than a manual hunt, and the artifact is verified against a key the pipeline's secrets hold and the application never carries. **What is not true yet: no update has ever been performed end to end** — no `latest.json` has ever been published, the updater has never run on Windows, and the plugin's own `check()` makes a real HTTPS GET with no seam to mock, so that path is verified by inspection only | the release workflow now stages the signed `.nsis.zip`, its `.sig` and the `latest.json`; what is left is to publish a release and exercise the update against it |
+| 5.3 | ~~**No auto-update mechanism.**~~ **Built 2026-10-20; never used end to end.** Tauri v2's updater plugin is installed and configured: `bundle.createUpdaterArtifacts` is on, the endpoint is pinned to this project's own `releases/latest/download/latest.json`, `requireSignedVersion` is on, and the artifact is checked against a minisign public key compiled into the build before anything is installed. The updater's artifact is **the NSIS installer itself** (`replayed_<version>_x64-setup.exe`) with a `.sig` beside it; Tauri 2 does not make the `.nsis.zip` of Tauri 1 unless `"v1Compatible"` is set, and an earlier version of the release workflow that looked for the zip could never publish. The check is **user-initiated only** (no startup check, no polling, no background task), and installing asks before it stops a running recording | a release is a download rather than a manual hunt, verified against a key the release pipeline's secrets hold and the application never carries. **Not true yet: no update has been performed end to end.** No `latest.json` has been published, the updater has never run on Windows, and the plugin's own `check()` makes a real HTTPS GET with no seam to mock, so that path is verified by inspection and by the signature script only | publish a release through §5.10 (a prerelease first, which is invisible to the updater) and install an update from it on a clean machine |
 | 5.4 | ~~**The installer may need the network.**~~ *Decided and set 2026-09-26:* `bundle.windows.webviewInstallMode` is now `offlineInstaller`, so the installer embeds the WebView2 runtime and the install touches no network at all. Resolved, and deliberately at the cost of size — the installer carries ~127 MB more on top of the ~201 MiB of ffmpeg sidecars, which principle 1 is worth | — | — |
 | 5.5 | **The icon is a placeholder** (§6) | it is a teal play triangle on near-black, generated at scaffold time; shipping it would look unfinished | real artwork, then `npm run tauri -- icon` |
 | 5.6 | **No uninstaller verification on Windows** — *done 2026-09-26, see §3.5.* Installed, run, uninstalled and reinstalled silently on the Windows test machine | the install lands where §3.3 said, both sidecars are inside it, the app launches and stays up, the uninstall removes the installation and the shortcut, and **the user's clips and index survive throughout** — the misleading checkbox errs in the safe direction, as §3.2 inferred | still open: an upgrade across *different* versions, and MSI |
-| 5.7 | ~~**No CI packaging job.**~~ **Done 2026-10-19.** A `package` job on `macos-latest` fetches the sidecars, builds the frontend, runs `tauri build --bundles app` and asserts the bundle actually carries the pinned ffmpeg sidecar; a `package-windows` job builds and inspects the NSIS installer. **Both now run on pushes to `main`, not only on pull requests.** A separate `.github/workflows/release.yml` turns a pushed `v*` tag into a published GitHub Release carrying the installer and a `SHA256SUMS` file, and the built installer is uploaded as a workflow artifact as well, so a failed publish still leaves it retrievable | bundling is exercised on every push, the bundle configuration — the identifier, `webviewInstallMode`, the resource mapping — is read by something rather than only by hand, and there is now a path from a tag to a download. The release body says plainly that the build is **not code-signed** (5.1) and gives the SmartScreen steps | — |
+| 5.7 | ~~**No CI packaging job.**~~ **Done 2026-10-19.** A `package` job on `macos-latest` fetches the sidecars, builds the frontend, runs `tauri build --bundles app` and asserts the bundle actually carries the pinned ffmpeg sidecar; a `package-windows` job builds and inspects the NSIS installer. **Both now run on pushes to `main`, not only on pull requests.** A separate `.github/workflows/release.yml` turns a pushed version tag into a published GitHub Release (§5.10: four jobs, signed installer, `.sig`, `SHA256SUMS`, `latest.json`), and the unsigned installer is also kept as a workflow artifact, so a failed publish still leaves what was built | bundling is exercised on every push, the bundle configuration — the identifier, `webviewInstallMode`, the resource mapping — is read by something rather than only by hand, and there is now a path from a tag to a download. The release body says plainly that the build is **not code-signed** (5.1) and gives the SmartScreen steps | — |
 | 5.8 | **The `.app` has never been launched** — *the installer half is done 2026-09-26*: built on Windows and run in a real session 1, where it stayed up for 30 seconds (§3.5) | the macOS half of this row remains a statement about the artifact as *files* | a login session on macOS, which is out of scope for a headless task (§7) |
 
 Not on this list, because it is done: the sidecars *are* bundled, and discovery *does* look
 where they land (§2, §4.1–4.2). The packaging jobs run on every push, and a pushed `v*` tag
-publishes a GitHub Release with the installer and its checksum (5.7).
+publishes a GitHub Release with the installer, its signature, its checksum and the update manifest (5.7, §5.10), though that path has not yet run for a real tag.
 
 ---
 
@@ -467,6 +469,80 @@ one-line change either way, it is not made here.
 
 The reference for all of it is [macOS Code
 Signing](https://v2.tauri.app/distribute/sign/macos/).
+
+---
+
+## 5.10 The release pipeline (`.github/workflows/release.yml`)
+
+**Read from the workflow and the scripts it calls; no release has been cut with it yet.** The
+workflow's own header comment is the long version. In short: pushing a version tag runs four
+jobs, and each holds only the authority it needs.
+
+| Job | Runs on | Holds | Does |
+|---|---|---|---|
+| `gate` | ubuntu | nothing; read-only (`actions: read` to read CI's run) | decides whether the tag may be released at all |
+| `build` | windows | **no secret** | builds the installer from the tagged commit, unsigned; runs `scripts/check-pe-imports.py` on the executable inside it (the anti-cheat binary guard) |
+| `sign` | ubuntu | `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`, in the `release` environment | signs the installer with the updater key and checks the signature against the key pinned in the app (`scripts/verify-updater-signature.py`); runs nothing but the Tauri CLI's signer |
+| `publish` | ubuntu | a write token (`contents: write`), no signing key | creates a **draft** release, downloads what GitHub stored, checks its SHA-256 and signature, then publishes it |
+
+**The gate** refuses unless, for the commit the tag names: the checkout is that commit and it
+is reachable from the default branch; every version agrees with the tag and `CHANGELOG.md` has
+its section (`scripts/check-release-version.py`); and the `CI` workflow has a successful `push` (or manual)
+run on that commit (it waits up to 30 minutes for one still running; a `pull_request` run does
+not count). The release does not re-run the tests; it refuses a commit they have not passed.
+
+**Where the signing secrets must live.** Only as two secrets used by the `sign` job, which runs
+in the **`release` environment**: add them as environment secrets of `release`, so no other job
+can read them. GitHub creates the environment
+on first use; add required reviewers to it to make every release wait for a person. The
+secrets never enter the repository. `tauri build` and `tauri signer sign` sign with whatever key
+they are given and only warn when it is not the pinned one, so the pipeline checks the signature
+itself, once before the draft exists and once on the bytes GitHub stored.
+
+**Tags.** `v1.2.3` is a release and `v1.2.3-rc.1` is a prerelease. A tag with a `-` is published
+with `--prerelease`, so it can never be GitHub's "latest" and so can never be what
+`releases/latest/download/latest.json` serves to installed copies. A prerelease is the safe way
+to rehearse this whole path. `workflow_dispatch` re-cuts a release: name the tag in the `tag`
+input. A stale **draft** of the tag is replaced; a release that is already **published** is
+never replaced in place (installed copies may have updated from it), so delete it by hand,
+deliberately, to re-cut.
+
+**Assets on the release:**
+
+| Asset | What it is |
+|---|---|
+| `replayed_<version>_x64-setup.exe` | the NSIS installer, which is also the updater's artifact |
+| `replayed_<version>_x64-setup.exe.sig` | the minisign signature, bound to this file name and version (`requireSignedVersion`) |
+| `SHA256SUMS` | the installer's SHA-256, in `sha256sum -c` format |
+| `latest.json` | the update manifest (`scripts/make-update-manifest.py`; platform keys `windows-x86_64-nsis` and `windows-x86_64`), served under the stable URL the app asks |
+
+The release body comes from `.github/release-notes.template.md`: the commit, the checksum, the
+SmartScreen warning (the build is **not** Authenticode-signed, §5.1), and the prerelease notice
+for a `-` tag.
+
+**Every cargo command in the workflow is `--locked`.** The two `Cargo.lock` files are what
+`cargo deny` audited; without `--locked`, cargo re-resolves a stale one and the release would be
+built from a dependency set nobody reviewed.
+
+**The version is written in six places** and `scripts/check-release-version.py` fails unless
+they agree with the tag: the workspace `Cargo.toml`, `apps/desktop/src-tauri/Cargo.toml`,
+`apps/desktop/package.json`, `apps/desktop/package-lock.json` (twice, the top-level field and
+`packages[""]`), `apps/desktop/src-tauri/tauri.conf.json`, and a `## [<version>]` section in
+`CHANGELOG.md`. A prerelease such as `0.3.0-rc.1` may use its release's `## [0.3.0]` section.
+Run it by hand before tagging: `python3 scripts/check-release-version.py --tag v0.3.0`.
+
+**Vendored crates.** The desktop shell builds against patched copies of `tao` and `muda` under
+`apps/desktop/src-tauri/vendor/`, so a Tauri upgrade that wants a different `tao` needs them
+re-vendored. The procedure is in
+[`apps/desktop/src-tauri/vendor/README.md`](../apps/desktop/src-tauri/vendor/README.md); the
+binary guard in the build job is what notices a patch that has stopped applying.
+
+**Not verified:** the whole path on a real tag, the `release` environment's reviewers, and an
+installed copy accepting the update. Two steps have never run: the build job's unpacking of the
+NSIS installer with 7-Zip (the binary guard reads the executable inside it), and anything that
+fetches `latest.json` back after publishing (the publish job checks what GitHub stored for the
+draft, not what the stable URL then serves). The workflows pin the compiler (`toolchain: 1.99.1`), but there is no
+`rust-toolchain.toml`, so a local build uses whatever Rust is installed.
 
 ---
 

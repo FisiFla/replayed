@@ -281,7 +281,7 @@
    * The encoder is spawned per recording, so a saved setting takes effect on the next
    * recording start. The panel says that rather than pretending the change is live.
    */
-  import { onMount } from 'svelte';
+  import { onMount, untrack } from 'svelte';
   import { activeSource, errorMessage } from '../ipc';
   import type { ClipSource, EncoderStatus } from '../ipc';
   import { formatBytes } from '../time';
@@ -292,9 +292,25 @@
      * injects. See `activeSource`.
      */
     source?: ClipSource;
+    /**
+     * Called after the settings were written, so the settings panel can read them again.
+     *
+     * Several of these keys (`fps`, `output_size`, the bitrate behind the quality preset) are
+     * also edited from the Capture group, which keeps its own copy: without this it would go on
+     * comparing its drafts against values this panel has since changed.
+     */
+    onSaved?: () => void;
+    /**
+     * The two keys the Capture group shares with this panel, as that group last read them.
+     *
+     * When Capture saves a new frame rate or size, this panel's picture of the file is stale; a
+     * change here moves the baseline (and the draft, if the user had not edited it) so the panel
+     * shows what the file says and only a real edit here is written back.
+     */
+    shared?: { fps: number; output_size: string } | null;
   }
 
-  let { source = activeSource() }: Props = $props();
+  let { source = activeSource(), onSaved = () => {}, shared = null }: Props = $props();
 
   /** The saved settings, as the backend read them back. */
   let saved = $state<EncoderSettings | null>(null);
@@ -323,13 +339,8 @@
   let preset = $state(DEFAULT_ENCODER_SETTINGS.preset);
   let audioBitrateText = $state(String(DEFAULT_ENCODER_SETTINGS.audio_bitrate_kbps));
 
-  $effect(() => {
-    if (saved === null) return;
-    vendor = saved.vendor;
-    codec = saved.codec;
-    bitrateText = String(saved.bitrate_kbps);
-    fps = saved.fps;
-    const size = saved.output_size;
+  /** Point the size picker at a saved output size: a listed one, or the custom box. */
+  function seedSize(size: string) {
     if (size === '') {
       sizeChoice = '';
       customSize = '';
@@ -340,11 +351,46 @@
       sizeChoice = 'custom';
       customSize = size;
     }
-    adaptFps = saved.adapt_fps;
-    zeroCopy = saved.zero_copy;
-    rateControl = saved.rate_control;
-    preset = saved.preset;
-    audioBitrateText = String(saved.audio_bitrate_kbps);
+  }
+
+  /**
+   * Reseed every draft from a fresh read.
+   *
+   * Called where a read lands, not from an effect on `saved`: `saved` is also moved by the
+   * shared-key sync below, and that must not throw away what the user has typed in the other
+   * fields.
+   */
+  function seed(from: EncoderSettings) {
+    vendor = from.vendor;
+    codec = from.codec;
+    bitrateText = String(from.bitrate_kbps);
+    fps = from.fps;
+    seedSize(from.output_size);
+    adaptFps = from.adapt_fps;
+    zeroCopy = from.zero_copy;
+    rateControl = from.rate_control;
+    preset = from.preset;
+    audioBitrateText = String(from.audio_bitrate_kbps);
+  }
+
+  // The Capture group saved a frame rate or size: take it as the new baseline, and show it
+  // unless the user has edited that field here, in which case the edit stays and is still sent.
+  $effect(() => {
+    const incoming = shared;
+    if (incoming === null) return;
+    untrack(() => {
+      if (saved === null) return;
+      const next = { ...saved };
+      if (incoming.fps !== saved.fps) {
+        if (fps === saved.fps) fps = incoming.fps;
+        next.fps = incoming.fps;
+      }
+      if (incoming.output_size !== saved.output_size) {
+        if (outputSize === saved.output_size) seedSize(incoming.output_size);
+        next.output_size = incoming.output_size;
+      }
+      saved = next;
+    });
   });
 
   const capabilities = $derived(status?.capabilities ?? null);
@@ -452,6 +498,7 @@
     ]);
     if (settings.status === 'fulfilled') {
       saved = isEncoderSettings(settings.value) ? settings.value : null;
+      if (saved !== null) seed(saved);
     }
     if (encoderStatus.status === 'fulfilled') {
       status = isEncoderStatus(encoderStatus.value) ? encoderStatus.value : null;
@@ -497,16 +544,48 @@
     }
   }
 
+  /**
+   * The drafts laid over a fresh read of the file, so that only what was edited here is written.
+   *
+   * `update_encoder_settings` takes the whole `[encode]` table, and this panel read it once, on
+   * mount. The Capture group writes `fps` and `output_size` into the same table, so sending the
+   * whole draft would put back the values this panel read minutes ago over whatever Capture saved
+   * since — and say "Encoder settings saved" while doing it. So the table is read again just
+   * before the write, and only the fields whose draft differs from what this panel last saw are
+   * laid over it: a key the user did not touch here keeps whatever the file says now.
+   *
+   * `everything` is for "Restore defaults", which means every field, touched or not.
+   */
+  async function wanted(everything: boolean): Promise<EncoderSettings> {
+    const mine = draft();
+    if (everything || saved === null) return mine;
+    const fresh = await source.encoderSettings();
+    if (!isEncoderSettings(fresh)) {
+      // Writing the drafts over a table that could not be read is exactly the overwrite this
+      // is here to prevent, so nothing is written.
+      throw new Error('The current encoder settings could not be read, so nothing was saved.');
+    }
+    const edited: Partial<EncoderSettings> = {};
+    for (const key of Object.keys(mine) as (keyof EncoderSettings)[]) {
+      if (mine[key] !== saved[key]) Object.assign(edited, { [key]: mine[key] });
+    }
+    return { ...fresh, ...edited };
+  }
+
   /** Save the drafts, and show the effective values the backend answers with. */
-  async function apply(): Promise<void> {
+  async function apply(everything = false): Promise<void> {
     if (!valid) return;
     busy = true;
     error = null;
     try {
-      const effective = await source.updateEncoderSettings(draft());
-      if (isEncoderSettings(effective)) saved = effective;
+      const effective = await source.updateEncoderSettings(await wanted(everything));
+      if (isEncoderSettings(effective)) {
+        saved = effective;
+        seed(effective);
+      }
       await refreshStatus();
       notice = 'Encoder settings saved. They apply on the next recording start.';
+      onSaved();
     } catch (err) {
       // The backend's refusal is the answer here: a bitrate it will not take, a codec the
       // chosen encoder does not have. It is shown, not swallowed.
@@ -531,7 +610,7 @@
     preset = defaults.preset;
     audioBitrateText = String(defaults.audio_bitrate_kbps);
     notice = null;
-    await apply();
+    await apply(true);
   }
 
   onMount(() => {

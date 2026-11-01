@@ -20,6 +20,12 @@ pub const LIVE_CLIENT_ADDR: SocketAddr =
 /// The one path this module asks for: the whole game snapshot in one response.
 pub const ALL_GAME_DATA_PATH: &str = "/liveclientdata/allgamedata";
 
+/// The small path a presence check asks for: mode, clock and map name, a couple of hundred
+/// bytes where `allgamedata` is several hundred kilobytes. Same service, same `GET`; it is only
+/// used by [`crate::process::LiveClientPresence`], which wants to know whether a game is being
+/// served and nothing else.
+pub const GAME_STATS_PATH: &str = "/liveclientdata/gamestats";
+
 /// The longest request path accepted, so a path can never grow a head past what
 /// [`crate::wire`] will read.
 pub const MAX_PATH_BYTES: usize = 512;
@@ -43,6 +49,16 @@ impl Endpoint {
         Self {
             addr: LIVE_CLIENT_ADDR,
             path: ALL_GAME_DATA_PATH.to_string(),
+        }
+    }
+
+    /// The real service's small `gamestats` document, for answering "is a game being played?"
+    /// without downloading the whole snapshot every few seconds. Built from constants, like
+    /// [`Self::live_client`].
+    pub fn game_stats() -> Self {
+        Self {
+            addr: LIVE_CLIENT_ADDR,
+            path: GAME_STATS_PATH.to_string(),
         }
     }
 

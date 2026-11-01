@@ -30,6 +30,24 @@ export function recordingState(status: RecordingStatus | null): RecordingState {
   return status.running ? 'recording' : 'idle';
 }
 
+/**
+ * The line that says why a recording that did not fail is not running, or that a running one is
+ * receiving no frames; `null` when there is nothing to say.
+ *
+ * Neither is an error. A closed game window ends the recording cleanly and keeps everything
+ * recorded, and a minimised window or an unchanging screen presents no frames for as long as it
+ * stays that way. The stall is shown only while running, from 5 s, so an ordinary pause between
+ * frames never reads as a frozen recording.
+ */
+export function describeRecorderNotice(status: RecordingStatus | null): string | null {
+  if (status === null || status.error !== null) return null;
+  if (!status.running && status.ended !== null) return `The recording ended: ${status.ended}`;
+  if (status.running && status.stalled_for_ms !== null && status.stalled_for_ms >= 5_000) {
+    return `No new frames for ${Math.floor(status.stalled_for_ms / 1000)} s (minimised or unchanging window).`;
+  }
+  return null;
+}
+
 /** The badge text for a state. */
 export function recordingLabel(status: RecordingStatus | null): string {
   switch (recordingState(status)) {

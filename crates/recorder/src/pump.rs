@@ -153,6 +153,17 @@ pub struct PumpCounts {
     /// Time spent inside the encoder's submit calls. Only video blocks in practice, on the bounded
     /// queue draining: this is backpressure (waiting for ffmpeg).
     pub submit: Duration,
+    /// The new frame geometry, when the capture backend reported that the captured thing changed size
+    /// during this pump ([`CaptureBackend::take_size_change`]).
+    ///
+    /// The pump does not rebuild the encoder: the encoder is borrowed here and owned by the caller,
+    /// who must finish the segment the old one is writing and start one declared for this size before
+    /// the next pump. What the pump does is refuse to feed the old encoder a frame of the new size:
+    /// the frame in hand when the change was reported is dropped (counted in
+    /// [`PumpCounts::skipped`], one frame at the pacer's rate), and the pacer is not advanced for
+    /// it, so the next pump takes the next frame at once. A caller that never reads this field is
+    /// not silently wrong: the next frame fails [`guard_frame_size`], naming both sizes.
+    pub resized: Option<(u32, u32)>,
 }
 
 impl PumpCounts {
@@ -167,6 +178,8 @@ impl PumpCounts {
             discard: self.discard + other.discard,
             pacer_sleep: self.pacer_sleep + other.pacer_sleep,
             submit: self.submit + other.submit,
+            // The newer report wins; a size is not additive.
+            resized: other.resized.or(self.resized),
         }
     }
 }
@@ -189,7 +202,10 @@ pub fn pump_once(
 ///    the held frames without the readback (a 33.2MB copy at 3840x2160).
 /// 2. When due, take a frame (`next_frame` waits at most [`FRAME_POLL`]), then commit the slot, so
 ///    a timed-out `next_frame` leaves the pacer still due rather than skipping a slot.
-/// 3. Submit it once [`guard_frame_size`] has checked it against the rawvideo pipe's size.
+/// 3. Ask the backend whether the captured thing changed size ([`CaptureBackend::take_size_change`]).
+///    If so the frame in hand is dropped and the new size is reported in [`PumpCounts::resized`] for
+///    the caller to rebuild the encoder; otherwise submit it once [`guard_frame_size`] has checked it
+///    against the rawvideo pipe's size.
 ///
 /// The not-due branch must wait (capped at [`FRAME_POLL`], never past the next slot):
 /// `discard_pending` never blocks, so without it the loop would spin at 100% CPU.
@@ -225,7 +241,15 @@ pub fn pump_once_counted_with_mic(
         let before = Instant::now();
         let frame = capture.next_frame(FRAME_POLL)?;
         counts.capture += before.elapsed();
-        if let Some(frame) = frame {
+        // The backend's contract: ask after *every* `next_frame`, whether or not it returned a frame,
+        // and before the frame is used. A frame returned after a `Some` is of the new geometry, and
+        // the encoder's rawvideo pipe is declared for the old one, so it must not reach it.
+        let resized = capture.take_size_change();
+        if let Some(size) = resized {
+            counts.resized = Some(size);
+            // One frame lost at a resize, accounted for as an offered frame the pump did not keep.
+            counts.skipped += u64::from(frame.is_some());
+        } else if let Some(frame) = frame {
             guard_frame_size(&frame, encoder.source_size())?;
             // Commit after the frame exists, so `is_due` stays a pure query.
             pacer.commit(Instant::now());
@@ -565,6 +589,60 @@ mod tests {
         }
     }
 
+    /// An encoder whose hardware thread has died: every submit says so.
+    struct DeadHardwareEncoder;
+
+    impl Encoder for DeadHardwareEncoder {
+        fn submit_video(&mut self, _frame: Frame) -> anyhow::Result<()> {
+            anyhow::bail!("the hardware encoder stopped: the MFT worker thread exited")
+        }
+        fn submit_audio(&mut self, _audio: AudioBuffer) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn active_encoder(&self) -> &'static str {
+            "dead"
+        }
+        fn source_size(&self) -> (u32, u32) {
+            (8, 8)
+        }
+        fn input_fps(&self) -> u32 {
+            1_000
+        }
+    }
+
+    /// A hardware encoder that stopped is a failure the pump reports, once, with the encoder's reason.
+    ///
+    /// The pump must not swallow it and carry on (a recording of nothing that looks healthy), and the
+    /// engine's loop ends on the first error it is handed (`Engine::stop_for`), so it cannot spin on it.
+    #[test]
+    fn a_hardware_encoder_that_stopped_fails_the_pump_with_its_reason() {
+        use replayed_capture::stub::{StubCapture, StubConfig};
+        let mut capture = StubCapture::new(StubConfig {
+            width: 8,
+            height: 8,
+            fps: 1_000,
+        });
+        capture.start().expect("start the stub capture");
+        let (mut pacer, _) = pacer(1_000);
+        let mut encoder = DeadHardwareEncoder;
+        let mut outcome = Ok(PumpCounts::default());
+        for _ in 0..200 {
+            outcome = pump_once_counted(&mut pacer, &mut capture, None, &mut encoder);
+            if outcome.is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let err = outcome.expect_err("the dead encoder's submit failure reaches the caller");
+        assert!(
+            format!("{err:#}").contains("the hardware encoder stopped"),
+            "the reason is the encoder's own: {err:#}"
+        );
+    }
+
     /// A real ffmpeg child at 8x8, in its own temp dir (the returned guard keeps it alive) so
     /// tests do not interfere through a shared scratch directory.
     fn tiny_encoder() -> (FfmpegEncoder, tempfile::TempDir) {
@@ -637,6 +715,7 @@ mod tests {
             discard,
             pacer_sleep,
             submit: spend,
+            resized: None,
         }
         .plus(PumpCounts {
             submitted: 5,
@@ -647,6 +726,7 @@ mod tests {
             discard: Duration::from_millis(1),
             pacer_sleep: Duration::from_millis(2),
             submit: spend,
+            resized: Some((4, 4)),
         });
         assert_eq!(
             (
@@ -670,6 +750,11 @@ mod tests {
                 spend * 2
             ),
             "every field accumulates, timings included"
+        );
+        assert_eq!(
+            summed.resized,
+            Some((4, 4)),
+            "a size report survives the sum"
         );
     }
 
@@ -712,6 +797,65 @@ mod tests {
             counts.mic_blocks, 1,
             "the block the microphone had due was handed over and counted"
         );
+    }
+
+    /// A resize is reported to the caller, and the frame of the new size never reaches the old encoder.
+    ///
+    /// The capture contract is "ask after every `next_frame`, before the frame is used". Without
+    /// the ask, the first frame of the new size fails [`guard_frame_size`] and ends the recording; with
+    /// it, the caller gets the new size, rebuilds the encoder, and the next frame is admitted.
+    #[test]
+    fn a_resize_is_reported_and_the_frame_in_hand_is_not_fed_to_the_old_encoder() {
+        use replayed_capture::stub::{StubCapture, StubConfig};
+        let mut capture = StubCapture::new(StubConfig {
+            width: 8,
+            height: 8,
+            fps: 1_000,
+        })
+        .resize_at_frame(2, (16, 12));
+        capture.start().expect("start the stub capture");
+        let mut encoder = CountingEncoder {
+            size: (8, 8),
+            fps: 1_000,
+            submitted: 0,
+        };
+        let (mut pacer, _) = pacer(1_000);
+
+        let mut total = PumpCounts::default();
+        for _ in 0..200 {
+            let counts = pump_once_counted(&mut pacer, &mut capture, None, &mut encoder)
+                .expect("a resize is not an error: the guard must not see the new frame");
+            total = total.plus(counts);
+            if counts.resized.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(total.resized, Some((16, 12)));
+        assert_eq!(
+            encoder.submitted, 2,
+            "the two frames of the old size were submitted and the new one was not"
+        );
+        assert!(
+            total.skipped >= 1,
+            "the dropped frame is an offered frame that was not kept: {total:?}"
+        );
+
+        // The caller rebuilt its encoder; the very next frame is of the new size and is admitted.
+        encoder.size = (16, 12);
+        let mut after = PumpCounts::default();
+        for _ in 0..200 {
+            after = after.plus(
+                pump_once_counted(&mut pacer, &mut capture, None, &mut encoder)
+                    .expect("frames of the new size are admitted by the rebuilt encoder"),
+            );
+            if after.submitted > 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(after.resized, None, "a change is reported once");
+        assert_eq!(encoder.submitted, 3);
     }
 
     /// A pacer plus an instant just after its schedule start; tests express times relative to it

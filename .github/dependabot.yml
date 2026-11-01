@@ -1,8 +1,24 @@
 version: 2
 updates:
+  # The two Cargo workspaces are ONE cargo entry with two directories, not two entries. The
+  # desktop shell is a separate workspace with its own `Cargo.lock`, but it depends on the
+  # crates under `crates/`, whose manifests are shared: a bump of `rusqlite` in
+  # `crates/store/Cargo.toml` has to land in both lockfiles or the shell's is stale. As two
+  # entries it arrived as two pull requests (#97 and #100 were exactly that), each updating
+  # one lock, and the tree between their merges did not match either lockfile. Grouped, one pull
+  # request carries the bump through both. CI now builds with `--locked`, so a lockfile that
+  # drifts anyway fails loudly instead of being quietly re-resolved.
+  #
+  # Major versions stay out of the group: each is a deliberate change reviewed on its own.
   - package-ecosystem: cargo
-    directory: /
+    directories:
+      - /
+      - /apps/desktop/src-tauri
     schedule: { interval: weekly }
+    groups:
+      rust-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
     # `windows` and `windows-core` are released as a pair and must move together: the crate
     # depends on an exact `windows-core` major, so bumping either alone puts two incompatible
     # copies in the tree (`struct Box is private`, `Interface` not satisfied). The 0.62 -> 0.100
@@ -12,14 +28,16 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: windows-core
         update-types: ["version-update:semver-major"]
-  - package-ecosystem: cargo
-    directory: /apps/desktop/src-tauri
-    schedule: { interval: weekly }
-    ignore:
-      - dependency-name: windows
-        update-types: ["version-update:semver-major"]
-      - dependency-name: windows-core
-        update-types: ["version-update:semver-major"]
+      # `tao` and `muda` are vendored and patched in `apps/desktop/src-tauri/vendor/` (wired in
+      # with `[patch.crates-io]` in that manifest) so the shipped binary does not import
+      # `SendInput`. A Dependabot bump would change the version in `Cargo.lock` underneath a
+      # patch written for the old one: cargo then either fails to apply the `[patch]` or, worse,
+      # resolves the registry copy and ships the import again. They move by hand, together with
+      # their patch, by the procedure in `apps/desktop/src-tauri/vendor/README.md`. Both only occur in the desktop
+      # shell's lockfile, so ignoring them in this shared entry does not hide anything from the
+      # root workspace.
+      - dependency-name: tao
+      - dependency-name: muda
   - package-ecosystem: npm
     directory: /apps/desktop
     schedule: { interval: weekly }

@@ -46,6 +46,12 @@ named, so every line below can be re-checked.
 > (`fps=56.9/60`, 8 dropped of 10,525) and **§15** for the core (3.1–4.0% of one core, on a path
 > that stops the captured frame crossing to the CPU at all).
 
+> **Update (2026-11-01).** A production-readiness pass followed 0.2.1: a code review of the whole
+> tree and the fixes it produced. §56 is its entry in this ledger: what the agents ran, on the
+> development host and on the Windows test machine, and which runs are **still pending** (the
+> full gate on the Windows machine, a local `tauri build`, the smoke test of the exit flush and
+> the update flow, the Intel QuickSync result). Nothing in it has been run against a real game.
+
 If that paragraph surprises you, it is doing its job. The rest of this file is the detail.
 
 **How to move an item out of *type-checked only*:** run `cargo xtask verify`
@@ -106,7 +112,7 @@ How to read it:
 * **It counts what the table cells say.** Where a later section (§10 onward) *moved* an item
   without anyone editing its row, the row still holds the old level, and so does the count. The
   Windows column is therefore still an under-claim for the recording engine, the storage policy
-  and the game-presence code (§10), and nothing from §11–§23 is in the 53.
+  and the game-presence code (§10), and nothing from §11–§23 (or §56) is in the 53.
 * **Unverified is no longer zero** because §8 (the desktop shell's background half) is now in
   scope; its four unverified rows are real: the keypress itself, the tray existing at all, recording
   while the window is hidden, and the registry write.
@@ -527,9 +533,14 @@ $ gh run view 35904179918 --log-failed
 - **No macOS/Linux capture backend.** `crates/capture/src/platform.rs` selects WGC/WASAPI
   on Windows and the synthetic `StubCapture` everywhere else. Off Windows the pipeline
   captures a generated image and *proves nothing* about real capture.
-- **The capture frame pool is never recreated on a display-mode change**
-  (`Direct3D11CaptureFramePool::Recreate` is not called); a mid-capture resolution or
-  refresh-rate change is unhandled beyond refusing a frame whose size diverged.
+- ~~**The capture frame pool is never recreated on a display-mode change**~~ **Handled since the
+  2026-11 pass (§56).** WGC detects a size change, builds a new pool and session at the new size (not
+  `Recreate`, which left a static window with no frame) and reports it through
+  `take_size_change`; the recorder follows it per recording mode. Window-level tests of resize,
+  close and minimise ran on the Windows machine in an interactive session (§56). **Not** run: a
+  real game being resized, and the encoder after a *lost graphics device* — a device rebuilt after a
+  driver reset is a new `ID3D11Device`, and an encoder bound to the old one fails, so that case still
+  ends the recording (a known gap).
 - **Encoder probing is a 1-frame smoke test, not a live capture.** `xtask probe` proves an
   encoder *opens* on this machine; it does not prove the live 4K path drives it.
 - **Highlights-vs-markers is a product policy, not a guarantee.** Kills/deaths/objectives/
@@ -588,7 +599,8 @@ $ gh run view 35904179918 --log-failed
   one implemented value (`"loopback"`, `"aac"`) and anything else is refused by
   `Config::validate`, which names what *is* implemented rather than recording something else.
   `bitrate_kbps` still reaches ffmpeg's `-b:a` — 192 kbps for a front-end that carries no value
-  (the desktop shell, which does not parse `[audio]`) — and is unused when `enabled = false`.
+  (written before the desktop shell read `[audio] bitrate_kbps`; it reads that key now and no
+  other key of `[audio]`) — and is unused when `enabled = false`.
   **It is measured**: §17 below carries the Windows test machine run — one `h264` stream, and no audio stream at
   all.
 
@@ -3691,6 +3703,13 @@ honest options are the maintainer's:
 
 Until one of those is chosen, the ledger says the criterion fails on this box, with the numbers
 and the context that explain why the same code once read 3.1–4.0%.
+
+> **Superseded (2026-11, §56).** §49 adopted a fitted envelope; the 2026-11 pass replaced it. The
+> harness now judges a flat **5% of one core**, but only when the display offered 15 frames/s or
+> fewer (a quiet screen). A busier screen is reported as *not performed* with the offered rate,
+> because a bound fitted to busy runs only describes those runs; the old envelope is still printed as
+> information. RSS is judged against 400 MB *at the harness's 16 MiB ring*, and the criterion text
+> says so.
 ## 49. #79 does not reproduce — with the fix or without it — and the desktop suite is green (2026-10-24)
 
 ### Issue #79: the probe now measures on the box, and the fix is not why
@@ -3730,7 +3749,8 @@ the autostart sync included (its fake `reg.exe` boundary is what makes it host-i
 §48 put three options to the owner rather than moving the target under a failing check. The answer
 was **make it frame-rate-aware**, and that is what `xtask verify` does now:
 
-- the verdict is `CPU <= 3.5% + 0.08% × offered frames/s` of one core;
+- *(Replaced in the 2026-11 pass: see the note under §48 and §56. The flat 5% on a quiet screen is
+  the criterion now.)* the verdict was `CPU <= 3.5% + 0.08% × offered frames/s` of one core;
 - the old fixed `5%` is still printed beside the verdict, so both numbers are visible;
 - with no frame data the old `5%` is the bound, so a run whose status lines did not parse still
   means something;
@@ -4027,3 +4047,209 @@ updated.
 suite passes with 0.7.10, the `lol_mock` TLS tests included. CI run 40309409646 on `76bd380`: all
 five jobs green, the dependency audit and the per-push secret scan among them.
 
+
+## 56. The production-readiness pass after 0.2.1: what was run, and what is still to run (2026-11-01)
+
+A review of the whole tree after 0.2.1 produced 201 findings, and parallel agents fixed them test
+first, each in its own worktree and each on its own domain; the work was then integrated. The
+`[Unreleased]` section of `CHANGELOG.md` lists what changed. This section says what was *run*, and
+it keeps the runs that have **not** happened visible as `PENDING(...)` markers, to be replaced with
+the real result and not with a guess.
+
+**"Winbox"** is the Windows test machine used for this pass (Windows 11, i7-13700K, an RTX 3090
+and an Intel UHD 770). Its runs were over SSH, so anything needing the interactive desktop went
+through a scheduled task in Session 1. The per-domain runs below used its default Rust, 1.98.1; the
+integrated gate further down pinned 1.99.1 (`RUSTUP_TOOLCHAIN`), the version the workflows pin. A
+count below is what the agent's own report gave; it is a count of tests that passed on that tree at that moment, not of anything a real game did.
+
+### Per-domain runs, by the agent that made them
+
+| Domain | Development host (macOS) | Winbox |
+|---|---|---|
+| Frontend | 405 tests, `check` and `build` passed; 421 tests after the second wave | not run (no Node there) |
+| Shell I/O (migration, reveal, background launch) | 316 tests, clippy and fmt clean | 311 tests |
+| Events (hotkey, GSI, presence, LoL) | passed | passed |
+| CLI and `xtask` | 825 passed, 1 known environmental failure | `xtask` and CLI suites passed |
+| Capture (WGC, WASAPI) | passed | 103 unit tests, and 4 WGC tests in Session 1 covering resize, close and minimise |
+| Shell core (webview permissions, window focus, updater preparation) | 311 + 6 tests, clippy clean | 303 + 6 tests |
+| Media and store | 245 crate tests; the workspace 843 passed, 1 environmental failure, with a temporary patch for the then-unmerged recorder and CLI | not run |
+| Recorder | passed | 146 + 13 tests |
+| CI and release workflows | 45 Python tests, 15 guard cases, `actionlint` and `cargo deny` clean | not run |
+| Encoder | passed | see the findings below |
+| Shell glue (migration repair, exit flush, `--background`) | store 139 tests, shell 345 + 6 | shell: 339 + 6 |
+| Vendored `tao` and `muda` | clippy prints 19 macOS-only warnings from the vendored `tao` (not errors) | see the import check below |
+
+The single known environmental failure on the development host is
+`ffmpeg::tests::a_shutdown_does_not_wait_for_a_child_that_will_not_exit`: a local program on that
+machine connects to new loopback ports.
+
+**After the encoder's changes were merged, before the recorder's:** the whole workspace passed
+(980 tests, 0 failed), the desktop shell 351 tests, the frontend 421, and `cargo deny`, the source
+guard and the Python tests were green.
+
+### The binary guard, on Winbox
+
+The binary guard first found `SendInput` in the desktop executable's import table, through
+`tao`'s `set_focus` and `muda`'s Copy/Paste menu items. After vendoring and patching both crates
+(and replacing `set_focus` with `window_focus.rs`), the import table of the **desktop executable
+(495 imports)** and of the **CLI (277 imports)** held no forbidden function. That was measured on the
+vendoring agent's build on Winbox, not on the final merged tree and not on an installer: it is
+re-run on the installer's executable in the release build below. The release workflow
+runs the same check on the executable inside the installer it builds.
+
+### Findings on Winbox that are not fixes
+
+- **Intel QuickSync on the UHD 770: decided.** The `0x80004005` first seen came from creating the
+  encoder in session 0 (an SSH login) and against the wrong adapter. Quick Sync's Media Foundation
+  encoder cannot be created in session 0 at all. Run in Session 1, the zero-copy encoder test
+  (`crates/encoder/tests/hardware_encoders.rs`) encoded **30 of 30 frames on NVENC and 30 of 30 on
+  Quick Sync**, once two bugs were fixed. First, the encoder is now taken from the capture GPU and the requested
+  vendor. Second, Quick Sync asks for three frames before it answers, and it returns `E_UNEXPECTED` after a format
+  change; both used to end the recording at its second frame. The ordinary path through ffmpeg's
+  `h264_qsv` also records. `vendor = "qsv"` while the captured display is on the NVIDIA card falls back to that
+  ffmpeg path; with `zero_copy = true` it refuses to start and names the GPU (`config.example.toml`,
+  `docs/USER-GUIDE.md`).
+- **A crash when a hardware encoder closed: root-caused and fixed.** The workspace test run on
+  Winbox crashed with an access violation in about one run in three. A vectored exception handler
+  traced it to NVIDIA's `nvEncMFTH264x.dll`. That encoder leaves an RTWorkQ work item pending after
+  its last release, and `IMFShutdown` reports `MFSHUTDOWN_COMPLETED` within a microsecond, so there
+  is nothing to wait on. `MftEncoder`'s `Drop` now ends streaming and shuts the transform down. It
+  then holds the last reference for 100 ms. A new test opens and closes an encoder 60 times in one
+  process
+  (`an_encoder_can_be_closed_and_reopened_many_times_in_one_process`). Before the fix it crashed
+  5 runs out of 5; after it, 0 of 10. The encoder suite crashed 4 of 15 serial runs and 7 of 15
+  parallel runs before; after, 0 of 15 and 0 of 10. Screen capture had a related crash when its
+  last session closed, fixed by keeping the COM apartment alive.
+- **A dropped hotkey listener kept its chord: fixed.** The opt-in real-capture self-test
+  (`REPLAYED_REAL_SOURCES=1 cargo test -p replayed-cli --test self_test_clip`) failed on Winbox
+  with "Ctrl+F8 ... Hot key is already registered" because the hotkey-path test before it, in
+  the same process, had dropped its listener. The listener thread never woke to let go. It now does, and dropping
+  it unregisters the chords (`a_dropped_listener_gives_its_chord_back_to_this_process`). That test failed before
+  the change and passes after it, and both self-tests now pass in one run. The desktop app
+  registers its chords once per process, so it was not affected.
+- **The Windows test run needs an ffmpeg with `libx264`.** Discovery puts a checkout's
+  `binaries/` ahead of `PATH`, and the pinned sidecar there (fetched for a release build) is an
+  LGPL build without `libx264`. With it present, the CLI's and the encoder's tests that encode
+  through `libx264` failed with "Unknown encoder 'libx264'". CI's Windows job has an empty `binaries/` and Chocolatey's full
+  ffmpeg on `PATH`; with `binaries/` emptied the same way, the Winbox run passed.
+- **A flaky log assertion in capture: fixed.** `the_source_is_announced_before_the_open_is_attempted`
+  failed 12 runs in 400 with the module's tests in parallel, and none alone or on one thread.
+  `tracing` caches a callsite's interest for the whole process, and a neighbouring test hit the
+  same callsite with no subscriber. The two log-asserting tests now record through one global,
+  always-interested subscriber that routes events by thread: 0 failures in 400.
+- **`av_origin` is not settled: open.** Its two tests compare the video track's length with the
+  audio track's. The video length comes out quantized in two-frame steps: 1.200 s, 1.133 s or
+  1.067 s for 1.2 s of picture, against 1.221 s of audio. Run alone on the development host, it
+  comes out at 1.200 s or 1.133 s, inside the 150 ms tolerance. In one full workspace run it was
+  1.067 s in both tests at once, which fails. No frame was dropped by the queue in any measured
+  run. The likely cause is in how the video is timed: ffmpeg stamps a frame with the wall clock
+  at the moment it *reads* it (`-use_wallclock_as_timestamps`). Its first read comes late, while
+  it is still opening its inputs, so the first frames are read in a burst and share a timestamp.
+  The video's zero is then that late read, not the first frame's capture time. If so, a real
+  recording would start with its picture ahead of its sound by ffmpeg's start-up delay, so this
+  is a possible A/V offset, not only a flaky test. It is not fixed. The fix changes how frames
+  are timed (passing ffmpeg real timestamps instead of read times), and that is a design decision.
+- **Three flaky tests were each seen failing once:** a hardware-encoder rate test
+  (`the_hardware_encoders_rate_is_measured_the_same_way_on_every_run`, a GPU warm-up);
+  `a_stale_event_driver...` (a loopback audio-port environment issue); and
+  `a_session_follows_the_capture_to_a_new_size...` in the recorder ("audio writer thread has stopped
+  (3 blocks)") under heavy load. The last has not been explained.
+- **`npm audit`:** two *low* advisories (`deepmerge` through `@sveltejs/vite-plugin-svelte`), build-time
+  only, with no fix available; with `--omit=dev` there are none. CI blocks at `moderate`, so it passes.
+
+### The integrated gate, on both hosts
+
+Both hosts ran the same tree, the integrated one with every fix above, with Rust 1.99.1. Every step
+exited 0.
+
+| Step | Development host (macOS) | Winbox (Session 1) |
+|---|---|---|
+| `cargo fmt --check` | passed | passed |
+| Frontend `check`, tests and `build` | 424 tests | passed (the count was not logged) |
+| Workspace clippy, `-D warnings`, with the test encoders | passed | passed |
+| Production clippy (no test features) | passed | passed |
+| Desktop shell clippy | — | passed |
+| Windows clippy, cross-compiled | passed | — |
+| `cargo test --workspace --features replayed-encoder/test-encoders,replayed-cli/test-encoders` | 1003 passed, 0 failed, 1 ignored | 1002 passed, 0 failed, 5 ignored |
+| WGC capture tests (`wgc_frame`, `--ignored`) | — | 4 passed |
+| Real-capture self-test (`REPLAYED_REAL_SOURCES=1`, `self_test_clip`) | — | 2 passed |
+| Desktop shell tests | 352 passed | 346 passed |
+| `cargo deny check` | passed | passed |
+| Forbidden-API source guard | passed | passed |
+| Python tests for the CI scripts | passed | passed |
+| `npm audit` (blocks at `moderate`) | passed, 2 low | passed, 2 low |
+
+After the microphone mix (`crates/media/tests/voice_mix.rs`, six tests), both hosts ran the workspace
+tests, fmt and clippy again on the final tree: 1009 passed on the development host and 1008 on
+Winbox, 0 failed on either.
+
+The Winbox test run includes the NVENC test through ffmpeg (`nvenc_encodes_real_frames_through_ffmpeg`).
+The zero-copy NVENC and Quick Sync runs are the Session 1 runs in the findings above. The ignored
+tests are the opt-in ones that need hardware or the real desktop, and the rows above run them.
+The binary guard on the built executable is in the release build below.
+
+### The release build, on Winbox
+
+A local build of the integrated tree followed `release.yml`'s steps, with nothing uploaded:
+`check-release-version.py --tag v0.2.1`, `xtask sidecars fetch`, `npm ci`, the frontend build and
+`tauri build --target x86_64-pc-windows-msvc --no-sign`. Every step exited 0. The bundle
+directory held exactly one file, `replayed_0.2.1_x64-setup.exe` (308,189,094 bytes), and it
+contains `replayed.exe`, `ffmpeg.exe` and `ffprobe.exe`. The binary guard on the `replayed.exe`
+inside the installer found **498 imports, none forbidden**. The installer was then signed with a
+throwaway key (the real key lives only in the release environment), and
+`verify-updater-signature.py` accepted the signature against that key. `SHA256SUMS` and
+`latest.json` (`make-update-manifest.py`) were written the way `release.yml` writes them.
+That makes four files, `replayed_0.2.1_x64-setup.exe`, its `.sig`, `SHA256SUMS` and
+`latest.json`: exactly the four that `gh release create` publishes.
+
+### The desktop smoke test, on Winbox
+
+The owner ran the `replayed.exe` from the installer above by hand on Winbox's desktop, with no
+game running. It used its own data folder and WebView2 profile, so the real install was not
+touched. The microphone was turned on in that folder's `config.toml`.
+
+- **Record, clip, trim: passed.** *Start recording*, then `Ctrl+F8` pressed on the keyboard,
+  saved clips through the hotkey listener changed above. Three presses 5 s apart made three
+  clips, each after its post-roll. A trim kept both audio tracks. *Quit* from the tray while
+  recording ended the replay buffer cleanly; a buffer writes nothing on its own, so nothing was
+  lost.
+- **The microphone was recorded but could not be heard: fixed.** Every clip carried a named
+  `Microphone` track. On the default communications device (a Scarlett Solo with nothing
+  plugged in) it was silent at -91 dB. On the device the owner picked (NVIDIA Broadcast) it
+  carried the voice at -25 dB mean and -4 dB peak. The app's player plays only the first audio
+  track, though, and the exports kept only the game audio, so the voice was never heard. A
+  saved clip now leads with a **Game + Mic** mix, and an export mixes the two itself
+  (`CHANGELOG.md`). That is covered by `crates/media/tests/voice_mix.rs`; it has not been
+  listened to in the app since.
+- **What the owner could not tell from the window:** what *Start recording* keeps. Only the
+  empty library says that a replay buffer writes nothing until a clip is saved, and that
+  *Stop* discards it. Nothing shows that a clip is on its way during its 5 s post-roll either.
+  Neither is fixed. The window would need the recorder's status to say whether the session is
+  also being saved, and whether a clip is pending.
+- **Frames were dropped at 4K: open.** While the owner used the app during a recording, the NVENC
+  path kept 45 to 50 of 60 frames a second at 3840×2160 ("222 frames never reached the
+  hardware encoder"). The start-up probe measured 156 fps on the same encoder. The log blames
+  the ffmpeg writer thread not keeping up. It has not been investigated.
+
+### What is still to be run
+
+| Marker | What | Why it is not a done item |
+|---|---|---|
+| `PENDING(install)` | Installing and uninstalling the NSIS installer built above, on a machine with no other replayed install | Winbox has the owner's own install, with the same app ID, so the installer was built and checked there but not run |
+| `PENDING(smoke-test)` | By hand, on a real desktop: install an update (a prerelease) **while recording** and see the panel ask; log in with *Start with Windows* on and see the window stay hidden (and whether it flashes); `replayed-cli` Ctrl+C in a real console (`docs/runbooks/phase-1-verification.md`); and the desktop smoke test below again, to hear the **Game + Mic** mix in the app's player | The update flow, the `--background` launch and the console handler are covered by unit tests and mocks only. The updater's own `process::exit` bypasses the exit flush, so the pre-install prompt (`prepare_for_update`) is the only guard on that path. The mix is covered by `crates/media/tests/voice_mix.rs`, not yet by ear |
+| `PENDING(game-run)` | A real League match, and a real CS2 or Dota 2 match with the refreshed per-game `.cfg`, against this build | The CS2 spectator and warmup logic and the `player_id` subscription have only been run against payloads that could not be checked against Valve's own documentation (the page returned 403) |
+
+### What this pass did not prove
+
+- **Not a real game.** No League, CS2 or Dota 2 client was contacted. The new League presence check
+  (`/liveclientdata/gamestats`), the CS2 spectator handling and the cfg refresh are covered by mocks.
+- **Not the release workflow.** `release.yml` was checked with `actionlint` and its helper scripts have
+  Python tests, but **no tag has been pushed** and the `release` environment has no reviewers yet.
+  A signed update has never been offered to an installed copy.
+- **Not the exit flush on a real desktop**, and not a window flashing on a `--background` launch.
+- **Not the resize and close paths in a real game.** The Winbox tests were not a game. A lost graphics
+  device is a known gap: the encoder bound to the old device fails, so the recording ends.
+- **Still deferred, and not done:** an atomic partial `update_encoder_settings` (so the Encoder panel's
+  full write can still overwrite the frame rate or output size the Capture group just saved if the two
+  race), fragmented-MP4 segments (concatenating segments still inflates timestamps by about 53 ms per
+  join), a `rust-toolchain.toml`, and a BGRA to NV12 video processor on the encode path.

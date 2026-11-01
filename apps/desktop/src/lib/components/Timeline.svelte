@@ -187,7 +187,7 @@
 
     {#each placed as marker (marker.event.id)}
       <!--
-        The marker carries its own offset and no handler of its own: the track owns the
+        The marker carries its own offset and no pointer handler of its own: the track owns the
         gesture, so a drag that starts on a marker scrubs like any other and the track
         reads the marker back out of this button when the press lands on it.
       -->
@@ -199,6 +199,13 @@
         title="{marker.label} at {formatPrecise(marker.event.offset_ms)}"
         aria-label="Marker: {marker.label} at {formatPrecise(marker.event.offset_ms)}"
         disabled={disabled}
+        onclick={(event) => {
+          // A pointer click is the track's gesture (above), which also seeks to the marker on
+          // release. Enter and Space on a focused marker produce a click with no pointer
+          // behind it (`detail` is 0), which nothing else handles: without this the marker is
+          // announced and tabbable and does nothing.
+          if (event.detail === 0) onSeek(seekTargetMs(marker.event.offset_ms));
+        }}
       ></button>
     {/each}
 

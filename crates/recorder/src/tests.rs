@@ -880,7 +880,487 @@ fn options(mode: RecordingMode, mic: bool) -> RecorderOptions {
         game: None,
         fail_starts: FailStarts::default(),
         audio_backends: AudioBackendOverrides::default(),
+        panic_engines: PanicEngines::default(),
+        retention_probe: RetentionProbe::default(),
+        capture_backend: CaptureOverride::default(),
     }
+}
+
+/// [`options`] with a capture backend of the test's own in place of the stub.
+fn options_with_capture(mode: RecordingMode, capture: ScriptedCapture) -> RecorderOptions {
+    RecorderOptions {
+        capture_backend: CaptureOverride::with(Box::new(capture)),
+        ..options(mode, false)
+    }
+}
+
+/// A capture backend written for the test: the stub's frames, plus what a real backend can say
+/// that the stub cannot (a window that closed, a device that was lost, a stall).
+///
+/// The size change is the stub's own ([`StubCapture::resize_at_frame`]); the other two are
+/// scripted here because a recording's reaction to them is the engine's, not the backend's.
+struct ScriptedCapture {
+    inner: StubCapture,
+    /// After this many frames have been handed out, `next_frame` fails with this.
+    lose: Option<(u64, CaptureLost)>,
+    offered: u64,
+    /// How long the capture reports having been without a frame, in ms; 0 is "not stalled".
+    stalled_ms: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl ScriptedCapture {
+    fn new() -> Self {
+        Self {
+            inner: StubCapture::new(StubConfig {
+                width: WIDTH,
+                height: HEIGHT,
+                fps: FPS,
+            }),
+            lose: None,
+            offered: 0,
+            stalled_ms: Arc::default(),
+        }
+    }
+
+    /// The source changes to `size` as it produces its `frame_index`th frame.
+    fn resizing_at(mut self, frame_index: u64, size: (u32, u32)) -> Self {
+        self.inner = self.inner.resize_at_frame(frame_index, size);
+        self
+    }
+
+    /// The capture is lost for good once `frames` frames have been handed out.
+    fn lost_after(mut self, frames: u64, lost: CaptureLost) -> Self {
+        self.lose = Some((frames, lost));
+        self
+    }
+}
+
+impl CaptureBackend for ScriptedCapture {
+    fn start(&mut self) -> Result<()> {
+        self.inner.start()
+    }
+
+    fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame>> {
+        if let Some((after, lost)) = &self.lose {
+            if self.offered >= *after {
+                return Err(anyhow::Error::new(lost.clone()));
+            }
+        }
+        let frame = self.inner.next_frame(timeout)?;
+        if frame.is_some() {
+            self.offered += 1;
+        }
+        Ok(frame)
+    }
+
+    fn discard_pending(&mut self) -> Result<usize> {
+        self.inner.discard_pending()
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.inner.stop()
+    }
+
+    fn native_size(&self) -> (u32, u32) {
+        self.inner.native_size()
+    }
+
+    fn take_size_change(&mut self) -> Option<(u32, u32)> {
+        self.inner.take_size_change()
+    }
+
+    fn stalled_for(&self) -> Option<Duration> {
+        match self.stalled_ms.load(Ordering::Relaxed) {
+            0 => None,
+            ms => Some(Duration::from_millis(ms)),
+        }
+    }
+}
+
+/// Decode every frame of `path` into the null muxer, with ffmpeg's log in the form this file's
+/// checks can read line by line.
+///
+/// `repeat+error` rather than `error`: by default ffmpeg folds a message identical to the one
+/// before it into a second line, `    Last message repeated N times`, and that line names nothing,
+/// so a check that recognises a complaint by its text cannot tell what it repeats. The synthetic
+/// source stamps two frames at a segment boundary with the same timestamp, and when *several* frames
+/// land on one timestamp the null muxer's complaint about it comes out identical each time, which
+/// is when ffmpeg folds it. Whether it does depends on how the child's reads were spread by the
+/// machine's load, so a check that filtered the complaint and not its summary passed on an idle host
+/// and failed one in ten under load, on a file that was fine. With `repeat` every occurrence is its
+/// own line and is judged on its own text.
+fn decode_to_null(bin: &FfmpegBinaries, path: &Path) -> std::process::Output {
+    std::process::Command::new(&bin.ffmpeg)
+        .args(["-v", "repeat+error", "-i"])
+        .arg(path)
+        .args(["-f", "null", "-"])
+        .output()
+        .expect("running ffmpeg")
+}
+
+/// Asserts that ffmpeg decodes every frame of `path` without a complaint: the proof that a file
+/// made of segments of two sizes is one file that plays, which the probe's header does not give.
+fn assert_decodes_cleanly(bin: &FfmpegBinaries, path: &Path) {
+    let output = decode_to_null(bin, path);
+    // The null muxer objects to two frames with the same timestamp ("non monotonically increasing
+    // dts"), which the synthetic ten-frames-a-second source produces at a segment boundary in any
+    // session, resized or not. That is a property of the test's source, not of what is under test, so
+    // it is not counted; every other complaint is (a decode error, a size change, a corrupt packet).
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let complaints: Vec<&str> = stderr
+        .lines()
+        .filter(|line| !line.contains("non monotonically increasing dts"))
+        .collect();
+    assert!(
+        output.status.success() && complaints.is_empty(),
+        "{} does not decode cleanly: {complaints:?}",
+        path.display(),
+    );
+}
+
+/// A file that makes the null muxer repeat itself decodes cleanly as far as this file's checks go.
+///
+/// Three frames to a timestamp is the case [`decode_to_null`] exists for: the complaint about the
+/// second frame and the one about the third are the same line, which ffmpeg folds into "Last
+/// message repeated 1 times" unless it is asked not to. That used to fail
+/// `a_session_follows_the_capture_to_a_new_size_and_ends_as_one_file_that_plays` whenever load made
+/// the live source put more than two frames on one timestamp at a segment boundary; this builds the
+/// same shape on purpose, so the failure does not wait for a busy machine.
+///
+/// The test also checks that the fixture does what it is for (the duplicates are there, and
+/// identical): a ffmpeg whose null muxer stopped objecting would otherwise leave this passing without
+/// proving anything.
+#[test]
+fn a_decode_check_judges_every_repeat_of_the_null_muxers_timestamp_complaint() {
+    let (_tmp, dir) = application_data_dir("decode-repeats");
+    std::fs::create_dir_all(&dir).expect("creating the scratch directory");
+    let bin = recorder_bin(&dir);
+    let path = dir.join("three-frames-to-a-timestamp.mkv");
+    let made = std::process::Command::new(&bin.ffmpeg)
+        .args([
+            "-v",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=r=10:d=1:s=64x48",
+        ])
+        .args([
+            "-vf",
+            "setpts='floor(N/3)*0.3/TB'",
+            "-fps_mode",
+            "passthrough",
+        ])
+        .args(["-c:v", "libx264", "-y"])
+        .arg(&path)
+        .output()
+        .expect("running ffmpeg");
+    assert!(made.status.success(), "{made:?}");
+
+    let stderr = String::from_utf8_lossy(&decode_to_null(&bin, &path).stderr).into_owned();
+    let dts: Vec<&str> = stderr
+        .lines()
+        .filter(|line| line.contains("non monotonically increasing dts"))
+        .collect();
+    assert!(
+        dts.len() >= 3 && dts.windows(2).any(|pair| pair[0] == pair[1]),
+        "the fixture must make the muxer repeat an identical complaint: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("Last message repeated"),
+        "every repeat is its own line, so none is a summary the checks cannot read: {stderr:?}"
+    );
+    assert_decodes_cleanly(&bin, &path);
+}
+
+/// The video size of a file, as probed.
+fn video_size(bin: &FfmpegBinaries, path: &Path) -> (u32, u32) {
+    let info = replayed_media::probe::MediaInfo::probe(bin, path).expect("probing the file");
+    let video = info.video.expect("the file has a video stream");
+    (video.width, video.height)
+}
+
+/// A session follows its capture across a resize and ends as one file that plays.
+///
+/// The window grows from 64x48 to 80x60 a second and a half in. Without following it the first
+/// new frame fails the pump's size guard and the recording is over; following it, the new
+/// encoder is declared at 80x60 and scales to the 64x48 the session started at, so the lossless
+/// concatenation of all the segments is one file with one set of parameters.
+#[test]
+fn a_session_follows_the_capture_to_a_new_size_and_ends_as_one_file_that_plays() {
+    let (_tmp, app_data_dir) = application_data_dir("session-resize");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let capture = ScriptedCapture::new().resizing_at(15, (80, 60));
+    let recorder = Recorder::start_with_options(
+        cfg,
+        options_with_capture(RecordingMode::FullSession, capture),
+    )
+    .expect("the session recorder starts");
+
+    // Four more seconds of frames after the resize: the recording is still going.
+    let after = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "frames to keep arriving after the resize",
+        |s| s.frames >= 55 || s.error.is_some() || !s.running,
+    );
+    assert!(
+        after.running,
+        "the recording survived the resize: {after:?}"
+    );
+    assert_eq!(after.error, None, "a resize is not a failure");
+    assert_eq!(after.ended, None, "and not an end");
+    assert!(after.frames >= 55, "{after:?}");
+
+    recorder.stop().expect("stop must succeed");
+    let row = wait_for_finished_session(&bin, &db_path);
+    let session_file = PathBuf::from(row.final_path.expect("the session file"));
+    assert_eq!(
+        video_size(&bin, &session_file),
+        (WIDTH, HEIGHT),
+        "the output size is held, so every segment carries the same parameters"
+    );
+    assert_decodes_cleanly(&bin, &session_file);
+    let info = replayed_media::probe::MediaInfo::probe(&bin, &session_file).expect("probing it");
+    assert!(
+        info.duration_ms >= 4_000,
+        "the file holds the footage from before the resize and after it: {}ms",
+        info.duration_ms
+    );
+}
+
+/// A replay buffer follows its capture across a resize, and a clip taken afterwards is at the new size.
+///
+/// The ring holds one stream with one header, so the resize replaces it: the footage from before
+/// is gone and the buffer fills again. What matters is that the recording is still alive and
+/// that a clip can be taken from the new ring.
+#[test]
+fn a_replay_buffer_follows_the_capture_to_a_new_size_and_clips_at_it() {
+    let (_tmp, app_data_dir) = application_data_dir("buffer-resize");
+    let cfg = stub_config(&app_data_dir);
+    let bin = cfg.bin.clone();
+
+    let capture = ScriptedCapture::new().resizing_at(15, (80, 60));
+    let recorder = Recorder::start_with_options(
+        cfg,
+        options_with_capture(RecordingMode::ReplayBuffer, capture),
+    )
+    .expect("the buffer starts");
+
+    let after = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "frames to keep arriving after the resize",
+        |s| s.frames >= 55 || s.error.is_some() || !s.running,
+    );
+    assert!(after.running, "the buffer survived the resize: {after:?}");
+    assert_eq!(after.error, None, "a resize is not a failure");
+    assert!(
+        after.dropped <= after.frames,
+        "the drop counter is one cumulative number across both encoders: {after:?}"
+    );
+
+    // The new ring has to hold the window before a clip can be cut from it.
+    let ready_ms = (PRE_SECONDS + POST_SECONDS) * 1000;
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the new ring to fill",
+        |s| s.span_ms >= ready_ms,
+    );
+    let clip = recorder
+        .clip_now()
+        .expect("a clip can be taken from the ring that followed the resize");
+    assert_eq!(
+        video_size(&bin, &clip.metadata.path),
+        (80, 60),
+        "a buffer's new stream is at the new size"
+    );
+    assert_eq!(stream_counts(&clip.metadata.path, &bin), (1, 1));
+    assert_decodes_cleanly(&bin, &clip.metadata.path);
+    recorder.stop().expect("stop must succeed");
+}
+
+/// A buffer that is also saving its session cannot follow a resize, and says so rather than
+/// writing a second header into the middle of the session file.
+#[test]
+fn a_replay_buffer_that_saves_its_session_ends_cleanly_at_a_resize() {
+    let (_tmp, app_data_dir) = application_data_dir("saved-session-resize");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let capture = ScriptedCapture::new().resizing_at(25, (80, 60));
+    let options = RecorderOptions {
+        save_session: true,
+        ..options_with_capture(RecordingMode::ReplayBuffer, capture)
+    };
+    let recorder = Recorder::start_with_options(cfg, options).expect("the buffer starts");
+
+    let ended = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the recording to end at the resize",
+        |s| !s.running,
+    );
+    assert_eq!(
+        ended.error, None,
+        "an end the recorder chose is not a failure"
+    );
+    let why = ended.ended.expect("the user is told why it ended");
+    assert!(
+        why.contains("64x48") && why.contains("80x60"),
+        "the message names both sizes: {why}"
+    );
+    recorder.stop().expect("stop reports no failure");
+
+    // What was recorded is a session that plays, at the size it was recorded.
+    let row = wait_for_finished_session(&bin, &db_path);
+    let file = PathBuf::from(row.final_path.expect("the saved session was finalised"));
+    assert_eq!(video_size(&bin, &file), (WIDTH, HEIGHT));
+    assert_decodes_cleanly(&bin, &file);
+}
+
+/// The captured window closing ends the recording cleanly: a message, no failure, a finalised session.
+#[test]
+fn a_closed_capture_target_ends_the_recording_cleanly_with_a_finalised_session() {
+    let (_tmp, app_data_dir) = application_data_dir("target-closed");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let capture = ScriptedCapture::new().lost_after(25, CaptureLost::TargetClosed);
+    let recorder = Recorder::start_with_options(
+        cfg,
+        options_with_capture(RecordingMode::FullSession, capture),
+    )
+    .expect("the session recorder starts");
+
+    let ended = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the recording to end when its target closed",
+        |s| !s.running,
+    );
+    assert_eq!(
+        ended.error, None,
+        "a closed window is the recording doing its job, not a fault: {ended:?}"
+    );
+    let why = ended.ended.expect("the user is told why it ended");
+    assert!(
+        why.contains("went away") && why.contains("kept"),
+        "the message says what happened and that nothing was lost: {why}"
+    );
+    recorder
+        .stop()
+        .expect("stopping a recording that ended cleanly reports no failure");
+
+    let row = wait_for_finished_session(&bin, &db_path);
+    let file = PathBuf::from(row.final_path.expect("the session was finalised"));
+    assert!(file.is_file());
+    assert_decodes_cleanly(&bin, &file);
+    assert!(
+        replayed_media::probe::MediaInfo::probe(&bin, &file)
+            .expect("probing it")
+            .duration_ms
+            >= 2_000,
+        "the footage up to the close was kept"
+    );
+}
+
+/// A device that is gone for good is a failure, with the backend's own reason in the message, and
+/// the session is still finalised on the way out.
+#[test]
+fn a_lost_graphics_device_fails_the_recording_with_the_reason_and_keeps_the_footage() {
+    let (_tmp, app_data_dir) = application_data_dir("device-lost");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let bin = cfg.bin.clone();
+
+    let capture = ScriptedCapture::new().lost_after(
+        25,
+        CaptureLost::DeviceLost {
+            attempts: 3,
+            reason: "the adapter was removed".to_string(),
+        },
+    );
+    let recorder = Recorder::start_with_options(
+        cfg,
+        options_with_capture(RecordingMode::FullSession, capture),
+    )
+    .expect("the session recorder starts");
+
+    let ended = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the recording to fail when its device was lost",
+        |s| !s.running,
+    );
+    let why = ended.error.clone().expect("a lost device is a failure");
+    assert!(
+        why.contains("3 attempts") && why.contains("the adapter was removed"),
+        "the message carries the attempts and the backend's reason: {why}"
+    );
+    assert_eq!(ended.ended, None, "it did not end cleanly");
+    let reported = recorder.stop().expect_err("stop reports the failure");
+    assert!(format!("{reported:#}").contains("the adapter was removed"));
+
+    let row = wait_for_finished_session(&bin, &db_path);
+    let file = PathBuf::from(row.final_path.expect("the footage was finalised"));
+    assert_decodes_cleanly(&bin, &file);
+}
+
+/// The status shows how long the capture has been without a frame, and stops showing it when
+/// frames are back.
+#[test]
+fn the_status_shows_a_stalled_capture_and_stops_showing_it_when_frames_return() {
+    let (_tmp, app_data_dir) = application_data_dir("capture-stall");
+    let cfg = stub_config(&app_data_dir);
+
+    let capture = ScriptedCapture::new();
+    let stall = Arc::clone(&capture.stalled_ms);
+    let recorder = Recorder::start_with_options(
+        cfg,
+        options_with_capture(RecordingMode::ReplayBuffer, capture),
+    )
+    .expect("the buffer starts");
+
+    let healthy = wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "frames to arrive",
+        |s| s.frames > 0,
+    );
+    assert_eq!(
+        healthy.stalled_for_ms, None,
+        "frames are arriving: {healthy:?}"
+    );
+
+    stall.store(12_000, Ordering::Relaxed);
+    let stalled = wait_for(
+        &recorder,
+        Duration::from_secs(10),
+        "the stall to be published",
+        |s| s.stalled_for_ms.is_some(),
+    );
+    assert_eq!(stalled.stalled_for_ms, Some(12_000));
+    assert!(
+        stalled.running,
+        "a stall is a state, not a failure: {stalled:?}"
+    );
+    assert_eq!(stalled.error, None);
+
+    stall.store(0, Ordering::Relaxed);
+    wait_for(
+        &recorder,
+        Duration::from_secs(10),
+        "the stall to clear",
+        |s| s.stalled_for_ms.is_none(),
+    );
+    recorder.stop().expect("stop must succeed");
 }
 
 /// The `(video, audio)` stream counts of a file, counted by ffprobe (`MediaInfo` reports only the first stream of each kind).
@@ -1354,10 +1834,10 @@ fn a_watched_game_starting_and_stopping_drives_a_full_session_and_the_retention_
     std::fs::create_dir_all(&sessions_dir).expect("the sessions area");
 
     // The old session, with files on disk as a real one leaves them.
-    let old_dir = sessions_dir.join("session-old");
+    let old_dir = sessions_dir.join("session-1");
     std::fs::create_dir_all(&old_dir).expect("the old session directory");
     std::fs::write(old_dir.join("seg-000000.mp4"), vec![0u8; 512]).expect("an old segment");
-    let old_file = sessions_dir.join("session-old.mp4");
+    let old_file = sessions_dir.join("session-1.mp4");
     std::fs::write(&old_file, vec![0u8; 512]).expect("an old session file");
     let two_days_ms = 2 * 24 * 60 * 60 * 1_000i64;
     {
@@ -1572,6 +2052,183 @@ fn a_start_that_fails_does_not_take_the_next_one_with_it() {
     recorder.stop().expect("stop must succeed");
 }
 
+/// A recording thread that dies must not end auto-record, and must not lose the index with it.
+///
+/// The engine owns the recorder's one index connection, so a panic in its loop took the connection
+/// down too: every later game failed with "this recorder's store is already in a recording". The
+/// supervisor also acted only on presence changes, so it never noticed the dead thread, said the
+/// session "is left for the next start to recover" although nothing would, and left the game
+/// unrecorded for as long as it ran.
+///
+/// So: the first recording thread panics as it starts, while the game is still running. The status
+/// must say so, the dead recording's row must be closed in this process, and the game must be
+/// recorded again by itself.
+#[test]
+fn a_recording_thread_that_panics_is_replaced_while_the_game_runs() {
+    let (_tmp, app_data_dir) = application_data_dir("engine-panic");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let mut opts = options(RecordingMode::FullSession, false);
+    opts.panic_engines = PanicEngines::next(1);
+
+    let (presence, changes) = mpsc::channel();
+    let recorder = Recorder::start_inner(
+        cfg,
+        opts,
+        &|_cfg: &EncodeConfig| {
+            panic!("the injected measurement belongs to a recording `start` begins itself")
+        },
+        Some((changes, None)),
+    )
+    .expect("the armed recorder starts");
+
+    let game = WatchedGame::by_process("Dota 2", "dota2.exe");
+    presence
+        .send(PresenceChange::Started(game))
+        .expect("telling the recorder");
+
+    // The panic is reported as what it was, not as a watcher that is merely idle.
+    let failed = wait_for(
+        &recorder,
+        Duration::from_secs(30),
+        "the panic to be reported",
+        |s| s.error.as_deref().is_some_and(|e| e.contains("panicked")),
+    );
+    assert!(!failed.running, "nothing is recording: {failed:?}");
+
+    // The game never stopped, and the recording comes back by itself, which it cannot do without the index.
+    let again = wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the game to be recorded again",
+        |s| s.running && s.span_ms >= 1_000,
+    );
+    assert_eq!(again.game.as_deref(), Some("Dota 2"), "{again:?}");
+    assert_eq!(again.error, None, "the old failure describes nothing now");
+
+    // The dead recording's row was closed here, so exactly one session is still running.
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let rows = store.list_sessions().expect("listing sessions");
+    let running = rows.iter().filter(|r| r.ended_at_ms.is_none()).count();
+    assert_eq!(
+        running, 1,
+        "the panicked recording's row must have been closed: {rows:?}"
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "the dead recording and the new one: {rows:?}"
+    );
+    drop(store);
+
+    recorder.stop().expect("stop must succeed");
+}
+
+/// A second `stop` must not return while the first is still closing the recording.
+///
+/// `stop` is documented as safe from a shared `Arc<Recorder>`, "a concurrent stop waits for the
+/// shutdown rather than returning early". The games-mode supervisor handle was taken under its lock
+/// and joined outside it, so the second caller found `None` and went straight on: it returned while
+/// the supervisor was still closing the session, and a caller that then exits the process (or reads
+/// the session file) cut the first stop off.
+#[test]
+fn a_second_stop_waits_for_the_first_to_finish_closing_the_recording() {
+    let (_tmp, app_data_dir) = application_data_dir("concurrent-stop");
+    let (presence, changes) = mpsc::channel();
+    let recorder = Arc::new(
+        Recorder::start_inner(
+            stub_config(&app_data_dir),
+            options(RecordingMode::FullSession, false),
+            &|_cfg: &EncodeConfig| panic!("the supervisor measures for itself"),
+            Some((changes, None)),
+        )
+        .expect("the armed recorder starts"),
+    );
+    presence
+        .send(PresenceChange::Started(WatchedGame::by_process(
+            "Dota 2",
+            "dota2.exe",
+        )))
+        .expect("telling the recorder");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the recording to start",
+        |s| s.running && s.span_ms >= 2_000,
+    );
+
+    let first = {
+        let recorder = Arc::clone(&recorder);
+        std::thread::spawn(move || recorder.stop())
+    };
+    // The first stop is inside the shutdown: the supervisor notices its flag within a tick and then
+    // spends real time closing the session.
+    std::thread::sleep(Duration::from_millis(20));
+    recorder.stop().expect("the second stop");
+    assert!(
+        !recorder.is_armed() && !recorder.is_running(),
+        "the second stop returned while the recording was still being closed: {:?}",
+        recorder.status()
+    );
+    first
+        .join()
+        .expect("the first stop did not panic")
+        .expect("the first stop");
+}
+
+/// A recording thread that panicked must not leave the recorder looking as if it could still be told things.
+///
+/// `stop` returned from the join's error arm before it cleared the command channel, so after the
+/// failure the recorder still held a sender whose receiver was gone: a later clip request failed
+/// with a message about a recorder that "stopped before it could" answer, not about one that is not
+/// running.
+#[test]
+fn a_stop_after_the_recording_thread_panicked_still_clears_the_commands() {
+    let (_tmp, app_data_dir) = application_data_dir("stop-after-panic");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.panic_engines = PanicEngines::next(1);
+    let recorder = Recorder::start_with_options(stub_config(&app_data_dir), opts)
+        .expect("the recorder starts");
+
+    let err = recorder.stop().expect_err("the recording thread panicked");
+    assert!(format!("{err:#}").contains("panicked"), "{err:#}");
+    assert!(
+        recorder
+            .commands
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .is_none(),
+        "the dead recording's command channel must be cleared"
+    );
+}
+
+/// The retention pass must not run on the pump thread.
+///
+/// It deletes files and walks directories, and on a slow disk that is time the capture is not
+/// pumped: the encoder's queue fills and the recording gets a frozen stretch. It runs on a worker
+/// of its own with its own index connection.
+#[test]
+fn the_retention_pass_does_not_run_on_the_pump_thread() {
+    let (_tmp, app_data_dir) = application_data_dir("retention-thread");
+    let mut opts = options(RecordingMode::ReplayBuffer, false);
+    opts.retention_probe.interval = Duration::from_millis(300);
+    let probe = opts.retention_probe.ran_on.clone();
+    let recorder = Recorder::start_with_options(stub_config(&app_data_dir), opts)
+        .expect("the recorder starts");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while probe.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "no retention pass ran");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    recorder.stop().expect("stop must succeed");
+    let ran_on = probe.lock().unwrap().clone();
+    assert!(
+        ran_on.iter().all(|name| name == "replayed-retention"),
+        "the pass ran on the pump thread: {ran_on:?}"
+    );
+}
+
 /// A clip's splice must not punch a hole in the recording.
 ///
 /// The splice is ffmpeg's, and ffmpeg takes as long as the clip is long. Run on the pump thread
@@ -1690,6 +2347,53 @@ fn slow_splice_wrapper(real_ffmpeg: &Path, delay: Duration) -> PathBuf {
     path
 }
 
+/// A splice that fails must not leave its half-written file in the clips directory.
+///
+/// ffmpeg opens the output before it has copied anything, so a splice that dies part-way (a full
+/// disk, a killed child, a stream it cannot read) leaves a truncated `clip-*.mp4`. The clip's index
+/// row is never written, so nothing would ever list or retain it: a file the clips cap counts as an
+/// orphan and the user finds as a clip that will not play.
+#[cfg(unix)]
+#[test]
+fn a_failed_splice_leaves_no_partial_clip() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let wrapper = dir.path().join("failing-ffmpeg");
+    // Writes something to the output (the last argument), then fails.
+    std::fs::write(
+        &wrapper,
+        "#!/bin/sh\nfor arg in \"$@\"; do out=\"$arg\"; done\necho partial > \"$out\"\nexit 1\n",
+    )
+    .expect("writing the wrapper");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))
+            .expect("making the wrapper executable");
+    }
+    let mut bin = FfmpegBinaries::discover(None).expect("ffmpeg on PATH");
+    bin.ffmpeg = wrapper;
+    let out = dir.path().join("clip-1.mp4");
+
+    let result = splice_clip(
+        bin,
+        ClipSource::Stream {
+            bytes: vec![0; 64],
+            audio_tracks: 0,
+            start_ms: 0,
+            duration_ms: 1_000,
+        },
+        out.clone(),
+        "libx264".to_string(),
+        Vec::new(),
+        None,
+        0,
+    );
+    assert!(result.is_err(), "the splice must fail: {result:?}");
+    assert!(
+        !out.exists(),
+        "the half-written clip must be removed, not left unindexed in the clips directory"
+    );
+}
+
 /// The gaps between the video frames of a file, in ms.
 ///
 /// The frames' own timestamps, which is the media timeline: a recording that stopped for a
@@ -1799,6 +2503,186 @@ fn a_burst_event_is_marked_at_the_moment_it_happened() {
         kill_at < 3_500,
         "the chapter must be where the event happened, not at the end of the pre-roll: {chapters:?}"
     );
+}
+
+/// An event that arrives while the driver is busy with a clip is marked when it arrived.
+///
+/// The driver is one thread, and cutting a clip holds it for the post-roll wait and the splice.
+/// Events were stamped with the media position only when the thread got back to the channel, so a
+/// kill two seconds into a post-roll was stamped at the end of it: the marker and the chapter named a
+/// moment seconds after the play, and the clip it started could miss the kill altogether.
+#[test]
+fn an_event_that_arrives_during_a_clip_is_marked_when_it_arrived() {
+    use crate::event_driver::{drive, Coalesce, EventSources, Policy};
+
+    const ARRIVAL_SLACK_MS: i64 = 1_500;
+
+    let (_tmp, app_data_dir) = application_data_dir("queued-event");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.buffer.pre_seconds = 5;
+    // A post-roll long enough that the driver is held for well over the slack.
+    cfg.buffer.post_seconds = 4;
+    let db_path = cfg.db_path();
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the window to be buffered",
+        |s| s.span_ms >= 9_000,
+    );
+
+    let (tx, events) = mpsc::channel::<GameEvent>();
+    let sources = EventSources {
+        events,
+        _lol: None,
+        _gsi: None,
+        reports: Vec::new(),
+    };
+    let policy = Policy {
+        coalesce: Coalesce {
+            quiet: Duration::from_millis(200),
+            max: Duration::from_millis(200),
+        },
+        muted: Vec::new(),
+        lol: ClipWindow::default(),
+        gsi: ClipWindow::default(),
+    };
+    let stop = AtomicBool::new(false);
+    let kill = || GameEvent::bare(replayed_events::Source::Lol, EventKind::Kill);
+
+    let arrived_second = std::thread::scope(|scope| {
+        let driver = scope.spawn(|| {
+            let on_clip: crate::event_driver::ClipHook = Box::new(|_| {});
+            drive(&recorder, sources, &stop, &policy, &on_clip)
+        });
+        tx.send(kill()).expect("the first kill");
+        // The driver is now in the first clip's post-roll; the second kill waits in the channel.
+        std::thread::sleep(Duration::from_millis(1_000));
+        let arrived = recorder.media_now_ms();
+        tx.send(kill()).expect("the second kill");
+        // Both clips are cut: the second after the first has been answered.
+        wait_for(
+            &recorder,
+            Duration::from_secs(60),
+            "both clips to be taken",
+            |s| s.clips >= 2,
+        );
+        stop.store(true, Ordering::Release);
+        driver.join().expect("the driver did not panic");
+        arrived
+    });
+    recorder.stop().expect("stop must succeed");
+
+    let store = open_clip_index(&db_path).expect("the index opens");
+    let mut kills: Vec<i64> = store
+        .list_events()
+        .expect("the events")
+        .iter()
+        .filter(|event| event.kind == "kill")
+        .map(|event| event.at_ms as i64)
+        .collect();
+    kills.sort_unstable();
+    assert_eq!(kills.len(), 2, "two kills: {kills:?}");
+    let drift = kills[1] - arrived_second as i64;
+    assert!(
+        drift.abs() <= ARRIVAL_SLACK_MS,
+        "the second kill must be stamped when it arrived ({arrived_second}ms), not when the driver \
+         got back to it: the row says {}ms",
+        kills[1]
+    );
+}
+
+/// A game's own, shorter `pre_seconds` must not start its clip after the event.
+///
+/// The clip's window was anchored where the request was *handled*, after the burst had been
+/// waited out. With a game window shorter than that wait (3 seconds of burst against a 1 second
+/// `pre_seconds`) the clip began two seconds after the kill it was taken for: the event was not
+/// in the clip, and its chapter was not either.
+#[test]
+fn a_game_pre_roll_shorter_than_the_burst_wait_still_covers_the_event() {
+    use crate::event_driver::{act_on_burst, Coalesce, Policy};
+
+    const BURST_WAIT: Duration = Duration::from_secs(3);
+
+    let (_tmp, app_data_dir) = application_data_dir("burst-short-pre");
+    let mut cfg = stub_config(&app_data_dir);
+    // The buffer reaches back further than the game's own window asks for.
+    cfg.buffer.pre_seconds = 8;
+    let recorder = Recorder::start(cfg).expect("the recorder starts");
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the window to be buffered",
+        |s| s.span_ms >= (8 + POST_SECONDS) * 1000,
+    );
+
+    let (_tx, rx) = mpsc::channel::<GameEvent>();
+    let kill = GameEvent::bare(replayed_events::Source::Lol, EventKind::Kill);
+    let policy = Policy {
+        coalesce: Coalesce {
+            quiet: BURST_WAIT,
+            max: BURST_WAIT * 3,
+        },
+        muted: Vec::new(),
+        // One second before the event, one after: shorter than the three seconds the burst waits.
+        lol: ClipWindow::new(1, 1),
+        gsi: ClipWindow::default(),
+    };
+    let clip = act_on_burst(&recorder, kill, &rx, &policy)
+        .expect("the burst is acted on")
+        .expect("a highlight takes a clip");
+    recorder.stop().expect("stop must succeed");
+
+    let chapters = chapter_starts(&clip.metadata.path, &recorder_bin(&app_data_dir));
+    let kill_at = chapters
+        .iter()
+        .find(|(_, title)| title == "Kill")
+        .map(|(at, _)| *at)
+        .unwrap_or_else(|| panic!("the kill the clip was taken for is not in it: {chapters:?}"));
+    // About one second of pre-roll before the kill (a segment of slack either way).
+    assert!(
+        (0..=2_500).contains(&(kill_at as i64)),
+        "the kill must sit about one second into the clip: {chapters:?}"
+    );
+}
+
+/// A `stop` must not wait out a clip's post-roll.
+///
+/// The post-roll wait ran inside the command handler, on the loop thread, so a `Stop` queued behind
+/// it was not read until the whole wait (the post-roll plus the segment lag plus a margin) was over.
+/// The wait now happens in the loop's own passes, and a stop ends it: the clip is cut from the
+/// footage there is.
+#[test]
+fn a_stop_does_not_wait_for_a_clips_post_roll() {
+    let (_tmp, app_data_dir) = application_data_dir("stop-in-post-roll");
+    let mut cfg = stub_config(&app_data_dir);
+    cfg.buffer.post_seconds = 8;
+    let recorder = Arc::new(Recorder::start(cfg).expect("the recorder starts"));
+    wait_for(
+        &recorder,
+        Duration::from_secs(40),
+        "the window to be buffered",
+        |s| s.span_ms >= 3_000,
+    );
+
+    let asker = {
+        let recorder = Arc::clone(&recorder);
+        std::thread::spawn(move || recorder.clip_now())
+    };
+    // The command is read and the post-roll wait has begun.
+    std::thread::sleep(Duration::from_millis(800));
+    let started = Instant::now();
+    recorder.stop().expect("stop must succeed");
+    let took = started.elapsed();
+    assert!(
+        took < Duration::from_secs(5),
+        "the stop waited for the post-roll: {took:?}"
+    );
+    let clip = asker
+        .join()
+        .expect("the asker did not panic")
+        .expect("the clip is cut from the footage there is");
+    assert!(clip.metadata.path.is_file(), "{:?}", clip.metadata.path);
 }
 
 /// The post-roll wait must survive a ledger whose span lags the wall clock by a whole segment.
@@ -2811,4 +3695,169 @@ fn a_failed_run_reports_what_the_audio_side_handed_over() {
         "the report must say what the audio side handed to the encoder; got: {error}"
     );
     recorder.stop().ok();
+}
+
+// ---------------------------------------------------------------------------------------
+// Production-readiness regressions: ownership, directories, ring-mode rows
+// ---------------------------------------------------------------------------------------
+
+/// A second recorder on a data directory that is already recording used to run recovery against the
+/// first one's live session row, concatenating segments ffmpeg was still writing and deleting the
+/// directory under it. It is refused instead, the first recording is untouched, and the directory
+/// is free again once the first one stops.
+#[test]
+fn a_second_recorder_on_a_live_data_directory_is_refused_and_leaves_the_session_alone() {
+    let (_tmp, app_data_dir) = application_data_dir("second-recorder");
+    let first = Recorder::start_with_options(
+        stub_config(&app_data_dir),
+        options(RecordingMode::FullSession, false),
+    )
+    .expect("the first recorder starts");
+    wait_for(&first, Duration::from_secs(40), "a segment on disk", |s| {
+        s.segments >= 1
+    });
+    let db_path = stub_config(&app_data_dir).db_path();
+    let row_dir = {
+        let store = open_clip_index(&db_path).unwrap();
+        let rows = store.list_sessions().unwrap();
+        assert_eq!(rows.len(), 1);
+        PathBuf::from(&rows[0].scratch_dir)
+    };
+
+    let refused = Recorder::start_with_options(
+        stub_config(&app_data_dir),
+        options(RecordingMode::FullSession, false),
+    )
+    .err()
+    .expect("a second recorder must not start");
+    assert!(
+        format!("{refused:#}").contains("already recording"),
+        "{refused:#}"
+    );
+
+    // The live session is exactly as it was: row open, directory and segments in place.
+    let store = open_clip_index(&db_path).unwrap();
+    let rows = store.list_sessions().unwrap();
+    assert_eq!(rows.len(), 1, "no second row, no recovery: {rows:?}");
+    assert!(rows[0].ended_at_ms.is_none(), "still recording");
+    assert!(row_dir.is_dir(), "the directory was not deleted under it");
+    drop(store);
+
+    first.stop().expect("the first recorder stops cleanly");
+    let again = Recorder::start_with_options(
+        stub_config(&app_data_dir),
+        options(RecordingMode::ReplayBuffer, false),
+    )
+    .expect("the directory is free once the first recorder is gone");
+    again.stop().expect("and stops");
+}
+
+/// A start that fails after the session directory was made used to leave it behind, empty, for
+/// every refused start.
+#[test]
+fn a_start_that_fails_after_the_session_directory_exists_removes_it() {
+    let (_tmp, app_data_dir) = application_data_dir("failed-start-dir");
+    let mut cfg = stub_config(&app_data_dir);
+    // Refused after `create_session_dir` (see `a_microphone_with_the_game_audio_off_is_refused_at_start`).
+    cfg.audio_enabled = Some(false);
+    let sessions_dir = cfg.sessions_dir();
+
+    Recorder::start_with_options(cfg, options(RecordingMode::FullSession, true))
+        .err()
+        .expect("refused");
+
+    let left: Vec<_> = std::fs::read_dir(&sessions_dir)
+        .map(|entries| entries.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "no directory is left behind: {left:?}");
+}
+
+/// A replay buffer writes nothing to its scratch directory, and a row that names it invites the
+/// retention pass to delete the configured `[buffer] scratch_dir` itself (the user's own folder,
+/// when they point it somewhere real) once the session ends. The row records no directory.
+#[test]
+fn a_buffer_row_never_names_the_scratch_directory() {
+    let (_tmp, app_data_dir) = application_data_dir("buffer-row-dir");
+    let cfg = stub_config(&app_data_dir);
+    let db_path = cfg.db_path();
+    let scratch = cfg.scratch_dir();
+
+    let recorder = Recorder::start_with_options(cfg, options(RecordingMode::ReplayBuffer, false))
+        .expect("starts");
+    recorder.stop().expect("stops");
+
+    let store = open_clip_index(&db_path).unwrap();
+    let rows = store.list_sessions().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_ne!(
+        PathBuf::from(&rows[0].scratch_dir),
+        scratch,
+        "the shared scratch directory is not a session directory to delete"
+    );
+    assert_eq!(
+        rows[0].scratch_dir, "",
+        "a RAM ring has no directory of its own"
+    );
+}
+
+/// A backend whose stop is a platform call that does not return until released.
+struct HangsOnStop {
+    release: mpsc::Receiver<()>,
+}
+
+impl AudioBackend for HangsOnStop {
+    fn start(&mut self) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn next_buffer(&mut self, _timeout: Duration) -> anyhow::Result<Option<AudioBuffer>> {
+        Ok(None)
+    }
+
+    fn stop(&mut self) -> anyhow::Result<()> {
+        let _ = self.release.recv();
+        Ok(())
+    }
+}
+
+/// `WorkerAudio::stop` gave up waiting for the stop's answer after its budget, and then joined the
+/// worker thread anyway: a stop that never returns made the shutdown (and a `Drop`) wait for ever on
+/// the call the budget was meant to cut off. It must return its timeout error and leave the stuck
+/// thread to finish alone.
+#[test]
+fn a_backend_that_never_stops_cannot_hang_the_shutdown() {
+    let (release, hang) = mpsc::channel();
+    let (mut worker, opening) =
+        WorkerAudio::spawn(Box::new(HangsOnStop { release: hang }), "game audio").unwrap();
+    worker.stop_budget = Duration::from_millis(200);
+    worker.await_open(&opening, Duration::from_secs(5)).unwrap();
+
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let outcome = worker.stop();
+        let _ = done.send(outcome);
+    });
+    let outcome = finished
+        .recv_timeout(Duration::from_secs(3))
+        .expect("stop returned instead of joining a stuck thread");
+    let err = outcome.expect_err("the stop timed out");
+    assert!(format!("{err:#}").contains("did not stop"), "{err:#}");
+    // Let the stuck call return so the test leaves no thread behind.
+    let _ = release.send(());
+}
+
+/// The microphone's input id is published as it is: an encoder may hand out any id, `0` and `1`
+/// included, and "no microphone" is the absence of one, not a number.
+#[test]
+fn the_published_microphone_input_is_an_option_not_a_number_with_a_magic_value() {
+    let status = SharedStatus::new();
+    assert_eq!(
+        status.mic_port(),
+        None,
+        "nothing is published before a recording"
+    );
+    for id in [Some(1), Some(0), Some(49_152), None] {
+        status.publish_recording(30, 30, id);
+        assert_eq!(status.mic_port(), id, "published as given");
+    }
 }

@@ -22,12 +22,28 @@
 //! The redaction is applied to the text that is **copied**, and to the text that is **returned**:
 //! the two are the same string, so what the user pastes and what the panel shows cannot differ.
 //!
+//! **The Windows account name is shortened out of paths.** The report is made to be pasted into a
+//! public issue, and the log and the configuration are full of absolute paths that start with the
+//! user's profile directory (`C:\Users\<name>\AppData\Local\replayed\...`), which is very
+//! often a real name. Those prefixes are replaced with the variable that names them
+//! (`%LOCALAPPDATA%`, `%APPDATA%`, `%USERPROFILE%`; see [`shorten_profile_paths`]), which keeps the
+//! layout a maintainer needs and drops the name. **That is all it does**: game names, window
+//! titles and paths outside the profile are still in the text, and the report says so in its own
+//! heading rather than leaving "credentials redacted" to be read as "safe to publish".
+//!
 //! # The clipboard
 //!
 //! The same safe mechanism the clip copy uses (`clip_files.rs`): the text never appears in
 //! script text. It is written to a file, and only the **path** travels in an environment
 //! variable, so neither PowerShell's quoting rules nor an apostrophe in the report can turn
-//! into an injection. The file is deleted afterwards.
+//! into an injection. The file is deleted afterwards, and its name is unique to the call: two copies
+//! in flight (a double click) each get a file of their own, so neither can truncate, read half of,
+//! or delete the other's.
+//!
+//! The file is UTF-8 without a byte-order mark, and Windows PowerShell 5.1 reads a file with no
+//! mark in the *ANSI* code page unless it is told otherwise, which turned every non-ASCII
+//! character (an accented profile name, a game title in Japanese) into mojibake on the clipboard
+//! while the panel showed it correctly. The script therefore says `-Encoding UTF8`.
 
 use super::*;
 use crate::clip_files::ClipboardCommand;
@@ -125,12 +141,13 @@ pub fn build_report(
             config_path.display()
         )
     });
-    let config = redact(&redact_keys(&config_text), &secrets);
-    let log_tail = redact(&read_log_tail(log_path), &secrets);
+    let roots = profile_roots();
+    let config = shorten_profile_paths(&redact(&redact_keys(&config_text), &secrets), &roots);
+    let log_tail = shorten_profile_paths(&redact(&read_log_tail(log_path), &secrets), &roots);
     // The problems come from the health page's own reader, so the report and the panel agree.
     let problems = crate::health::read_recent_problems(log_path, 50)
         .into_iter()
-        .map(|line| redact(&line, &secrets))
+        .map(|line| shorten_profile_paths(&redact(&line, &secrets), &roots))
         .collect();
     Ok(DiagnosticsReport {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -157,7 +174,10 @@ fn render(report: &DiagnosticsReport) -> String {
             text.push('\n');
         }
     }
-    text.push_str("\n--- configuration (credentials redacted) ---\n");
+    text.push_str(
+        "\n--- configuration (credentials redacted; the user profile folder is shortened to \
+         %USERPROFILE% and friends; game names, window titles and other paths are NOT) ---\n",
+    );
     text.push_str(&report.config);
     text.push_str("\n--- log tail ---\n");
     text.push_str(&report.log_tail);
@@ -264,9 +284,97 @@ fn redact_bearer(text: &str) -> String {
     out
 }
 
+/// The directories whose absolute path carries the account name, each with the label that
+/// replaces it: the most specific first, so `%LOCALAPPDATA%` wins over `%USERPROFILE%` for a path
+/// under both.
+fn profile_roots() -> Vec<(String, &'static str)> {
+    let mut roots: Vec<(String, &'static str)> = Vec::new();
+    for (var, label) in [
+        ("LOCALAPPDATA", "%LOCALAPPDATA%"),
+        ("APPDATA", "%APPDATA%"),
+        ("USERPROFILE", "%USERPROFILE%"),
+        ("HOME", "$HOME"),
+    ] {
+        if let Some(value) = std::env::var_os(var) {
+            let value = value
+                .to_string_lossy()
+                .trim_end_matches(['/', '\\'])
+                .to_string();
+            // A root of `C:` or `/` names no account, and replacing it would mangle every path.
+            if value.len() > 3 {
+                roots.push((value, label));
+            }
+        }
+    }
+    // Longest first: a path under `...\AppData\Local` is under the profile too, and must take
+    // the label that hides more of it.
+    roots.sort_by_key(|(path, _)| std::cmp::Reverse(path.len()));
+    roots
+}
+
+/// `text` with every occurrence of a profile directory replaced by its label.
+///
+/// Matched as a plain string, in the three spellings a path appears in a log: as the environment
+/// gives it, with doubled backslashes (what `{:?}` prints), and with forward slashes. On Windows
+/// the match ignores ASCII case, because the same directory is written `C:\Users\Ana` and
+/// `c:\users\ana` by different programs. A name with non-ASCII letters is matched exactly.
+fn shorten_profile_paths(text: &str, roots: &[(String, &'static str)]) -> String {
+    let ignore_case = cfg!(windows);
+    let mut out = text.to_string();
+    for (root, label) in roots {
+        let mut spellings = vec![root.clone()];
+        let doubled = root.replace('\\', "\\\\");
+        let slashed = root.replace('\\', "/");
+        for spelling in [doubled, slashed] {
+            if !spellings.contains(&spelling) {
+                spellings.push(spelling);
+            }
+        }
+        for spelling in spellings {
+            out = replace_matching(&out, &spelling, label, ignore_case);
+        }
+    }
+    out
+}
+
+/// Replace every occurrence of `needle` in `text`, optionally ignoring ASCII case.
+///
+/// Lower-casing ASCII only keeps every byte offset, so the match positions found in the folded
+/// copy are valid in the original.
+fn replace_matching(text: &str, needle: &str, with: &str, ignore_case: bool) -> String {
+    if needle.is_empty() {
+        return text.to_string();
+    }
+    if !ignore_case {
+        return text.replace(needle, with);
+    }
+    let haystack = text.to_ascii_lowercase();
+    let needle = needle.to_ascii_lowercase();
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0;
+    while let Some(found) = haystack[last..].find(&needle) {
+        let start = last + found;
+        out.push_str(&text[last..start]);
+        out.push_str(with);
+        last = start + needle.len();
+    }
+    out.push_str(&text[last..]);
+    out
+}
+
 // ---------------------------------------------------------------------------------------
 // The clipboard
 // ---------------------------------------------------------------------------------------
+
+/// The PowerShell expression that reads the report file back as text.
+///
+/// `-Encoding UTF8` is the fix for the mojibake: the file is written as UTF-8 with no byte-order
+/// mark, and Windows PowerShell 5.1 decodes a markless file with the ANSI code page unless told
+/// otherwise.
+#[cfg(windows)]
+fn read_report_expression() -> String {
+    format!("(Get-Content -Raw -Encoding UTF8 -LiteralPath $env:{DIAGNOSTICS_PATH_ENV})")
+}
 
 /// The command that puts a file's contents on the clipboard.
 ///
@@ -279,9 +387,7 @@ fn clipboard_command(path: &Path) -> Option<ClipboardCommand> {
         args: ["-NoProfile", "-NonInteractive", "-Command"]
             .iter()
             .map(|a| a.to_string())
-            .chain([format!(
-                "Set-Clipboard -Value (Get-Content -Raw -LiteralPath $env:{DIAGNOSTICS_PATH_ENV})"
-            )])
+            .chain([format!("Set-Clipboard -Value {}", read_report_expression())])
             .collect(),
         env: vec![(DIAGNOSTICS_PATH_ENV.to_string(), path.display().to_string())],
     })
@@ -363,11 +469,28 @@ fn copy_file_contents_to_clipboard(path: &Path) -> Result<(), CommandError> {
 
 /// The file the text is written to, in the system's temporary directory.
 ///
-/// A name that carries the process id, so two copies at once cannot share it.
+/// A name that is unique to the *call*: the process id keeps two processes apart, and a counter
+/// keeps two calls in one process apart. The command is `async` and the button can be pressed
+/// twice, so the process id alone let the second call truncate the file the first call's
+/// PowerShell was reading, and the first call's cleanup delete the file the second one was about
+/// to open. The file is created with `create_new`, so a leftover with the same name is an error
+/// rather than something overwritten.
 fn write_temp_file(text: &str) -> Result<PathBuf, CommandError> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    let call = CALLS.fetch_add(1, Ordering::Relaxed);
     let mut path = std::env::temp_dir();
-    path.push(format!("replayed-diagnostics-{}.txt", std::process::id()));
-    std::fs::write(&path, text).map_err(|err| {
+    path.push(format!(
+        "replayed-diagnostics-{}-{call}.txt",
+        std::process::id()
+    ));
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .and_then(|mut file| file.write_all(text.as_bytes()));
+    written.map_err(|err| {
         CommandError::new(
             ErrorCode::Io,
             format!(
@@ -608,6 +731,94 @@ mod tests {
             spec.env
         );
         assert!(!spec.program.is_empty());
+    }
+
+    /// Two copies in flight do not share a file: the second must not truncate what the first's
+    /// PowerShell is reading, and the first's cleanup must not delete the second's file.
+    #[test]
+    fn two_copies_at_once_get_files_of_their_own() {
+        let first = write_temp_file("first report").unwrap();
+        let second = write_temp_file("second report").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first report");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second report");
+        std::fs::remove_file(&first).unwrap();
+        assert!(second.is_file(), "removing one leaves the other");
+        std::fs::remove_file(&second).unwrap();
+    }
+
+    /// The profile folder is shortened out of the report, and only that.
+    #[test]
+    fn the_account_name_is_shortened_out_of_paths_but_other_text_survives() {
+        let roots = vec![
+            (r"C:\Users\Ana\AppData\Local".to_string(), "%LOCALAPPDATA%"),
+            (r"C:\Users\Ana".to_string(), "%USERPROFILE%"),
+        ];
+        let text = "settings written to C:\\Users\\Ana\\AppData\\Local\\replayed\\config.toml\n\
+                    clips_dir = \"C:\\Users\\Ana\\Videos\"\n\
+                    seen C:/Users/Ana/Documents and D:\\games\\League";
+        let shortened = shorten_profile_paths(text, &roots);
+        assert!(!shortened.contains("Ana"), "{shortened}");
+        assert!(shortened.contains("%LOCALAPPDATA%"), "{shortened}");
+        assert!(shortened.contains("%USERPROFILE%"), "{shortened}");
+        assert!(
+            shortened.contains("D:\\games\\League"),
+            "paths elsewhere are not touched"
+        );
+    }
+
+    #[test]
+    fn a_profile_match_ignores_case_only_where_the_file_system_does() {
+        let roots = vec![(r"C:\Users\Ana".to_string(), "%USERPROFILE%")];
+        let shortened = shorten_profile_paths(r"c:\users\ana\x", &roots);
+        if cfg!(windows) {
+            assert_eq!(shortened, r"%USERPROFILE%\x");
+        } else {
+            assert_eq!(shortened, r"c:\users\ana\x");
+        }
+        // A bare drive or root is not an account and is never offered as one.
+        assert!(profile_roots().iter().all(|(p, _)| p.len() > 3));
+        assert_eq!(shorten_profile_paths("anything", &[]), "anything");
+    }
+
+    #[test]
+    fn the_report_says_what_the_shortening_does_not_cover() {
+        let (_dir, config, log, app_data) = machine();
+        let report = build_report(&app_data, &config, &log).unwrap();
+        let text = render(&report);
+        assert!(
+            text.contains("game names, window titles and other paths are NOT"),
+            "{text}"
+        );
+    }
+
+    /// The encoding fix, run through the real Windows PowerShell on the real expression.
+    ///
+    /// The file is UTF-8 with no byte-order mark, which Windows PowerShell 5.1 reads as the ANSI
+    /// code page unless told otherwise. The expression the clipboard command uses reads the file
+    /// here and writes what it read to another file as UTF-8, and the bytes must come back equal;
+    /// the clipboard itself needs a desktop session and is not involved.
+    #[cfg(windows)]
+    #[test]
+    fn non_ascii_text_survives_the_trip_through_powershell() {
+        let dir = tempfile::tempdir().unwrap();
+        let text =
+            "C:\\Users\\Jos\u{e9}\\clip\n\u{30b2}\u{30fc}\u{30e0} \u{2014} caf\u{e9} \u{1f3ae}\n";
+        let input = write_temp_file(text).unwrap();
+        let output = dir.path().join("out.txt");
+        let script = format!(
+            "$t = {}; [IO.File]::WriteAllText($env:REPLAYED_TEST_OUT, $t, (New-Object Text.UTF8Encoding $false))",
+            read_report_expression()
+        );
+        let status = replayed_media::sidecar_command("powershell")
+            .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+            .env(DIAGNOSTICS_PATH_ENV, &input)
+            .env("REPLAYED_TEST_OUT", &output)
+            .status()
+            .expect("powershell runs");
+        let _ = std::fs::remove_file(&input);
+        assert!(status.success());
+        assert_eq!(std::fs::read(&output).unwrap(), text.as_bytes());
     }
 
     /// The timestamp is a real date, not an offset from the epoch.

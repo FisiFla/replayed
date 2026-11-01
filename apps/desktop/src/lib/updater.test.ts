@@ -16,12 +16,18 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 vi.mock('@tauri-apps/plugin-updater', () => ({
   check: vi.fn(),
 }));
+vi.mock('@tauri-apps/api/core', () => ({
+  invoke: vi.fn(),
+  convertFileSrc: vi.fn(),
+}));
 
+import { invoke } from '@tauri-apps/api/core';
 import { check } from '@tauri-apps/plugin-updater';
 import type { Update } from '@tauri-apps/plugin-updater';
-import { checkForUpdate, formatUpdateDate } from './updater';
+import { checkForUpdate, formatUpdateDate, prepareToInstall } from './updater';
 
 const mockedCheck = vi.mocked(check);
+const mockedInvoke = vi.mocked(invoke);
 
 /** The plugin's `Update` resource, as the plugin would hand it over. */
 function fakeUpdate(overrides: Record<string, unknown> = {}): Update {
@@ -122,5 +128,54 @@ describe('the release date', () => {
 
   it('shows nothing for a release with no date', () => {
     expect(formatUpdateDate(null)).toBe('');
+  });
+});
+
+describe('getting the recording out of the way before an install', () => {
+  beforeEach(() => {
+    mockedInvoke.mockReset();
+  });
+
+  it('is ready at once when nothing is recording, having asked without permission to stop', async () => {
+    mockedInvoke.mockResolvedValue({ was_recording: false, stopped: false });
+
+    expect(await prepareToInstall(false)).toBe('ready');
+    // The first ask never carries the user's consent: that is the point of asking.
+    expect(mockedInvoke).toHaveBeenCalledWith('prepare_for_update', { stop_recording: false });
+  });
+
+  it('says the recording is in the way, rather than failing, when the shell refuses', async () => {
+    mockedInvoke.mockRejectedValue({ code: 'recording_active', message: 'a recording is running' });
+
+    expect(await prepareToInstall(false)).toBe('recording_active');
+  });
+
+  it('is ready after the shell stopped the recording the user agreed to lose', async () => {
+    mockedInvoke.mockResolvedValue({ was_recording: true, stopped: true });
+
+    expect(await prepareToInstall(true)).toBe('ready');
+    expect(mockedInvoke).toHaveBeenCalledWith('prepare_for_update', { stop_recording: true });
+  });
+
+  it('is not ready if the shell says it was recording and did not stop it', async () => {
+    // `was_recording` true with `stopped` false is not an answer the shell gives; if it ever
+    // did, an install would run over a live recording, so it is refused instead of trusted.
+    mockedInvoke.mockResolvedValue({ was_recording: true, stopped: false });
+
+    await expect(prepareToInstall(true)).rejects.toThrow(/did not stop/);
+  });
+
+  it('fails closed on any other failure: the install must not go ahead over it', async () => {
+    mockedInvoke.mockRejectedValue({ code: 'recording', message: 'the recording could not be flushed' });
+
+    await expect(prepareToInstall(false)).rejects.toMatchObject({ code: 'recording' });
+  });
+
+  it('does not take a refusal after being given leave to stop as "ask the user"', async () => {
+    // With consent already given, `recording_active` cannot mean "go and ask": asking again
+    // would loop on a recording that did not stop, so it is a failure.
+    mockedInvoke.mockRejectedValue({ code: 'recording_active', message: 'a recording is running' });
+
+    await expect(prepareToInstall(true)).rejects.toMatchObject({ code: 'recording_active' });
   });
 });
