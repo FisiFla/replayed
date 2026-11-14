@@ -119,7 +119,7 @@ use std::io::Write;
 use std::process::{Child, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -722,6 +722,12 @@ pub struct FfmpegEncoder {
     mic_port: Option<u16>,
     /// Tells the audio pumps the child has ended, so one still waiting for its connection stops.
     audio_abort: Arc<AtomicBool>,
+    /// Why the first audio pump to stop stopped, recorded by that thread before its queue closes.
+    ///
+    /// A submit only sees the closed queue; this is the reason it reports with it (see
+    /// [`FfmpegEncoder::explain_dead_writer`]). A connect deadline leaves ffmpeg alive, so without
+    /// it nothing would say what went wrong.
+    writer_failure: Arc<OnceLock<String>>,
     /// What the child was told the microphone input is (`-f/-ar/-ac`), so
     /// [`Encoder::submit_mic_audio`] can refuse a block whose format disagrees with it.
     mic_spec: Option<crate::MicAudioSpec>,
@@ -908,6 +914,7 @@ impl FfmpegEncoder {
         // Set once the child has ended, so a pump still waiting for its connection stops waiting
         // instead of holding the shutdown up to the connect deadline.
         let audio_abort = Arc::new(AtomicBool::new(false));
+        let writer_failure = Arc::new(OnceLock::new());
         let output_stream = child.stdout.take();
         let video_in = child.stdin.take().context("child stdin unavailable")?;
 
@@ -946,9 +953,12 @@ impl FfmpegEncoder {
             Some(listener) => {
                 let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
                 let abort = Arc::clone(&audio_abort);
+                let failure = Arc::clone(&writer_failure);
                 let writer = std::thread::Builder::new()
                     .name("ffmpeg-audio-in".into())
-                    .spawn(move || pump_audio(listener, rx, child_pid, GAME_AUDIO_LABEL, &abort))
+                    .spawn(move || {
+                        pump_audio(listener, rx, child_pid, GAME_AUDIO_LABEL, &abort, &failure)
+                    })
                     .context("spawning audio writer thread")?;
                 (Some(tx), Some(writer))
             }
@@ -963,9 +973,12 @@ impl FfmpegEncoder {
                 let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(AUDIO_QUEUE_BLOCKS);
                 let port = listener.port();
                 let abort = Arc::clone(&audio_abort);
+                let failure = Arc::clone(&writer_failure);
                 let writer = std::thread::Builder::new()
                     .name("ffmpeg-mic-in".into())
-                    .spawn(move || pump_audio(listener, rx, child_pid, MICROPHONE_LABEL, &abort))
+                    .spawn(move || {
+                        pump_audio(listener, rx, child_pid, MICROPHONE_LABEL, &abort, &failure)
+                    })
                     .context("spawning microphone writer thread")?;
                 (Some(tx), Some(writer), Some(port))
             }
@@ -991,6 +1004,7 @@ impl FfmpegEncoder {
             mft,
             mic_port,
             audio_abort,
+            writer_failure,
             mic_spec: cfg.mic_audio,
             game_audio: cfg.game_audio,
             dropped_video: AtomicU64::new(0),
@@ -1010,7 +1024,7 @@ impl FfmpegEncoder {
 }
 
 /// Copy queued chunks into a sink until the sender half is dropped, then close it (EOF to ffmpeg).
-fn pump<W: Write>(rx: mpsc::Receiver<Vec<u8>>, mut sink: W) -> std::io::Result<()> {
+fn pump<W: Write>(rx: &mpsc::Receiver<Vec<u8>>, mut sink: W) -> std::io::Result<()> {
     for chunk in rx {
         sink.write_all(&chunk)?;
     }
@@ -1053,15 +1067,26 @@ fn pump_video<W: Write>(rx: mpsc::Receiver<VideoChunk>, mut sink: W) -> std::io:
 /// Dropping the stream at the end is ffmpeg's EOF on the input. `what` names the input in
 /// failures (`"audio"` or `"microphone"`); both run this same function, which is what makes the
 /// microphone share the game audio's clock discipline. `abort` is set when the child has ended.
+///
+/// A failure is written to `failure` (if no pump has written one yet) *before* `rx` is dropped.
+/// Dropping `rx` is what a submit sees as the queue closing, so by then the reason is there for it
+/// to report ([`FfmpegEncoder::explain_dead_writer`]).
 fn pump_audio(
     listener: AudioListener,
     rx: mpsc::Receiver<Vec<u8>>,
     child_pid: u32,
     what: &str,
     abort: &AtomicBool,
+    failure: &OnceLock<String>,
 ) -> std::io::Result<()> {
-    let stream = listener.accept_from(child_pid, AUDIO_CONNECT_TIMEOUT, abort, what)?;
-    pump(rx, stream)
+    let result = listener
+        .accept_from(child_pid, AUDIO_CONNECT_TIMEOUT, abort, what)
+        .and_then(|stream| pump(&rx, stream));
+    if let Err(e) = &result {
+        let _ = failure.set(format!("writing {what} to ffmpeg: {e}"));
+    }
+    drop(rx);
+    result
 }
 
 impl Encoder for FfmpegEncoder {
@@ -1465,9 +1490,18 @@ impl FfmpegEncoder {
     /// with the real cause (a missing `amfrt64.dll`) in ffmpeg's stderr. This encoder owns the child,
     /// so it adds the cause.
     ///
-    /// Returns the error untouched when the child has not exited yet (the pipe can break before the
-    /// process is reapable); inventing a cause would be worse.
+    /// An audio pump that stopped on its own says why first ([`FfmpegEncoder::writer_failure`]):
+    /// its connect deadline is a failure that leaves ffmpeg running, so the child has no exit to
+    /// report.
+    ///
+    /// Without either, the error is returned untouched (the pipe can break before the process is
+    /// reapable); inventing a cause would be worse.
     fn explain_dead_writer(&mut self, err: anyhow::Error) -> anyhow::Error {
+        // An audio pump that stopped on its own (a connect deadline, say) recorded why first.
+        let err = match self.writer_failure.get() {
+            Some(why) => anyhow::Error::msg(format!("{err}: {why}")),
+            None => err,
+        };
         match self.ffmpeg_death() {
             Some(cause) => anyhow::Error::msg(format!("{err}; {cause}")),
             None => err,
@@ -2799,6 +2833,99 @@ sleep 30;
         );
     }
 
+    /// An audio pump that stops says why before its queue closes, so the sender that finds the
+    /// queue closed can say why too.
+    ///
+    /// The case that needed it: on CI the `ffmpeg` on PATH was Chocolatey's shim, which runs the
+    /// real ffmpeg as a child of its own. The owner check rightly refused the real one's
+    /// connection, the pump hit its connect deadline, and all the recording said was "audio writer
+    /// thread has stopped". ffmpeg was still alive, so its exit status could not explain it either.
+    #[test]
+    fn a_stopped_audio_pump_records_why_before_its_queue_closes() {
+        let listener = AudioListener::bind(GAME_AUDIO_LABEL).unwrap();
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(1);
+        let failure = Arc::new(OnceLock::new());
+        // Already set: the pump gives up at once instead of waiting out the connect deadline.
+        let abort = Arc::new(AtomicBool::new(true));
+        let pump = {
+            let failure = Arc::clone(&failure);
+            std::thread::spawn(move || {
+                pump_audio(listener, rx, u32::MAX, GAME_AUDIO_LABEL, &abort, &failure)
+            })
+        };
+
+        // The first send that finds the queue closed is the moment a submit reports the failure,
+        // so the reason must already be there.
+        let give_up = Instant::now() + Duration::from_secs(20);
+        while !matches!(tx.try_send(Vec::new()), Err(TrySendError::Disconnected(_))) {
+            assert!(Instant::now() < give_up, "the pump never stopped");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let why = failure
+            .get()
+            .expect("the reason is recorded before the queue closes");
+        assert!(
+            why.contains("abandoned because ffmpeg had already ended"),
+            "the reason is the pump's own error: {why}"
+        );
+        assert!(pump.join().unwrap().is_err());
+    }
+
+    /// The error a submit returns for a stopped writer carries the reason that writer recorded.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_writer_is_reported_with_its_own_reason() {
+        let child = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let reason = "writing audio to ffmpeg: 1 connection(s) from other processes were refused";
+        let failure = Arc::new(OnceLock::new());
+        failure.set(reason.to_string()).unwrap();
+        let mut encoder = FfmpegEncoder {
+            child,
+            output_stream: None,
+            video_tx: None,
+            audio_tx: None,
+            mic_tx: None,
+            video_writer: None,
+            audio_writer: None,
+            mic_writer: None,
+            encoder_name: "libx264",
+            source_size: (320, 240),
+            input_fps: 30,
+            accepts_textures: false,
+            mic_port: None,
+            audio_abort: Arc::new(AtomicBool::new(false)),
+            writer_failure: failure,
+            mic_spec: None,
+            game_audio: false,
+            dropped_video: AtomicU64::new(0),
+            dropped_audio: AtomicU64::new(0),
+            dropped_mic_audio: AtomicU64::new(0),
+            owed_audio: 0,
+            owed_mic_audio: 0,
+            game_origin: AudioOrigin::default(),
+            mic_origin: AudioOrigin::default(),
+            video_started: false,
+            drained_stderr: None,
+            stderr_drain: None,
+            argv: Vec::new(),
+        };
+
+        let err = encoder.explain_dead_writer(anyhow::anyhow!("audio writer thread has stopped"));
+        let _ = encoder.child.kill();
+        let _ = encoder.child.wait();
+        let err = err.to_string();
+        assert!(
+            err.starts_with("audio writer thread has stopped") && err.contains(reason),
+            "the symptom is followed by the writer's reason: {err}"
+        );
+    }
+
     /// A pipe can be read once but two reports want ffmpeg's words (the writer failure and the
     /// failure [`Encoder::finish`] raises afterwards); the second must not be left with nothing.
     #[cfg(unix)]
@@ -2827,6 +2954,7 @@ sleep 30;
             accepts_textures: false,
             mic_port: None,
             audio_abort: Arc::new(AtomicBool::new(false)),
+            writer_failure: Arc::new(OnceLock::new()),
             mic_spec: None,
             // No audio input: `audio_tx`/`audio_writer` above are `None` to match.
             game_audio: false,

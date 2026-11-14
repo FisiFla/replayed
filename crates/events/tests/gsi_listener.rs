@@ -521,23 +521,34 @@ fn anonymous_traffic_cannot_spend_the_games_share() {
     // answered the game with 429. Now only requests that do not carry the token are counted,
     // and the game's lane is its own. Hammer the port from several threads with token-less
     // POSTs for the whole test, and have the game post throughout.
+    //
+    // The flood's own measure is the `429`s it was answered with, not how many it sent. A `429`
+    // is the listener turning anonymous traffic away (over the budget, or over its capacity), so
+    // at least one shows the flood really pressed on the share the game must keep. A count of
+    // attempts said that on a fast machine and not on a slow one: each flooder waits for its
+    // answer, so when answers are slow the flood is too (159 requests in 2.7 s on a CI runner,
+    // against 650 on a desktop, where about 1000 are now turned away). Twelve flooders keep the
+    // pressure up even then: the listener takes connections in batches, so more of them in
+    // flight is more of them per second.
     let harness = Harness::start();
     let addr = harness.addr();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let flooders: Vec<_> = (0..6)
+    let flooders: Vec<_> = (0..12)
         .map(|_| {
             let stop = std::sync::Arc::clone(&stop);
             std::thread::spawn(move || {
-                let mut sent = 0u32;
+                let mut refused = 0u32;
                 while !stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    let _ = TcpStream::connect(addr).and_then(|mut stream| {
+                    let answer = TcpStream::connect(addr).and_then(|mut stream| {
                         stream.write_all(b"POST /gsi HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")?;
                         stream.set_read_timeout(Some(Duration::from_millis(200)))?;
                         let mut sink = [0u8; 64];
-                        let _ = stream.read(&mut sink);
-                        Ok(())
+                        let n = stream.read(&mut sink)?;
+                        Ok(sink[..n].to_vec())
                     });
-                    sent += 1;
+                    if answer.is_ok_and(|a| a.starts_with(b"HTTP/1.1 429")) {
+                        refused += 1;
+                    }
                     // Paced, not unbounded: a tight connect loop exhausts Windows' ephemeral ports
                     // (and their `TIME_WAIT`) within seconds, and then the *game's* connect fails
                     // with `AddrInUse` in the test process, which says nothing about the listener.
@@ -545,7 +556,7 @@ fn anonymous_traffic_cannot_spend_the_games_share() {
                     // budget the limiter has.
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                sent
+                refused
             })
         })
         .collect();
@@ -558,10 +569,12 @@ fn anonymous_traffic_cannot_spend_the_games_share() {
         std::thread::sleep(Duration::from_millis(20));
     }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    let sent: u32 = flooders.into_iter().map(|f| f.join().unwrap()).sum();
+    let refused: u32 = flooders.into_iter().map(|f| f.join().unwrap()).sum();
     assert!(
-        sent > gsi::MAX_REQUESTS_PER_WINDOW * 2,
-        "the flood really exceeded the anonymous budget ({sent} requests)"
+        refused > 0,
+        "none of the flood was turned away with 429, so it never pressed on the game's share \
+         (the anonymous budget is {} a second)",
+        gsi::MAX_REQUESTS_PER_WINDOW
     );
     assert!(statuses.len() > 20, "the game posted throughout");
     assert!(

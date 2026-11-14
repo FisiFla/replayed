@@ -29,7 +29,10 @@ signed update has never been offered to an installed copy**; the ledger
   ffmpeg child it spawned: on Windows by reading the TCP table (`GetExtendedTcpTable`, no process is
   opened), elsewhere through a Unix socket in a `0700` directory and the kernel's peer credentials. A
   stranger is dropped and the wait goes on; a peer whose owner cannot be determined is refused. There
-  is no unauthenticated fallback.
+  is no unauthenticated fallback. That includes an `ffmpeg` on PATH that is a launcher shim
+  (Chocolatey's, for one), which runs the real ffmpeg as a separate process: point at the real
+  binary instead. When that happens, the error now says which process was refused instead of only
+  "audio writer thread has stopped".
 - **Retention and cleanup delete only inside the library.** The unattended passes read paths from an
   editable database and used to check only that they were absolute. They now go through a
   `LibraryRoots`: a clip's file must be inside the clips directory, a session's file inside the
