@@ -406,7 +406,7 @@ features = [
 version = "0.62"
 
 [target.'cfg(target_os = "windows")'.dependencies.windows-version]
-version = "0.1"
+version = "0.100"
 
 [target.'cfg(target_os = "windows")'.dev-dependencies.softbuffer]
 version = "0.4"
