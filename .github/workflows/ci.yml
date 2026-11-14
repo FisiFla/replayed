@@ -400,7 +400,15 @@ jobs:
           cache: npm
           cache-dependency-path: apps/desktop/package-lock.json
       - name: Install ffmpeg
-        run: choco install ffmpeg -y --no-progress
+        # The `ffmpeg.exe` Chocolatey puts on PATH is a shim that runs the real ffmpeg as a child
+        # of its own. The encoder admits only the process it spawned to its audio inputs, so the
+        # real ffmpeg's connection was refused (as any stranger's would be), and every recording
+        # with audio failed at the connect deadline. The real binaries go first on PATH instead.
+        run: |
+          choco install ffmpeg -y --no-progress
+          $bin = Join-Path $env:ChocolateyInstall 'lib\ffmpeg\tools\ffmpeg\bin'
+          if (-not (Test-Path (Join-Path $bin 'ffmpeg.exe'))) { throw "no real ffmpeg.exe in $bin" }
+          $bin | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Rust workspace tests
         env:
           # The self-test writes its log here as well as to its own buffer. A test binary
