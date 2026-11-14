@@ -160,6 +160,21 @@ const CHILD_DEATH_POLL: Duration = Duration::from_millis(10);
 /// finalised, far short of letting a wedged encoder accumulate a gigabyte.
 const VIDEO_QUEUE_FRAMES: usize = 4;
 
+/// How many encoded packets the child's muxer may hold while its output is blocked.
+///
+/// ffmpeg 9 runs the demuxer on a thread of its own and hands packets to the muxer through a
+/// queue; `-thread_queue_size` (an output option there) is that queue's depth per stream, and it
+/// is what keeps ffmpeg reading `pipe:0` while its stdout is not being drained. Without it, a
+/// reader that stalls — the replay buffer's ring assembling a clip under its lock, or a segment
+/// being finalised — makes ffmpeg stop reading the video pipe, the writer's four-frame queue
+/// fills, and the hardware encoder's two-deep feed is starved: measured at 4K60, a 2 s stall in
+/// the reader of ffmpeg's stdout dropped 375 of 602 frames.
+///
+/// Only the encoded path gets this. A raw 4K BGRA frame is 33 MB, and 240 of them would be
+/// 8 GB; the encoded packets are ~80 KB each at a recording's bitrate, so 240 is ~20 MB and
+/// four seconds at 60fps.
+const MUX_QUEUE_PACKETS: usize = 240;
+
 /// How many 10 ms audio blocks may be queued before audio submits are dropped.
 ///
 /// Blocks are 1920 B at 48kHz stereo s16le, so this is ~576 KB: three seconds of slack. The drop
@@ -598,6 +613,13 @@ fn ffmpeg_args(cfg: &EncodeConfig, audio_url: &str, mic_url: Option<&str>) -> Ve
             args.push(format!("-metadata:s:a:{index}").into());
             args.push(format!("title={title}").into());
         }
+    }
+
+    // The encoded path's muxer queue (see [`MUX_QUEUE_PACKETS`]): output options come after the
+    // inputs, and this one sizes the queue the demuxer thread hands packets to.
+    if cfg.video == VideoInput::EncodedBitstream {
+        args.extend(["-thread_queue_size"].iter().map(OsString::from));
+        args.push(MUX_QUEUE_PACKETS.to_string().into());
     }
 
     match cfg.output {
@@ -1222,8 +1244,9 @@ impl Encoder for FfmpegEncoder {
             if dropped > 0 {
                 tracing::warn!(
                     "{dropped} frames never reached the hardware encoder: its queue is two deep \
-                     because capture's handover ring is three, and the encoder is slower than the \
-                     frame rate it is being fed"
+                     because capture's handover ring is three, so a frame is lost when the encoder \
+                     falls behind the rate capture feeds it — or when the writer holds it up, \
+                     which the video queue warning above names"
                 );
             }
             mft.failure()
@@ -2215,6 +2238,49 @@ mod tests {
         assert!(
             refused.to_string().contains("cannot be scaled"),
             "the refusal must name the reason rather than fail later: {refused}"
+        );
+    }
+
+    /// The encoded path's muxer queue is an output option, and the raw path must not get one.
+    ///
+    /// ffmpeg 9 runs the demuxer on its own thread and hands packets to the muxer through
+    /// `-thread_queue_size`'s queue (per stream, on the output). Without it, a reader that stalls
+    /// makes ffmpeg stop reading the video pipe and the encoder's feed drops: at 4K60 a 2 s stall
+    /// cost 375 of 602 frames. The raw path queues 33 MB frames, so the same option there would
+    /// let a stall accumulate gigabytes.
+    #[test]
+    fn the_bitstream_output_queues_packets_and_the_raw_path_does_not() {
+        let mut cfg = args_cfg(60, 1000);
+        cfg.video = VideoInput::EncodedBitstream;
+        let args = ffmpeg_args(&cfg, "tcp://127.0.0.1:1", None);
+        let text: Vec<String> = args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = text
+            .iter()
+            .position(|a| a == "-thread_queue_size")
+            .unwrap_or_else(|| panic!("the encoded path needs a muxer queue: {text:?}"));
+        assert_eq!(
+            text[at + 1],
+            MUX_QUEUE_PACKETS.to_string(),
+            "the queue depth is the constant that documents the memory it costs: {text:?}"
+        );
+        let input = text
+            .iter()
+            .position(|a| a == "pipe:0")
+            .expect("the video input");
+        assert!(
+            at > input,
+            "`-thread_queue_size` is an output option in ffmpeg 9; before the input it sizes \
+             nothing: {text:?}"
+        );
+
+        cfg.video = VideoInput::RawPixels;
+        let args = ffmpeg_args(&cfg, "tcp://127.0.0.1:1", None);
+        assert!(
+            !args.iter().any(|a| a == "-thread_queue_size"),
+            "a 240-packet queue of 4K raw frames would be gigabytes: {args:?}"
         );
     }
 

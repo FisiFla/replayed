@@ -4226,10 +4226,26 @@ touched. The microphone was turned on in that folder's `config.toml`.
   *Stop* discards it. Nothing shows that a clip is on its way during its 5 s post-roll either.
   Neither is fixed. The window would need the recorder's status to say whether the session is
   also being saved, and whether a clip is pending.
-- **Frames were dropped at 4K: open.** While the owner used the app during a recording, the NVENC
-  path kept 45 to 50 of 60 frames a second at 3840×2160 ("222 frames never reached the
-  hardware encoder"). The start-up probe measured 156 fps on the same encoder. The log blames
-  the ffmpeg writer thread not keeping up. It has not been investigated.
+- **Frames were dropped at 4K: fixed in the code, not yet seen in a real game.** While the owner
+  used the app during a recording, the NVENC path kept 45 to 50 of 60 frames a second at
+  3840×2160 ("222 frames never reached the hardware encoder") while the start-up probe measured
+  156 fps. The encoder was not the shortfall. ffmpeg 9 runs the demuxer on its own thread and
+  hands packets to the muxer through `-thread_queue_size`'s queue, which was at its default of
+  8 packets; when the reader of ffmpeg's output stopped — the replay buffer's ring assembles a
+  clip's bytes under its lock, and the splice runs on another thread only after that copy —
+  ffmpeg's muxer blocked, the video pipe stopped being read, and the encoder's two-deep feed
+  dropped the stall's frames. The schedule then treated the resulting hole as a capture gap and
+  waited half of it, so the drops continued after the stall: the owner's 222 frames fit one stall
+  of a few seconds together with the cascade that followed it. The encoded path's muxer queue is
+  now four seconds of packets
+  (`MUX_QUEUE_PACKETS` in `crates/encoder/src/ffmpeg.rs`) and `FrameSchedule` writes the first
+  frame after a hole at once. The reproduction,
+  `a_stalled_output_reader_does_not_cost_the_encoder_frames` in
+  `crates/encoder/tests/zero_copy_rate.rs`, records 4K60 through a deliberate 2 s stall in the
+  reader of ffmpeg's stdout with **0 of 602 frames dropped**; before the change the same stall
+  dropped **375 of 602** and did not stop when the reader resumed. The test ran on the RTX 3090
+  host with a synthetic 4K texture feed, not with a real game on the owner's 4K display (this
+  host currently runs 2560×1440), so the next 4K game recording is still the confirmation.
 
 ### What is still to be run
 
