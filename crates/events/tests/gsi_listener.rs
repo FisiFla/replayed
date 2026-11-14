@@ -562,10 +562,24 @@ fn anonymous_traffic_cannot_spend_the_games_share() {
         .collect();
     std::thread::sleep(Duration::from_millis(200));
 
+    // The game posts for at least 2.5 s and at least 25 times, however slow the machine is, so
+    // its posts span the flood by construction. A count of posts within the 2.5 s was a speed
+    // bound in disguise (about 100 ms a post), which a loaded CI runner missed although every
+    // post was still served. What the game needs is the answer before its own timeout: the
+    // `"timeout" "1.0"` the integration file gives it (`gsi::integration`), after which it
+    // gives up on that update.
+    const GAME_TIMEOUT: Duration = Duration::from_secs(1);
     let started = Instant::now();
     let mut statuses = Vec::new();
-    while started.elapsed() < Duration::from_millis(2500) {
+    let mut waits = Vec::new();
+    while started.elapsed() < Duration::from_millis(2500) || statuses.len() < 25 {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the game's 25 posts took over a minute: {waits:?}"
+        );
+        let sent = Instant::now();
         statuses.push(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)));
+        waits.push(sent.elapsed());
         std::thread::sleep(Duration::from_millis(20));
     }
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -576,10 +590,13 @@ fn anonymous_traffic_cannot_spend_the_games_share() {
          (the anonymous budget is {} a second)",
         gsi::MAX_REQUESTS_PER_WINDOW
     );
-    assert!(statuses.len() > 20, "the game posted throughout");
     assert!(
         statuses.iter().all(|s| *s == 200),
         "every one of the game's POSTs was served, none was a 429: {statuses:?}"
+    );
+    assert!(
+        waits.iter().all(|w| *w < GAME_TIMEOUT),
+        "every one of the game's POSTs was answered within its {GAME_TIMEOUT:?} timeout: {waits:?}"
     );
     assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
 }
