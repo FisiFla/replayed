@@ -218,6 +218,11 @@ fn measure_hardware_encoder_fps(
         cfg.bitrate_kbps,
         cfg.fps,
         cfg.rate_control,
+        // The encoder the recording will open, so its rate is the one measured. A hardware
+        // configuration always names a vendor; software (tests only) has no MFT to measure.
+        crate::EncoderFamily::of(cfg.encoder_name())
+            .vendor()
+            .context("the zero-copy path measures a hardware encoder, and this one is software")?,
         budget,
     )?;
     if measured.renegotiations > 0 {

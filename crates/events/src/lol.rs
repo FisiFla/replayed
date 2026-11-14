@@ -16,7 +16,11 @@
 //! | [`poller`] | the loop, the logging discipline, the event sink | sockets |
 //!
 //! `derive` is covered against canned payloads in `tests/fixtures/`; the network layer against
-//! a local HTTPS mock (`tests/lol_mock.rs`) with a self-signed certificate on `127.0.0.1`.
+//! a local HTTPS mock (`tests/lol_mock.rs`) under a throwaway CA, serving either a certificate
+//! for `127.0.0.1` or one naming another host (Riot's names none, so only the host-name
+//! relaxation lets that connect). What the mock cannot be is Riot's real certificate chain: the
+//! pinned root is a 2013 X.509 v1, SHA-1-signed certificate with no extensions, and a leaf
+//! under it can only come from a live client, so that exact shape is untested here.
 //!
 //! No real League client has been checked against these shapes: the game runs kernel-level
 //! anti-cheat and was never contacted. Payload shapes come from the documented API and are

@@ -32,17 +32,42 @@ pub fn copy_budget(bytes: u64) -> Duration {
 }
 
 /// Remux without re-encoding, moving the index to the front for fast seeking.
+///
+/// The budget is derived from the source's size ([`copy_budget`]) like every other copy: a
+/// fixed one is far too small for a multi-gigabyte file and the copy fails only after doing the
+/// work.
 pub fn remux_lossless(bin: &FfmpegBinaries, src: &Path, dst: &Path) -> Result<()> {
     let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-i"])
         .arg(src)
         .args(["-c", "copy", "-movflags", "+faststart"])
         .arg(dst);
-    expect_success(cmd, "remux", dst, EDIT_TIMEOUT)
+    expect_success(cmd, "remux", dst, copy_budget(file_len(src)))
 }
 
 /// Trim `[start_ms, end_ms)` with `-c copy`. Cuts snap to the nearest preceding keyframe,
 /// inherent to stream copy.
+///
+/// Every video and audio stream of `src` is kept (`-map 0:v -map 0:a?`) and the audio tracks are
+/// re-named from [`audio_titles`]. Without a `-map`, ffmpeg's default stream selection keeps
+/// exactly one audio stream, so trimming a clip or session recorded with a microphone silently
+/// dropped the microphone track with exit status 0, and a `-c copy` carries no per-stream names,
+/// so the surviving track came out anonymous. Both are what the concatenation and the remuxes
+/// already guard against ([`concat_lossless`], [`remux_file_lossless_titled`]).
+///
+/// The map is `0:v`/`0:a` rather than a bare `-map 0` on purpose: a clip that has had chapters
+/// added carries a `data` stream (the MP4 muxer's chapter text track), and `-map 0` would copy
+/// that track *and* regenerate it from the copied chapters, so each trim of a chaptered clip
+/// would gain a second one. The chapters themselves are carried and shifted by ffmpeg regardless.
+///
+/// The audio map is optional (`?`) and the video map is not. A recording with audio turned off
+/// has no audio stream, and ffmpeg refuses a map that matches nothing, so a required `0:a` made
+/// every such clip untrimmable. A clip with no video is not a clip, and failing on it is right.
+///
+/// The budget scales with the size of `src` ([`copy_budget`]), not a fixed minute: a long
+/// session on a busy disk takes longer than that, and the copy then fails only after doing the
+/// work. A failed or timed-out trim removes its partial output, so no half-written `.mp4`
+/// sits in the library with no row naming it.
 pub fn trim_lossless(
     bin: &FfmpegBinaries,
     src: &Path,
@@ -53,6 +78,7 @@ pub fn trim_lossless(
     if end_ms <= start_ms {
         bail!("trim range is empty: start={start_ms}ms end={end_ms}ms");
     }
+    let audio_streams = stream_layout(bin, src)?.audio_count();
     let mut cmd = crate::sidecar_command(&bin.ffmpeg);
     cmd.args(["-v", "error", "-y", "-ss"])
         .arg(format!("{:.3}", start_ms as f64 / 1000.0))
@@ -60,9 +86,13 @@ pub fn trim_lossless(
         .arg(src)
         .arg("-t")
         .arg(format!("{:.3}", (end_ms - start_ms) as f64 / 1000.0))
-        .args(["-c", "copy", "-movflags", "+faststart"])
-        .arg(dst);
-    expect_success(cmd, "trim", dst, EDIT_TIMEOUT)
+        .args(["-map", "0:v", "-map", "0:a?", "-c", "copy"]);
+    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}"))
+            .arg(format!("title={title}"));
+    }
+    cmd.args(["-movflags", "+faststart"]).arg(dst);
+    expect_success(cmd, "trim", dst, copy_budget(file_len(src)))
 }
 
 /// Single-frame JPEG at `at_ms`, for timelines.
@@ -115,8 +145,10 @@ pub fn screenshot_png(
     .arg(format!("{width}x{height}"))
     .args(["-i", "pipe:0", "-frames:v", "1"])
     .arg(dst);
-    let out = crate::binaries::run_with_stdin(cmd, bgra.to_vec(), EDIT_TIMEOUT)?;
+    let out = crate::binaries::run_with_stdin(cmd, bgra.to_vec(), EDIT_TIMEOUT)
+        .inspect_err(|_| remove_partial(dst))?;
     if !out.status.success() {
+        remove_partial(dst);
         bail!(
             "writing the screenshot {} failed: {}",
             dst.display(),
@@ -161,7 +193,9 @@ pub fn concat_lossless(bin: &FfmpegBinaries, list_file: &Path, dst: &Path) -> Re
 /// thread could stall before the deadline bounding it ever ran.
 ///
 /// The audio tracks are re-named from [`audio_titles`], since a `-c copy` to a file carries no
-/// per-stream metadata and the clip's tracks would otherwise be anonymous.
+/// per-stream metadata and the clip's tracks would otherwise be anonymous. A clip with a
+/// microphone also gets the mix of [`map_clip_streams`]; the video and the recorded tracks stay
+/// copies.
 pub fn remux_stream_lossless(
     bin: &FfmpegBinaries,
     bytes: Vec<u8>,
@@ -175,17 +209,16 @@ pub fn remux_stream_lossless(
     // pipe.
     let budget = copy_budget(bytes.len() as u64);
     let mut cmd = crate::sidecar_command(&bin.ffmpeg);
-    cmd.args([
-        "-v", "error", "-y", "-i", "pipe:0", "-map", "0", "-c", "copy",
-    ]);
-    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
-        cmd.arg(format!("-metadata:s:a:{index}"))
-            .arg(format!("title={title}"));
-    }
+    cmd.args(["-v", "error", "-y", "-i", "pipe:0"]);
+    map_clip_streams(&mut cmd, audio_streams);
     cmd.args(["-movflags", "+faststart"]).arg(dst);
 
-    let out = run_with_stdin(cmd, bytes, budget)?;
+    // A failed or timed-out save removes its partial file: `index_new_clip` is never reached, so
+    // nothing would name it, and it would sit in the library's directory using disk the cap does
+    // not count.
+    let out = run_with_stdin(cmd, bytes, budget).inspect_err(|_| remove_partial(dst))?;
     if !out.status.success() {
+        remove_partial(dst);
         bail!(
             "remuxing the in-memory stream into {} failed: {}",
             dst.display(),
@@ -347,6 +380,44 @@ pub const GAME_AUDIO_TITLE: &str = "Game Audio";
 /// The `title` the microphone track is tagged with, the encoder's own string.
 pub const MICROPHONE_TITLE: &str = "Microphone";
 
+/// The `title` of the track a saved clip with a microphone leads with: the game audio and the
+/// voice mixed into one, for the players that play only a file's first audio track.
+pub const MIX_TITLE: &str = "Game + Mic";
+
+/// The mix's bitrate: what the game-audio track records by default (`[audio] bitrate_kbps`).
+const MIX_BITRATE: &str = "192k";
+
+/// The game audio and the microphone summed, not averaged (`normalize=0`): averaging would
+/// halve both, so a clip's mix would be quieter than its own game-audio track.
+pub(crate) const MIX_FILTER: &str = "[0:a:0][0:a:1]amix=inputs=2:duration=longest:normalize=0[mix]";
+
+/// Map a saved clip's streams, and name its audio tracks.
+///
+/// With no microphone every stream is copied (`-map 0 -c copy`). With one, a clip also leads
+/// with a mix of the two ([`MIX_TITLE`]). The microphone is a separate track, so a player that
+/// plays only the first audio track never plays it: the app's own player (a WebView2 `<video>`)
+/// is one, and so are most of the places a clip is dropped into to be shared. The mix is the
+/// only re-encoded stream: the video and the two recorded tracks follow it as copies, under
+/// their own names, so nothing recorded is lost and the voice can still be edited on its own.
+///
+/// Only clips are given a mix. A full session is the recording itself and keeps its two tracks
+/// ([`concat_lossless_sized`]); an export mixes them itself ([`crate::export::export`]).
+fn map_clip_streams(cmd: &mut Command, audio_streams: usize) {
+    let audio_streams = if audio_streams == 2 {
+        cmd.args(["-filter_complex", MIX_FILTER])
+            .args(["-map", "0:v", "-map", "[mix]", "-map", "0:a", "-c", "copy"])
+            .args(["-c:a:0", "aac", "-b:a:0", MIX_BITRATE]);
+        3
+    } else {
+        cmd.args(["-map", "0", "-c", "copy"]);
+        audio_streams
+    };
+    for (index, title) in audio_titles(audio_streams).iter().enumerate() {
+        cmd.arg(format!("-metadata:s:a:{index}"))
+            .arg(format!("title={title}"));
+    }
+}
+
 /// The titles for a lossless concatenation's audio tracks, in stream order.
 ///
 /// A `-c copy` through the concat demuxer does not carry per-stream metadata. The encoder's
@@ -356,13 +427,15 @@ pub const MICROPHONE_TITLE: &str = "Microphone";
 /// re-applies the names.
 ///
 /// The convention is the encoder's: game audio first, microphone second. One audio stream is
-/// the game audio; two are the game audio plus the microphone. The encoder maps at most two, and
-/// any beyond are left as the muxer named them rather than mislabelled.
+/// the game audio; two are the game audio plus the microphone. Three are a saved clip's: its
+/// mix, then those two ([`map_clip_streams`]). Nothing writes more, and any beyond are left as
+/// the muxer named them rather than mislabelled.
 pub fn audio_titles(audio_streams: usize) -> Vec<&'static str> {
     match audio_streams {
         0 => Vec::new(),
         1 => vec![GAME_AUDIO_TITLE],
-        _ => vec![GAME_AUDIO_TITLE, MICROPHONE_TITLE],
+        2 => vec![GAME_AUDIO_TITLE, MICROPHONE_TITLE],
+        _ => vec![MIX_TITLE, GAME_AUDIO_TITLE, MICROPHONE_TITLE],
     }
 }
 
@@ -391,6 +464,24 @@ pub fn concat_lossless_sized(
         cmd.arg(format!("-metadata:s:a:{index}"))
             .arg(format!("title={title}"));
     }
+    cmd.args(["-movflags", "+faststart"]).arg(dst);
+    expect_success(cmd, "concat", dst, copy_budget(total_bytes))
+}
+
+/// As [`concat_lossless_sized`], for a clip cut from segments: a clip with a microphone also
+/// leads with the mix of [`map_clip_streams`]. A full session keeps
+/// [`concat_lossless_sized`]'s two tracks.
+pub fn concat_clip_sized(
+    bin: &FfmpegBinaries,
+    list_file: &Path,
+    dst: &Path,
+    total_bytes: u64,
+    audio_streams: usize,
+) -> Result<()> {
+    let mut cmd = crate::sidecar_command(&bin.ffmpeg);
+    cmd.args(["-v", "error", "-y", "-f", "concat", "-safe", "0", "-i"])
+        .arg(list_file);
+    map_clip_streams(&mut cmd, audio_streams);
     cmd.args(["-movflags", "+faststart"]).arg(dst);
     expect_success(cmd, "concat", dst, copy_budget(total_bytes))
 }
@@ -487,6 +578,82 @@ pub fn check_concat_layout(bin: &FfmpegBinaries, segments: &[PathBuf]) -> Result
     Ok(expected)
 }
 
+/// What [`check_concat_layout_tolerating_tail`] decided about a session's segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverableSegments {
+    /// The segments to concatenate, in the order given: all of them except a dropped tail.
+    pub kept: Vec<PathBuf>,
+    /// The layout every kept segment shares; its [`StreamLayout::audio_count`] is what
+    /// [`concat_lossless_sized`] needs to name the tracks.
+    pub layout: StreamLayout,
+    /// The trailing segment that was left out because ffprobe could not read it, with ffprobe's
+    /// reason; `None` when every segment was readable. The file is not touched here: the caller
+    /// decides whether to keep it beside the output, and should say so.
+    pub dropped_tail: Option<(PathBuf, String)>,
+}
+
+/// As [`check_concat_layout`], but a **final** segment that ffprobe cannot read is dropped and
+/// reported instead of failing the whole session.
+///
+/// The segment muxer writes ordinary (non-fragmented) MP4, whose index is written when the segment
+/// closes. A crash, a kill or a power loss therefore leaves the newest segment with an `mdat` and no
+/// `moov`: ffprobe exits 1 on it while every earlier segment is whole. [`check_concat_layout`]
+/// propagates that one probe error, so `finalise` refused to run, the session row stayed `running`
+/// and every later launch retried and failed the same way. The concat of the readable prefix is
+/// a perfectly good session, and recovery after a crash is the one case this exists for.
+///
+/// What is and is not tolerated is narrow on purpose:
+///
+/// * only the **last** segment. A crash truncates the segment being written, which is the newest;
+///   an unreadable segment in the middle is damage nothing here explains, and dropping it would
+///   splice a hole into the recording without a word. That stays an error.
+/// * only a file ffprobe *rejected* ([`crate::probe::probe_layout`]'s inner `Err`). A probe that
+///   could not run at all (spawn failure, timeout) says nothing about the file and stays an error.
+/// * a session with no readable segment is an error: there is nothing to recover.
+/// * a readable final segment whose layout disagrees with the first stays the refusal
+///   [`check_concat_layout`] makes: that is a different problem, not a truncation.
+pub fn check_concat_layout_tolerating_tail(
+    bin: &FfmpegBinaries,
+    segments: &[PathBuf],
+) -> Result<RecoverableSegments> {
+    let Some((last, head)) = segments.split_last() else {
+        bail!("cannot check the stream layout of an empty segment list");
+    };
+    if head.is_empty() {
+        // A lone segment cannot be dropped: that would leave nothing.
+        let layout = check_concat_layout(bin, segments)?;
+        return Ok(RecoverableSegments {
+            kept: segments.to_vec(),
+            layout,
+            dropped_tail: None,
+        });
+    }
+    // Everything before the tail is strict, with the same refusal messages.
+    let layout = check_concat_layout(bin, head)?;
+    match crate::probe::probe_layout(bin, last)
+        .with_context(|| format!("reading the stream layout of {}", last.display()))?
+    {
+        Ok(got) if got == layout => Ok(RecoverableSegments {
+            kept: segments.to_vec(),
+            layout,
+            dropped_tail: None,
+        }),
+        // Readable but different: `check_concat_layout` words the refusal.
+        Ok(_) => {
+            check_concat_layout(bin, segments)?;
+            bail!(
+                "the last segment {} differs in stream layout from the first",
+                last.display()
+            )
+        }
+        Err(reason) => Ok(RecoverableSegments {
+            kept: head.to_vec(),
+            layout,
+            dropped_tail: Some((last.clone(), reason)),
+        }),
+    }
+}
+
 /// `video/h264 64x48, audio/aac 48000Hz 2ch`: the shapes, for a refusal message.
 fn describe(layout: &StreamLayout) -> String {
     layout
@@ -497,8 +664,23 @@ fn describe(layout: &StreamLayout) -> String {
         .join(", ")
 }
 
+/// Run `cmd` and check it wrote `dst`.
+///
+/// On any failure (a non-zero exit, a timeout that killed ffmpeg, a spawn error, or a "success"
+/// that left no file) `dst` is removed: a partial `.mp4` is not a clip, no row names it, and it
+/// would otherwise occupy the disk unaccounted for until the user found it. A failure is the
+/// only time this deletes, and only the path the caller asked ffmpeg to write.
 fn expect_success(cmd: Command, what: &str, dst: &Path, budget: Duration) -> Result<()> {
-    let out = run_with_timeout(cmd, budget)?;
+    let result = run_expecting_file(cmd, what, dst, budget);
+    if result.is_err() {
+        remove_partial(dst);
+    }
+    result
+}
+
+fn run_expecting_file(cmd: Command, what: &str, dst: &Path, budget: Duration) -> Result<()> {
+    let out =
+        run_with_timeout(cmd, budget).with_context(|| format!("{what} of {}", dst.display()))?;
     if !out.status.success() {
         bail!(
             "{what} failed writing {}: {}",
@@ -515,6 +697,20 @@ fn expect_success(cmd: Command, what: &str, dst: &Path, budget: Duration) -> Res
     dst.metadata()
         .map(|_| ())
         .with_context(|| format!("statting {}", dst.display()))
+}
+
+/// Best-effort removal of a half-written output; the error being reported is the one that matters.
+pub(crate) fn remove_partial(dst: &Path) {
+    // Only a regular file: a directory squatting on the name (a test does this to force a
+    // failure) is not something this wrote and not something to recurse into.
+    if dst.is_file() {
+        let _ = std::fs::remove_file(dst);
+    }
+}
+
+/// The size of `path` in bytes, 0 when it cannot be read: the budget then falls to its floor.
+fn file_len(path: &Path) -> u64 {
+    path.metadata().map(|m| m.len()).unwrap_or(0)
 }
 
 /// Render `path` as the path field of one `file '...'` line of an ffmpeg concat list.

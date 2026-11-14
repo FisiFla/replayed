@@ -98,6 +98,10 @@ mod tls {
         /// The CA certificate a client pins to trust the leaf.
         pub root_pem: Vec<u8>,
         pub leaf_pem: Vec<u8>,
+        /// A second leaf from the same CA and key, but naming a host that is not `127.0.0.1`: the
+        /// shape of Riot's real certificate, which carries nothing matching an IP literal. Only a
+        /// client that skips the host-name match accepts it.
+        pub wrong_name_leaf_pem: Vec<u8>,
         /// PKCS#8 PEM, the form `native_tls::Identity::from_pkcs8` takes.
         pub leaf_key_pem: Vec<u8>,
     }
@@ -147,9 +151,22 @@ mod tls {
                 .signed_by(&public, &issuer)
                 .expect("a leaf signed by the test CA");
 
+            let mut other = CertificateParams::default();
+            other.subject_alt_names = vec![SanType::DnsName(
+                "livegame.riot.invalid".try_into().unwrap(),
+            )];
+            let mut dn = DistinguishedName::new();
+            dn.push(DnType::CommonName, "livegame.riot.invalid");
+            other.distinguished_name = dn;
+            other.serial_number = Some(SerialNumber::from(3u64));
+            let wrong_name = other
+                .signed_by(&public, &issuer)
+                .expect("a second leaf signed by the test CA");
+
             Chain {
                 root_pem: ca_cert.pem().into_bytes(),
                 leaf_pem: leaf.pem().into_bytes(),
+                wrong_name_leaf_pem: wrong_name.pem().into_bytes(),
                 leaf_key_pem: rsa
                     .to_pkcs8_pem(Default::default())
                     .expect("PKCS#8")
@@ -190,8 +207,19 @@ struct MockGame {
 
 impl MockGame {
     fn start(replies: Vec<Reply>) -> Self {
+        Self::start_with(replies, false)
+    }
+
+    /// As [`Self::start`]; with `wrong_name` the certificate served names `livegame.riot.invalid`
+    /// instead of `127.0.0.1`, as Riot's does.
+    fn start_with(replies: Vec<Reply>, wrong_name: bool) -> Self {
         let chain = tls::chain();
-        let identity = Identity::from_pkcs8(&chain.leaf_pem, &chain.leaf_key_pem)
+        let leaf = if wrong_name {
+            &chain.wrong_name_leaf_pem
+        } else {
+            &chain.leaf_pem
+        };
+        let identity = Identity::from_pkcs8(leaf, &chain.leaf_key_pem)
             .expect("the generated certificate loads");
         let acceptor = TlsAcceptor::new(identity).expect("a TLS acceptor");
         let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral loopback port");
@@ -407,6 +435,84 @@ fn attaching_to_a_game_already_in_progress_does_not_replay_its_history() {
     let requests = mock.requests();
     assert!(requests.len() >= 2, "the mock saw the polls: {requests:?}");
     assert_eq!(requests[0], "GET /liveclientdata/allgamedata HTTP/1.1");
+}
+
+#[test]
+fn a_certificate_naming_another_host_is_accepted_only_by_the_hostname_relaxation() {
+    // Riot's certificate names no host, and ours is an IP literal, so the one relaxation in the
+    // client (`danger_accept_invalid_hostnames`, no SNI) is what makes the real thing connect. The
+    // other mock certificate has a SAN for 127.0.0.1 and never needs it, so this is the only test
+    // that runs the relaxed path. Both halves are asserted: the same chain and the same pinned
+    // root fail under a connector that checks the name, and succeed under the client.
+    let mock = MockGame::start_with(vec![Reply::Body(IN_PROGRESS)], true);
+
+    // A connector pinned to the same root, but with the stock host-name check, refuses it: the
+    // name is the only thing wrong, so this is the relaxation's whole job.
+    let root = native_tls::Certificate::from_pem(&mock.root_pem).expect("the mock's root parses");
+    let checking = TlsConnector::builder()
+        .disable_built_in_roots(true)
+        .add_root_certificate(root)
+        .build()
+        .expect("a connector that pins the root and checks the name");
+    let tcp = TcpStream::connect_timeout(&mock.addr, Duration::from_secs(2)).expect("connects");
+    assert!(
+        checking.connect("127.0.0.1", tcp).is_err(),
+        "a certificate for another host must fail a name check, or this test proves nothing"
+    );
+
+    // The client, which relaxes only that, gets the document.
+    let body = replayed_events::lol::LoopbackClient::for_endpoint_with_root(
+        mock.endpoint(),
+        &mock.root_pem,
+    )
+    .expect("pinned to the mock's root")
+    .get()
+    .expect("the relaxed client accepts a chain it trusts whatever name it carries");
+    assert!(matches!(body, Response::Body(_)), "{body:?}");
+
+    // And the relaxation is not a bypass: an unrelated root still fails for the same server.
+    let other = tls::unrelated_root();
+    let err = replayed_events::lol::LoopbackClient::for_endpoint_with_root(mock.endpoint(), &other)
+        .expect("pinned to an unrelated root")
+        .get()
+        .expect_err("a chain the pin does not trust is refused, whatever name it carries");
+    assert!(
+        matches!(err, replayed_events::lol::FetchError::Tls(..)),
+        "{err}"
+    );
+}
+
+#[test]
+fn presence_is_a_game_only_when_the_body_names_one() {
+    use replayed_events::process::{default_watch, GamePresence, LiveClientPresence};
+
+    // Each answer is one poll against a fresh mock. `{}` and `null` are the client between games:
+    // a 200, but not a running game. The old check counted any 200.
+    for (reply, running) in [
+        (
+            Reply::Body(r#"{"gameMode":"CLASSIC","gameTime":812.5,"mapName":"Map11"}"#),
+            true,
+        ),
+        (Reply::Body(IN_PROGRESS), true),
+        (Reply::Body("{}"), false),
+        (Reply::Body("null"), false),
+        (Reply::NoGame, false),
+    ] {
+        let mock = MockGame::start(vec![reply]);
+        let mut source =
+            LiveClientPresence::with_root(&default_watch(), mock.endpoint(), &mock.root_pem)
+                .expect("a source for the mock");
+        let presences = source.poll().expect("an answer");
+        assert_eq!(presences.len(), 1);
+        assert_eq!(presences[0].running, running, "for {reply:?}");
+    }
+
+    // Somebody else's body is a failure to look, not a stopped game.
+    let mock = MockGame::start(vec![Reply::Body("<html>not the game</html>")]);
+    let mut source =
+        LiveClientPresence::with_root(&default_watch(), mock.endpoint(), &mock.root_pem)
+            .expect("a source for the mock");
+    assert!(source.poll().is_err());
 }
 
 #[test]

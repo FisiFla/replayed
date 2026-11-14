@@ -1893,8 +1893,139 @@ pub fn app_data_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
     let dir = base.join("replayed");
-    migrate_legacy_data_dir(&base, &dir);
+    // Once per process: this is called from several places, and the move is a start-up step, not
+    // something to repeat (and re-report) on every call. A start that left something behind
+    // retries at the *next* start, which is what [`migrate_legacy_data_dir`] promises.
+    static MIGRATE: std::sync::Once = std::sync::Once::new();
+    MIGRATE.call_once(|| {
+        let report = migrate_legacy_data_dir(&base, &dir);
+        report.persist(&dir);
+        *migration_report_slot() = Some(report);
+    });
     dir
+}
+
+/// What the move from the old data directory did.
+///
+/// A value rather than log lines because the move runs inside [`app_data_dir`], and the first
+/// caller of that is the log's own set-up: the tracing subscriber does not exist yet, so every
+/// `warn!` the move made was discarded and a move that stranded half a library said nothing
+/// anywhere. The report is kept ([`log_migration_report`] replays it once logging is up) and,
+/// when something was left behind, written next to the data ([`MigrationReport::persist`]) so the
+/// answer survives a log nobody reads.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct MigrationReport {
+    /// The old directory that was read, when there was one.
+    pub legacy: Option<PathBuf>,
+    /// Entries (relative to the old directory) that now live in the new one.
+    pub moved: Vec<String>,
+    /// Entries whose name was already taken in the new directory. Never overwritten and never
+    /// retried: a taken name is a decision, not a fault.
+    pub skipped: Vec<String>,
+    /// Entries that could not be moved (a file held open, a permission): left where they were and
+    /// retried at the next start.
+    pub failed: Vec<String>,
+    /// Why nothing was moved at all, when that is not "there was nothing to move".
+    pub note: Option<String>,
+}
+
+impl MigrationReport {
+    /// Whether the report has something a user should read.
+    pub fn needs_attention(&self) -> bool {
+        !self.skipped.is_empty() || !self.failed.is_empty() || self.note.is_some()
+    }
+
+    /// The lines of the report, as `(is_warning, text)`.
+    fn lines(&self) -> Vec<(bool, String)> {
+        let mut lines = Vec::new();
+        let Some(legacy) = &self.legacy else {
+            return lines;
+        };
+        if !self.moved.is_empty() {
+            lines.push((
+                false,
+                format!(
+                    "the data from the old `{}` directory was moved: {}",
+                    legacy.display(),
+                    self.moved.join(", ")
+                ),
+            ));
+        }
+        if !self.skipped.is_empty() {
+            lines.push((
+                true,
+                format!(
+                    "these were not moved from the old `{}` directory because the name is already \
+                     taken in the new one, and were left as they are: {}",
+                    legacy.display(),
+                    self.skipped.join(", ")
+                ),
+            ));
+        }
+        if !self.failed.is_empty() {
+            lines.push((
+                true,
+                format!(
+                    "these could not be moved from the old `{}` directory and will be tried again \
+                     at the next start: {}",
+                    legacy.display(),
+                    self.failed.join(", ")
+                ),
+            ));
+        }
+        if let Some(note) = &self.note {
+            lines.push((true, note.clone()));
+        }
+        lines
+    }
+
+    /// Write the report beside the data when it needs attention, and remove an earlier one when it
+    /// no longer does. Best effort: the report is a courtesy and must not stop the application.
+    fn persist(&self, dir: &Path) {
+        let file = dir.join(MIGRATION_REPORT);
+        if !self.needs_attention() {
+            if self.legacy.is_some() {
+                let _ = std::fs::remove_file(&file);
+            }
+            return;
+        }
+        let text = self
+            .lines()
+            .into_iter()
+            .map(|(_, line)| line)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&file, format!("{text}\n"));
+    }
+}
+
+/// The file the move's report is written to, in the data directory.
+const MIGRATION_REPORT: &str = "localplay-migration.txt";
+
+/// The marker that says a move from the old directory started and has entries still to retry.
+///
+/// Without it the next start could not tell "this build has been used, leave the old directory
+/// alone" from "this build's index is the one the move itself brought across": both look like a
+/// directory with a `replayed.db`.
+const MIGRATION_MARKER: &str = ".localplay-migration-pending";
+
+fn migration_report_slot() -> MutexGuard<'static, Option<MigrationReport>> {
+    static SLOT: Mutex<Option<MigrationReport>> = Mutex::new(None);
+    SLOT.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Replay the migration's report into the log. Call once the tracing subscriber is installed:
+/// the move itself runs before it exists.
+pub fn log_migration_report() {
+    let report = migration_report_slot().take();
+    for (warn, line) in report.iter().flat_map(MigrationReport::lines) {
+        if warn {
+            tracing::warn!("{line}");
+        } else {
+            tracing::info!("{line}");
+        }
+    }
 }
 
 /// Move the data directory over from the name the project had before the rename.
@@ -1915,12 +2046,23 @@ pub fn app_data_dir() -> PathBuf {
 /// directory is left exactly where it is: merging two libraries is not something to do to
 /// somebody's clips without being asked.
 ///
-/// Otherwise each entry of the old directory is moved across one at a time, skipping anything
-/// whose destination already exists, and the index is renamed with the project. Nothing is
-/// copied, so a failure part way through loses nothing: whatever did not move is still in the
-/// old directory, which is left in place, and the next start tries again.
-fn migrate_legacy_data_dir(base: &std::path::Path, dir: &std::path::Path) {
-    use std::ffi::{OsStr, OsString};
+/// Otherwise each entry of the old directory is moved across one at a time, the index renamed
+/// with the project, and a directory that exists on both sides is merged entry by entry.
+/// Nothing is copied and nothing is overwritten, so a failure part way through loses nothing:
+/// whatever did not move is still in the old directory.
+///
+/// **A move that did not finish is finished at the next start.** The first move writes
+/// [`MIGRATION_MARKER`] into the new directory before it touches anything, and removes it only
+/// once nothing is left to retry. While it is there the "this build has data of its own" rule is
+/// not applied, because the data it would see (the index the move itself brought across) is ours.
+/// Without it the index's arrival was the very thing that made every later start give up, so the
+/// clips directory behind it stayed stranded for good. Names that were taken are not retried.
+///
+/// The paths *inside* the index are not touched here: the store keeps each clip's absolute path,
+/// and the old ones name `...\localplay\...`. They are repaired once the index is open, by
+/// [`plan_legacy_path_repair`].
+fn migrate_legacy_data_dir(base: &Path, dir: &Path) -> MigrationReport {
+    use std::ffi::OsStr;
 
     // The name before the rename, spelled out rather than derived: it must stay this
     // literal forever, because it is the name of a directory that exists on disk.
@@ -1930,70 +2072,304 @@ fn migrate_legacy_data_dir(base: &std::path::Path, dir: &std::path::Path) {
     const INDEX: &str = "replayed.db";
 
     let legacy = base.join(LEGACY);
+    let mut report = MigrationReport::default();
     if !legacy.is_dir() {
-        return;
+        // Nothing is waiting any more, so a marker or a report from an earlier start is stale: the
+        // marker would switch off the "data of its own" rule for no reason, and the report would
+        // keep promising a retry that has nothing left to retry.
+        let _ = std::fs::remove_file(dir.join(MIGRATION_MARKER));
+        let _ = std::fs::remove_file(dir.join(MIGRATION_REPORT));
+        return report;
     }
-    if dir.join(INDEX).exists() || dir.join("config.toml").exists() {
+    report.legacy = Some(legacy.clone());
+    let marker = dir.join(MIGRATION_MARKER);
+    if !marker.exists() && (dir.join(INDEX).exists() || dir.join("config.toml").exists()) {
         // The new directory has data of its own. It is not ours to merge into.
-        return;
+        report.note = Some(format!(
+            "the old data directory `{}` was left alone: `{}` already has data of its own, and \
+             merging two libraries is not done without being asked",
+            legacy.display(),
+            dir.display()
+        ));
+        return report;
     }
     let entries = match std::fs::read_dir(&legacy) {
         Ok(entries) => entries,
         Err(err) => {
-            tracing::warn!(
+            report.note = Some(format!(
                 "the old data directory at `{}` could not be read: {err}",
                 legacy.display()
-            );
-            return;
+            ));
+            return report;
         }
     };
-    let mut moved: Vec<String> = Vec::new();
-    let mut left: Vec<String> = Vec::new();
+    // The new directory may not exist yet, when the application is run from a build rather than
+    // from the installer. The marker goes in before the first move, so a start that dies half way
+    // is recognised at the next one.
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(err) = std::fs::write(
+        &marker,
+        b"a move from the old localplay directory is unfinished\n",
+    ) {
+        // Without the marker a partial move could not be resumed, so nothing is moved: the old
+        // directory stays whole, which is the safe side.
+        report.note = Some(format!(
+            "the old data directory `{}` was not moved: the marker `{}` could not be written: {err}",
+            legacy.display(),
+            marker.display()
+        ));
+        return report;
+    }
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let target_name: OsString = if name.as_os_str() == OsStr::new(LEGACY_INDEX) {
-            OsString::from(INDEX)
+        let target_name = if name.as_os_str() == OsStr::new(LEGACY_INDEX) {
+            OsStr::new(INDEX).to_owned()
         } else {
             name.clone()
         };
-        let target = dir.join(&target_name);
-        if target.exists() {
-            left.push(name.to_string_lossy().into_owned());
-            continue;
-        }
-        // The new directory may not exist yet, when the application is run from a build
-        // rather than from the installer.
-        let _ = std::fs::create_dir_all(dir);
-        match std::fs::rename(entry.path(), &target) {
-            Ok(()) => moved.push(name.to_string_lossy().into_owned()),
-            Err(err) => {
-                tracing::warn!(
-                    "`{}` could not be moved to `{}`: {err}",
-                    name.to_string_lossy(),
-                    target.display()
-                );
-                left.push(name.to_string_lossy().into_owned());
-            }
-        }
+        let label = name.to_string_lossy().into_owned();
+        move_entry(&entry.path(), &dir.join(target_name), &label, &mut report);
     }
     // Only an empty directory is removed, and `remove_dir` refuses anything else — so this
     // cannot delete a leftover the user still needs.
     let _ = std::fs::remove_dir(&legacy);
-    if !moved.is_empty() {
-        tracing::info!(
-            "the data from the old `{}` directory was moved to `{}`: {}",
-            legacy.display(),
-            dir.display(),
-            moved.join(", ")
-        );
+    if report.failed.is_empty() {
+        // Nothing is left to retry (what remains was skipped on purpose), so the next start must
+        // apply the ordinary "data of its own" rule again.
+        let _ = std::fs::remove_file(&marker);
     }
-    if !left.is_empty() {
+    report
+}
+
+/// Move one entry of the old directory to `target`, recording what happened under `label`.
+///
+/// A free name is a rename. A directory on both sides is merged: each child is moved on its own
+/// and the old directory is removed if that emptied it. Anything else with a taken name is
+/// skipped, never overwritten.
+fn move_entry(source: &Path, target: &Path, label: &str, report: &mut MigrationReport) {
+    if !target.exists() {
+        match std::fs::rename(source, target) {
+            Ok(()) => report.moved.push(label.to_string()),
+            Err(err) => {
+                tracing::warn!(
+                    "`{label}` could not be moved to `{}`: {err}",
+                    target.display()
+                );
+                report.failed.push(label.to_string());
+            }
+        }
+        return;
+    }
+    if source.is_dir() && target.is_dir() {
+        let Ok(children) = std::fs::read_dir(source) else {
+            report.failed.push(label.to_string());
+            return;
+        };
+        for child in children.flatten() {
+            let name = child.file_name();
+            let child_label = format!("{label}/{}", name.to_string_lossy());
+            move_entry(&child.path(), &target.join(&name), &child_label, report);
+        }
+        let _ = std::fs::remove_dir(source);
+        return;
+    }
+    report.skipped.push(label.to_string());
+}
+
+/// Which table and column a repaired path lives in: the three places the index keeps a path.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LegacyPathRepair {
+    /// `clips.path`, as `(row id, stored value, new value)`.
+    pub clips: Vec<(i64, String, String)>,
+    /// `sessions.final_path`, in the same shape.
+    pub session_finals: Vec<(i64, String, String)>,
+    /// `sessions.scratch_dir`, in the same shape.
+    pub session_scratch: Vec<(i64, String, String)>,
+}
+
+impl LegacyPathRepair {
+    /// How many rows the repair would change.
+    pub fn len(&self) -> usize {
+        self.clips.len() + self.session_finals.len() + self.session_scratch.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The rows of the index whose stored path still names the old `localplay` directory, for a file
+/// that now lives in the new one.
+///
+/// The store keeps every clip's **absolute** path, so moving the directory moved the files and
+/// left every row pointing at the old place: the library listed each clip as a missing file, and
+/// "prune missing" would have deleted the rows of clips that were sitting safely in
+/// `replayed\clips`. The same function repairs an index that was migrated by an earlier build.
+///
+/// A row is rewritten only when **all** of this holds:
+///
+/// 1. its path is under the old root (`<base>\localplay`), compared by whole path component and,
+///    on Windows, without regard to case;
+/// 2. nothing exists at that path any more; and
+/// 3. something exists at the same path under the new root.
+///
+/// Anything else is left exactly as it is, which is the fail-safe: a path outside the old root
+/// (a clips directory the user chose, say) is not this function's business, a file that is still
+/// where the row says is not "missing", and a file found in neither place stays a missing file
+/// for the user to look at. The plan only *reads* the disk and never removes anything.
+///
+/// `exists` is the disk, so a test can answer for it. The plan is applied by the store in one
+/// transaction (compare-and-set on the stored value), after [`backup_index_before_repair`].
+pub fn plan_legacy_path_repair(
+    base: &Path,
+    dir: &Path,
+    clips: &[replayed_store::Clip],
+    sessions: &[replayed_store::Session],
+    exists: impl Fn(&Path) -> bool,
+) -> LegacyPathRepair {
+    let old_root = base.join("localplay");
+    let ignore_case = cfg!(windows);
+    let rewrite = |stored: &str| -> Option<String> {
+        let relative = strip_root(Path::new(stored), &old_root, ignore_case)?;
+        let moved = dir.join(relative);
+        (!exists(Path::new(stored)) && exists(&moved)).then(|| moved.to_string_lossy().into_owned())
+    };
+    let mut plan = LegacyPathRepair::default();
+    for clip in clips {
+        let stored = clip.path.to_string_lossy();
+        if let Some(to) = rewrite(&stored) {
+            plan.clips.push((clip.id, stored.into_owned(), to));
+        }
+    }
+    for session in sessions {
+        if let Some(stored) = &session.final_path {
+            if let Some(to) = rewrite(stored) {
+                plan.session_finals.push((session.id, stored.clone(), to));
+            }
+        }
+        if let Some(to) = rewrite(&session.scratch_dir) {
+            plan.session_scratch
+                .push((session.id, session.scratch_dir.clone(), to));
+        }
+    }
+    plan
+}
+
+/// `path` relative to `root`, when it is strictly inside it. Whole components only, so
+/// `localplay-old\x` is not under `localplay`.
+fn strip_root(path: &Path, root: &Path, ignore_case: bool) -> Option<PathBuf> {
+    let mut path_parts = path.components();
+    for want in root.components() {
+        let got = path_parts.next()?;
+        let same = if ignore_case {
+            got.as_os_str()
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&want.as_os_str().to_string_lossy())
+        } else {
+            got == want
+        };
+        if !same {
+            return None;
+        }
+    }
+    let rest = path_parts.as_path();
+    (!rest.as_os_str().is_empty()).then(|| rest.to_path_buf())
+}
+
+/// Copy the index aside before its paths are rewritten, and say where the copy is.
+///
+/// The rewrite is one transaction and compare-and-set, but it is still a bulk edit of somebody's
+/// library, so the file as it was stays recoverable. The copy is never overwritten: a second
+/// repair gets its own name, and nothing here deletes a backup.
+pub fn backup_index_before_repair(db_path: &Path) -> std::io::Result<PathBuf> {
+    let name = db_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "replayed.db".to_string());
+    // Open the source first: a missing index must not leave an empty "backup" behind that looks
+    // like a good one.
+    let mut input = std::fs::File::open(db_path)?;
+    for n in 0.. {
+        let suffix = if n == 0 {
+            String::new()
+        } else {
+            format!(".{n}")
+        };
+        let backup = db_path.with_file_name(format!("{name}.pre-path-repair{suffix}.bak"));
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&backup)
+        {
+            Ok(mut out) => {
+                if let Err(err) = std::io::copy(&mut input, &mut out) {
+                    drop(out);
+                    // A partial copy is not a backup: remove only the file this call created.
+                    let _ = std::fs::remove_file(&backup);
+                    return Err(err);
+                }
+                out.sync_all()?;
+                return Ok(backup);
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("the loop only ends by returning")
+}
+
+/// Repair the paths a move of the data directory left in the index: plan, back up, rewrite.
+///
+/// The order is the safety property. The plan only reads ([`plan_legacy_path_repair`]); the index
+/// is copied aside ([`backup_index_before_repair`]) **before** anything is written, and a copy
+/// that cannot be made means no rewrite at all, not a rewrite without a way back; and the rewrite
+/// is one transaction that changes a row only while it still holds the value the plan read
+/// ([`replayed_store::Store::rewrite_paths`]). With nothing to repair (the common start) no backup
+/// is made.
+///
+/// Returns how many columns were changed. An error is the caller's to log: a library whose rows
+/// still name the old directory is a library that lists its clips as missing, which is bad, but
+/// a shell that refuses to start over it is worse.
+pub fn repair_legacy_index_paths(
+    store: &replayed_store::Store,
+    base: &Path,
+    dir: &Path,
+    db_path: &Path,
+) -> Result<usize, String> {
+    let clips = store
+        .list_clips()
+        .map_err(|err| format!("the clips could not be read: {err:#}"))?;
+    let sessions = store
+        .list_sessions()
+        .map_err(|err| format!("the sessions could not be read: {err:#}"))?;
+    let plan = plan_legacy_path_repair(base, dir, &clips, &sessions, |p| p.exists());
+    if plan.is_empty() {
+        return Ok(0);
+    }
+    let backup = backup_index_before_repair(db_path).map_err(|err| {
+        format!(
+            "{} row(s) name the old data directory but the index could not be copied aside first, \
+             so nothing was rewritten: {err}",
+            plan.len()
+        )
+    })?;
+    tracing::info!(
+        "the index was copied to {} before its paths were repaired",
+        backup.display()
+    );
+    let changed = store
+        .rewrite_paths(&plan.clips, &plan.session_finals, &plan.session_scratch)
+        .map_err(|err| {
+            format!("the paths could not be rewritten (nothing was changed): {err:#}")
+        })?;
+    if changed < plan.len() {
         tracing::warn!(
-            "these are still in the old `{}` directory and were not moved: {}",
-            legacy.display(),
-            left.join(", ")
+            "{} of {} path(s) were left as they were: the row changed after it was read",
+            plan.len() - changed,
+            plan.len()
         );
     }
+    Ok(changed)
 }
 
 #[cfg(test)]
@@ -2089,6 +2465,407 @@ mod tests {
         assert!(
             legacy.join("notes.txt").is_file(),
             "the skipped file is still where it was"
+        );
+    }
+
+    #[test]
+    fn a_move_that_stopped_part_way_is_finished_at_the_next_start() {
+        // The state a partial move leaves: the index already came across (and with it the
+        // `replayed.db` that used to make every later start give up), the clips did not. The
+        // marker is what says the index is ours, so the clips are moved rather than stranded.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::write(dir.join("replayed.db"), b"index").unwrap();
+        std::fs::write(dir.join(MIGRATION_MARKER), b"x").unwrap();
+        std::fs::create_dir_all(legacy.join("clips")).unwrap();
+        std::fs::write(legacy.join("clips/a.mp4"), b"video").unwrap();
+
+        let report = migrate_legacy_data_dir(&base, &dir);
+
+        assert_eq!(std::fs::read(dir.join("clips/a.mp4")).unwrap(), b"video");
+        assert!(!legacy.exists(), "the emptied old directory is removed");
+        assert!(
+            !dir.join(MIGRATION_MARKER).exists(),
+            "nothing is left to retry, so the marker goes"
+        );
+        assert_eq!(report.moved, ["clips"]);
+        assert!(!report.needs_attention());
+    }
+
+    #[test]
+    fn without_the_marker_a_directory_with_an_index_is_not_touched() {
+        // The same state as above minus the marker is a build that has been used. The old
+        // directory is left alone, and the report says so instead of dropping it.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::write(dir.join("replayed.db"), b"index").unwrap();
+        std::fs::create_dir_all(legacy.join("clips")).unwrap();
+
+        let report = migrate_legacy_data_dir(&base, &dir);
+
+        assert!(legacy.join("clips").is_dir(), "left where it was");
+        assert!(!dir.join("clips").exists());
+        assert!(report.needs_attention(), "{report:?}");
+        assert!(report.note.as_deref().unwrap().contains("left alone"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_partial_failure_is_retried_and_finishes() {
+        // The failure itself, not a staged copy of its aftermath: a rename out of a directory
+        // that cannot be written fails, which is what a file held open or a permission does.
+        use std::os::unix::fs::PermissionsExt;
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::write(legacy.join("localplay.db"), b"index").unwrap();
+        std::fs::create_dir_all(legacy.join("clips")).unwrap();
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(legacy.join("probe"), b"").is_ok() {
+            // Running with rights that ignore the mode (root): the failure cannot be made.
+            std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let first = migrate_legacy_data_dir(&base, &dir);
+        assert!(!first.failed.is_empty(), "{first:?}");
+        assert!(first.needs_attention());
+        assert!(
+            dir.join(MIGRATION_MARKER).exists(),
+            "a failed entry keeps the marker so the next start retries"
+        );
+        // The diagnostics are not dropped: the report is on disk beside the data.
+        first.persist(&dir);
+        let text = std::fs::read_to_string(dir.join(MIGRATION_REPORT)).unwrap();
+        assert!(text.contains("tried again"), "{text}");
+
+        std::fs::set_permissions(&legacy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let second = migrate_legacy_data_dir(&base, &dir);
+        assert!(second.failed.is_empty(), "{second:?}");
+        assert!(dir.join("replayed.db").is_file());
+        assert!(dir.join("clips").is_dir());
+        assert!(!legacy.exists());
+        assert!(!dir.join(MIGRATION_MARKER).exists());
+        second.persist(&dir);
+        assert!(
+            !dir.join(MIGRATION_REPORT).exists(),
+            "a finished move removes its own stale report"
+        );
+    }
+
+    #[test]
+    fn a_directory_on_both_sides_is_merged_without_overwriting() {
+        // `clips` exists in both (the new build made one before the move ran). Each file moves on
+        // its own; the name that is taken is skipped, never overwritten.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::create_dir_all(legacy.join("clips")).unwrap();
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+        std::fs::write(legacy.join("clips/old.mp4"), b"old").unwrap();
+        std::fs::write(legacy.join("clips/same.mp4"), b"legacy").unwrap();
+        std::fs::write(dir.join("clips/same.mp4"), b"new").unwrap();
+
+        let report = migrate_legacy_data_dir(&base, &dir);
+
+        assert_eq!(std::fs::read(dir.join("clips/old.mp4")).unwrap(), b"old");
+        assert_eq!(std::fs::read(dir.join("clips/same.mp4")).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(legacy.join("clips/same.mp4")).unwrap(),
+            b"legacy",
+            "the colliding file stays where it was"
+        );
+        assert_eq!(report.skipped, ["clips/same.mp4"]);
+        assert!(
+            !dir.join(MIGRATION_MARKER).exists(),
+            "a taken name is a decision, not something to retry"
+        );
+    }
+
+    #[test]
+    fn a_start_with_no_old_directory_clears_a_stale_marker_and_report() {
+        let (_tmp, base, dir) = legacy_case();
+        std::fs::remove_dir(base.join("localplay")).unwrap();
+        std::fs::write(dir.join(MIGRATION_MARKER), b"x").unwrap();
+        std::fs::write(dir.join(MIGRATION_REPORT), b"stale").unwrap();
+
+        let report = migrate_legacy_data_dir(&base, &dir);
+
+        assert_eq!(report, MigrationReport::default());
+        assert!(!dir.join(MIGRATION_MARKER).exists());
+        assert!(!dir.join(MIGRATION_REPORT).exists());
+    }
+
+    // -- the paths inside the index --------------------------------------------------------
+
+    fn clip_at(id: i64, path: impl Into<PathBuf>) -> replayed_store::Clip {
+        replayed_store::Clip {
+            id,
+            kind: "clip".to_string(),
+            path: path.into(),
+            started_at_ms: 0,
+            duration_ms: 1000,
+            size_bytes: 10,
+            codec: "h264".to_string(),
+            favourite: false,
+            created_at_ms: 0,
+            title: None,
+            game: None,
+            tags: Vec::new(),
+        }
+    }
+
+    fn session_at(id: i64, scratch: &str, final_path: Option<&str>) -> replayed_store::Session {
+        replayed_store::Session {
+            id,
+            game: None,
+            mode: "session".to_string(),
+            started_at_ms: 0,
+            media_epoch_ms: 0,
+            ended_at_ms: Some(1),
+            scratch_dir: scratch.to_string(),
+            final_path: final_path.map(str::to_string),
+            size_bytes: 0,
+            duration_ms: 0,
+            favourite: false,
+        }
+    }
+
+    #[test]
+    fn a_migrated_clip_that_is_missing_at_the_old_path_is_pointed_at_the_new_one() {
+        // The reported bug: the directory moved, the row kept `...\localplay\clips\a.mp4`, and the
+        // library showed the clip as missing.
+        let (_tmp, base, dir) = legacy_case();
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+        std::fs::write(dir.join("clips/a.mp4"), b"v").unwrap();
+        let old = base.join("localplay/clips/a.mp4");
+        let clips = [clip_at(1, &old)];
+
+        let plan = plan_legacy_path_repair(&base, &dir, &clips, &[], |p| p.exists());
+
+        assert_eq!(
+            plan.clips,
+            [(
+                1,
+                old.to_string_lossy().into_owned(),
+                dir.join("clips/a.mp4").to_string_lossy().into_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn the_repair_never_touches_a_row_it_cannot_prove_moved() {
+        // Fail safe, row by row: only "under the old root, gone from there, present in the new
+        // root" is rewritten. Every other row stays as it is, so nothing is ever repointed at a
+        // file that is not there, and the repair deletes nothing.
+        let (_tmp, base, dir) = legacy_case();
+        let legacy = base.join("localplay");
+        std::fs::create_dir_all(legacy.join("clips")).unwrap();
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+        // Present in both places: still where the row says, so not missing.
+        std::fs::write(legacy.join("clips/both.mp4"), b"v").unwrap();
+        std::fs::write(dir.join("clips/both.mp4"), b"v").unwrap();
+        // Present in neither: stays a missing file for the user to see.
+        // A clips directory the user chose: not under the old root at all.
+        let elsewhere = base.join("my-clips/x.mp4");
+        // A sibling that merely starts with the old name.
+        let lookalike = base.join("localplay-old/clips/y.mp4");
+        std::fs::create_dir_all(dir.join("localplay-old/clips")).unwrap();
+        std::fs::write(dir.join("clips/y.mp4"), b"v").unwrap();
+        let clips = [
+            clip_at(1, legacy.join("clips/both.mp4")),
+            clip_at(2, legacy.join("clips/neither.mp4")),
+            clip_at(3, &elsewhere),
+            clip_at(4, &lookalike),
+            clip_at(5, &legacy),
+        ];
+
+        let plan = plan_legacy_path_repair(&base, &dir, &clips, &[], |p| p.exists());
+
+        assert!(plan.is_empty(), "{plan:?}");
+    }
+
+    #[test]
+    fn the_plan_reads_rows_back_from_a_real_index() {
+        // The rows the plan sees are the store's own, not hand-built structs: what the index
+        // returns for a clip written with an old absolute path.
+        let (_tmp, base, dir) = legacy_case();
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+        std::fs::write(dir.join("clips/real.mp4"), b"v").unwrap();
+        let store = replayed_store::Store::open_in_memory().unwrap();
+        store.migrate().unwrap();
+        let old = base.join("localplay/clips/real.mp4");
+        let id = store
+            .insert_clip(&replayed_store::NewClip {
+                path: old.clone(),
+                started_at_ms: 0,
+                duration_ms: 1000,
+                size_bytes: 1,
+                codec: "h264".to_string(),
+            })
+            .unwrap();
+
+        let plan = plan_legacy_path_repair(
+            &base,
+            &dir,
+            &store.list_clips().unwrap(),
+            &store.list_sessions().unwrap(),
+            |p| p.exists(),
+        );
+
+        assert_eq!(plan.clips.len(), 1);
+        assert_eq!(plan.clips[0].0, id);
+        assert_eq!(plan.clips[0].1, old.to_string_lossy());
+    }
+
+    #[test]
+    fn session_paths_are_repaired_too() {
+        let (_tmp, base, dir) = legacy_case();
+        std::fs::create_dir_all(dir.join("sessions/session-1")).unwrap();
+        std::fs::write(dir.join("sessions/session-1.mp4"), b"v").unwrap();
+        let old_scratch = base.join("localplay/sessions/session-1");
+        let old_final = base.join("localplay/sessions/session-1.mp4");
+        let sessions = [session_at(
+            9,
+            old_scratch.to_str().unwrap(),
+            Some(old_final.to_str().unwrap()),
+        )];
+
+        let plan = plan_legacy_path_repair(&base, &dir, &[], &sessions, |p| p.exists());
+
+        assert_eq!(plan.len(), 2);
+        assert_eq!(
+            plan.session_finals[0].2,
+            dir.join("sessions/session-1.mp4").to_string_lossy()
+        );
+        assert_eq!(
+            plan.session_scratch[0].2,
+            dir.join("sessions/session-1").to_string_lossy()
+        );
+    }
+
+    #[test]
+    fn the_old_root_is_matched_by_whole_components_and_by_case_on_windows() {
+        let root = Path::new("/data/localplay");
+        assert_eq!(
+            strip_root(Path::new("/data/localplay/clips/a.mp4"), root, false),
+            Some(PathBuf::from("clips/a.mp4"))
+        );
+        assert_eq!(strip_root(Path::new("/data/localplay"), root, false), None);
+        assert_eq!(
+            strip_root(Path::new("/data/localplay2/a.mp4"), root, false),
+            None
+        );
+        assert_eq!(strip_root(Path::new("/data"), root, false), None);
+        assert_eq!(
+            strip_root(Path::new("/data/LocalPlay/a.mp4"), root, false),
+            None,
+            "case matters where the file system's does"
+        );
+        assert_eq!(
+            strip_root(Path::new("/data/LocalPlay/a.mp4"), root, true),
+            Some(PathBuf::from("a.mp4")),
+            "and does not on Windows"
+        );
+    }
+
+    fn index_at(db: &Path) -> replayed_store::Store {
+        let store = replayed_store::Store::open(db).unwrap();
+        store.migrate().unwrap();
+        store
+    }
+
+    fn new_clip_at(path: &Path) -> replayed_store::NewClip {
+        replayed_store::NewClip {
+            path: path.to_path_buf(),
+            started_at_ms: 1,
+            duration_ms: 1_000,
+            size_bytes: 1,
+            codec: "h264".into(),
+        }
+    }
+
+    #[test]
+    fn the_repair_backs_the_index_up_then_rewrites_only_the_rows_it_planned() {
+        let (_tmp, base, dir) = legacy_case();
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+        std::fs::write(dir.join("clips/a.mp4"), b"v").unwrap();
+        let db = dir.join("replayed.db");
+        let store = index_at(&db);
+        let moved = store
+            .insert_clip(&new_clip_at(&base.join("localplay/clips/a.mp4")))
+            .unwrap();
+        // Under the old root but in neither place: stays a missing file for the user to see.
+        let lost = store
+            .insert_clip(&new_clip_at(&base.join("localplay/clips/lost.mp4")))
+            .unwrap();
+
+        let changed = repair_legacy_index_paths(&store, &base, &dir, &db).unwrap();
+
+        assert_eq!(changed, 1);
+        let clips = store.list_clips().unwrap();
+        let path_of = |id: i64| clips.iter().find(|c| c.id == id).unwrap().path.clone();
+        assert_eq!(path_of(moved), dir.join("clips/a.mp4"));
+        assert_eq!(path_of(lost), base.join("localplay/clips/lost.mp4"));
+        assert!(
+            dir.join("replayed.db.pre-path-repair.bak").is_file(),
+            "the index was copied aside first"
+        );
+    }
+
+    #[test]
+    fn a_repair_with_nothing_to_do_makes_no_backup_and_a_failed_backup_rewrites_nothing() {
+        let (_tmp, base, dir) = legacy_case();
+        std::fs::create_dir_all(dir.join("clips")).unwrap();
+        std::fs::write(dir.join("clips/a.mp4"), b"v").unwrap();
+        let db = dir.join("replayed.db");
+        let store = index_at(&db);
+
+        assert_eq!(repair_legacy_index_paths(&store, &base, &dir, &db), Ok(0));
+        assert!(!dir.join("replayed.db.pre-path-repair.bak").exists());
+
+        let old = base.join("localplay/clips/a.mp4");
+        store.insert_clip(&new_clip_at(&old)).unwrap();
+        // The index file the backup would copy is not where it was said to be.
+        let err =
+            repair_legacy_index_paths(&store, &base, &dir, &dir.join("elsewhere.db")).unwrap_err();
+        assert!(err.contains("nothing was rewritten"), "{err}");
+        assert_eq!(
+            store.list_clips().unwrap()[0].path,
+            old,
+            "no backup, no rewrite"
+        );
+    }
+
+    #[test]
+    fn the_index_is_copied_aside_and_a_backup_is_never_overwritten() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = tmp.path().join("replayed.db");
+        std::fs::write(&db, b"index v1").unwrap();
+
+        let first = backup_index_before_repair(&db).unwrap();
+        std::fs::write(&db, b"index v2").unwrap();
+        let second = backup_index_before_repair(&db).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(&first).unwrap(), b"index v1");
+        assert_eq!(std::fs::read(&second).unwrap(), b"index v2");
+        assert_eq!(
+            std::fs::read(&db).unwrap(),
+            b"index v2",
+            "the index itself is unchanged"
+        );
+        assert!(backup_index_before_repair(&tmp.path().join("missing.db")).is_err());
+        assert_eq!(
+            std::fs::read_dir(tmp.path())
+                .unwrap()
+                .filter(|e| e
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("missing"))
+                .count(),
+            0,
+            "a failed backup leaves no empty file behind"
         );
     }
 

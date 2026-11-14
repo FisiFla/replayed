@@ -95,11 +95,20 @@ The 2026-09-23 session failed the frame-rate and CPU criteria (~24 fps against 3
 configured, 1183 of 1814 frames submitted dropped — 65% — and ~50.8% of a core); both are
 now met on the zero-copy path — 59.6 of 60 fps with no dropped frames at 3.1–4.0% of one
 core (§13, §15). That CPU figure is against a *still* screen: the cost is per frame the screen
-presents, so on 2026-10-24 the harness read 6.55% while the display offered 58.5 frames/s, inside
-a bound that scales with the offered rate (§48, issue #93). Everything after the 2026-09-24 session is itemised in the ledger, which
+presents, so on 2026-10-24 the harness read 6.55% while the display offered 58.5 frames/s. The
+harness now judges the flat 5% target only on a quiet screen (15 offered frames/s or fewer) and
+reports a busy screen as *not performed* instead of failing it against a bound fitted to the busy
+runs (§48, §49, §56, issue #93). Everything after the 2026-09-24 session is itemised in the ledger, which
 records what has since been re-measured on Windows and what has not. The *capture path*
 targets Windows only; off Windows the pipeline runs a synthetic stub, so a green `cargo
 test` proves none of the eight acceptance criteria.
+
+**The production-readiness pass after 0.2.1** (a code review of the whole tree and the fixes it
+produced) is described in the `[Unreleased]` section of [`CHANGELOG.md`](CHANGELOG.md) and its
+evidence, with the runs still to be made marked as pending, is in
+[`docs/verification-status.md`](docs/verification-status.md) §56. Its tests pass on the
+development host and on the Windows test machine; **none of it has been run against a real game,
+and a signed update has never been offered to an installed copy.**
 
 ---
 
@@ -239,12 +248,18 @@ icon and its tooltip carry the recording state, and the tray menu shows/hides th
 starts and stops recording, saves a clip now, opens `config.toml` and quits. A chord that
 cannot be registered — another application already owns it, or another replayed does, since
 the CLI and the desktop app cannot both hold one chord — is reported in the window, in the
-tooltip and in the log, and the window keeps working without it. `[app] start_with_system`
-(default `false`) is the Windows Run-key entry.
+tooltip and in the log, and the window keeps working without it. A chord is Ctrl, Alt and Shift
+plus one key: a letter or a digit must carry Ctrl or Alt (Shift alone is not enough, because the
+chord is claimed system-wide), while an F-key may stand alone or with Shift. `[app]
+start_with_system` (default `false`) is the Windows Run-key entry; it starts the app with
+`--background`, so a login start goes to the tray with the window hidden. Quitting from the tray
+stops the recorder and finalises the segment in flight; installing an update asks first, because
+the updater's own exit bypasses that path.
 
 **Game events.** Two local-only sources, no network egress:
 - *League of Legends* — poll `https://127.0.0.1:2999/liveclientdata/allgamedata`
-  (its certificate is issued by a root the client pins) for kills/deaths/objectives.
+  (its certificate is issued by a root the client pins) for kills/deaths/objectives. On by
+  default (`[events] lol_poll_enabled`); it only runs while a recording is running.
 - *CS2 / Dota 2* — a `127.0.0.1`-bound HTTP listener consuming Valve's Game State
   Integration POSTs via a user-installed config file.
 - *Everything else* — the global hotkey path, which needs no integration at all.
@@ -285,7 +300,8 @@ Updates*, and it goes to this project's own GitHub release page — see the
 ```
 replayed/
 ├── .github/workflows/          # CI: tests + cross-check + frontend (macOS), the workspace
-│                               #   test suite (Windows), supply chain + packaging (Ubuntu/Windows)
+│                               #   test suite (Windows), supply chain + packaging (Ubuntu/Windows);
+│                               #   release.yml: gate / build / sign / publish on a version tag
 ├── Cargo.toml                  # workspace manifest
 ├── crates/
 │   ├── capture/                # WGC + WASAPI backends (Windows) behind one trait; stub elsewhere
@@ -300,6 +316,7 @@ replayed/
 │   ├── replayed-cli/          # headless binary: a hotkey driver over `recorder`
 │   └── desktop/
 │       ├── src-tauri/          # Tauri v2 app + IPC command layer over store/recorder
+│       │   └── vendor/         #   patched copies of tao and muda (no SendInput); see its README
 │       └── src/                # Svelte frontend (nav rail, library, clip page, sessions,
 │                                #   storage, health, settings)
 ├── docs/
@@ -310,7 +327,9 @@ replayed/
 │   ├── anti-cheat.md           # the rules for testing next to an anti-cheat
 │   └── runbooks/               # manual (Windows) verification procedures
 ├── xtask/                      # build helpers: `xtask sidecars …`, `xtask probe`, `xtask verify`
-├── scripts/                    # PowerShell glue (run the harness in a desktop session)
+├── scripts/                    # the anti-cheat guards (source + built-binary), the release
+│                               #   scripts and their tests, and the PowerShell glue that runs the
+│                               #   harness in a desktop session
 ├── config.example.toml
 ├── LICENSE-MIT
 ├── LICENSE-APACHE
@@ -320,13 +339,14 @@ replayed/
 Start with [`docs/verification-status.md`](docs/verification-status.md) — the honest
 ledger of what is verified, what is only type-checked, and what is unverified — and
 [`docs/platform-traps.md`](docs/platform-traps.md) for the OS behaviours that have already
-caused two bugs here. The architecture is described above; Phase 1 acceptance is in the runbooks under
+caused bugs here. The architecture is described above; Phase 1 acceptance is in the runbooks under
 [`docs/runbooks/`](docs/runbooks/).
 
 ### Game event integrations (Phase 4)
 
-Two sources, both **loopback-only by construction** and both switched on from `[events]` in
-the config file:
+Two sources, both **loopback-only by construction** and both configured from `[events]` in
+the config file (the League poll is on by default; the GSI listener is on at its default port and
+`gsi_port = 0` turns it off):
 
 - **League of Legends** — polls Riot's Live Client Data API
   (`https://127.0.0.1:2999/liveclientdata/allgamedata`) once a second while a game is
@@ -341,7 +361,9 @@ the config file:
   `gamestate_integration_replayed.cfg`. In the desktop app, **Settings > Game integrations**
   has an Install button that finds the game in your Steam libraries and writes that file into
   its `cfg` folder (after checking the destination stays inside the game's install folder);
-  otherwise copy the generated file there yourself.
+  otherwise copy the generated file there yourself. Each game has its own token; a file installed
+  by an earlier build (one shared token) is refreshed by the desktop app when a recording starts,
+  and has to be installed again with the CLI.
 
 An event takes a clip through **the hotkey's own trigger** — same pre-roll, same post-roll,
 same lossless splice in media time — and writes why it was taken into the `events` table,

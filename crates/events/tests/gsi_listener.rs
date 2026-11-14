@@ -10,7 +10,10 @@
 //! * a wrong token, or no auth block, is rejected and yields nothing (fail closed);
 //! * a wrong token is rejected *before* the body is parsed, however large the body is;
 //! * a malformed body yields nothing, does not panic and does not stop the listener;
-//! * the game is served while a peer holds a connection open;
+//! * the game is served while a peer holds a connection open, however many peers do (they
+//!   cost the listener a slot, never a reader), and while anonymous peers flood it;
+//! * a request a web page made is refused whether or not it carries the token;
+//! * a payload whose `auth` block comes last, behind a large scoreboard, is heard;
 //! * a listener pinned to one game refuses the other game's payload;
 //! * the listener binds loopback only and refuses anything else.
 
@@ -481,7 +484,9 @@ fn the_game_is_served_while_a_peer_holds_a_connection_open() {
     let addr = harness.addr();
 
     let mut held = Vec::new();
-    for _ in 0..gsi::WORKERS - 1 {
+    // More than every reader, every queue slot and every pending slot: eight was enough to starve the
+    // listener it replaced, and a peer that opens sockets is not limited to eight.
+    for _ in 0..(gsi::WORKERS + 2 * gsi::MAX_QUEUED + gsi::MAX_PENDING) * 3 {
         let mut stream = TcpStream::connect(addr).expect("loopback connects");
         // A head that never ends: the reader waits for the rest of it.
         stream
@@ -489,7 +494,11 @@ fn the_game_is_served_while_a_peer_holds_a_connection_open() {
             .expect("the head is sent");
         held.push(stream);
     }
-    // Give the readers a moment to take the connections.
+    // Idle sockets too: connected, and nothing sent at all.
+    for _ in 0..gsi::MAX_PENDING * 2 {
+        held.push(TcpStream::connect(addr).expect("loopback connects"));
+    }
+    // Give the listener a moment to take the connections.
     std::thread::sleep(Duration::from_millis(100));
 
     let started = Instant::now();
@@ -504,6 +513,195 @@ fn the_game_is_served_while_a_peer_holds_a_connection_open() {
 
     // The held connections are closed, so the readers they occupy are free again.
     drop(held);
+}
+
+#[test]
+fn anonymous_traffic_cannot_spend_the_games_share() {
+    // The limiter used to count every connection, so more than 100 a second from anyone
+    // answered the game with 429. Now only requests that do not carry the token are counted,
+    // and the game's lane is its own. Hammer the port from several threads with token-less
+    // POSTs for the whole test, and have the game post throughout.
+    //
+    // The flood's own measure is the `429`s it was answered with, not how many it sent. A `429`
+    // is the listener turning anonymous traffic away (over the budget, or over its capacity), so
+    // at least one shows the flood really pressed on the share the game must keep. A count of
+    // attempts said that on a fast machine and not on a slow one: each flooder waits for its
+    // answer, so when answers are slow the flood is too (159 requests in 2.7 s on a CI runner,
+    // against 650 on a desktop, where about 1000 are now turned away). Twelve flooders keep the
+    // pressure up even then: the listener takes connections in batches, so more of them in
+    // flight is more of them per second.
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flooders: Vec<_> = (0..12)
+        .map(|_| {
+            let stop = std::sync::Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let mut refused = 0u32;
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let answer = TcpStream::connect(addr).and_then(|mut stream| {
+                        stream.write_all(b"POST /gsi HTTP/1.1\r\nContent-Length: 2\r\n\r\n{}")?;
+                        stream.set_read_timeout(Some(Duration::from_millis(200)))?;
+                        let mut sink = [0u8; 64];
+                        let n = stream.read(&mut sink)?;
+                        Ok(sink[..n].to_vec())
+                    });
+                    if answer.is_ok_and(|a| a.starts_with(b"HTTP/1.1 429")) {
+                        refused += 1;
+                    }
+                    // Paced, not unbounded: a tight connect loop exhausts Windows' ephemeral ports
+                    // (and their `TIME_WAIT`) within seconds, and then the *game's* connect fails
+                    // with `AddrInUse` in the test process, which says nothing about the listener.
+                    // Several hundred connections a second is still several times the 100-a-second
+                    // budget the limiter has.
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                refused
+            })
+        })
+        .collect();
+    std::thread::sleep(Duration::from_millis(200));
+
+    // The game posts for at least 2.5 s and at least 25 times, however slow the machine is, so
+    // its posts span the flood by construction. A count of posts within the 2.5 s was a speed
+    // bound in disguise (about 100 ms a post), which a loaded CI runner missed although every
+    // post was still served. What the game needs is the answer before its own timeout: the
+    // `"timeout" "1.0"` the integration file gives it (`gsi::integration`), after which it
+    // gives up on that update.
+    const GAME_TIMEOUT: Duration = Duration::from_secs(1);
+    let started = Instant::now();
+    let mut statuses = Vec::new();
+    let mut waits = Vec::new();
+    while started.elapsed() < Duration::from_millis(2500) || statuses.len() < 25 {
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "the game's 25 posts took over a minute: {waits:?}"
+        );
+        let sent = Instant::now();
+        statuses.push(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)));
+        waits.push(sent.elapsed());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let refused: u32 = flooders.into_iter().map(|f| f.join().unwrap()).sum();
+    assert!(
+        refused > 0,
+        "none of the flood was turned away with 429, so it never pressed on the game's share \
+         (the anonymous budget is {} a second)",
+        gsi::MAX_REQUESTS_PER_WINDOW
+    );
+    assert!(
+        statuses.iter().all(|s| *s == 200),
+        "every one of the game's POSTs was served, none was a 429: {statuses:?}"
+    );
+    assert!(
+        waits.iter().all(|w| *w < GAME_TIMEOUT),
+        "every one of the game's POSTs was answered within its {GAME_TIMEOUT:?} timeout: {waits:?}"
+    );
+    assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
+}
+
+#[test]
+fn a_request_split_across_packets_is_still_the_games_request() {
+    // The listener collects a request without blocking, so a head and a body that arrive
+    // apart (the game's HTTP client may write them separately) must still be one request.
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let body = CS2_COMPETITIVE;
+    let head = format!(
+        "POST /gsi HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    let (first, second) = body.as_bytes().split_at(body.len() / 2);
+    stream.write_all(first).unwrap();
+    stream.flush().unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    stream.write_all(second).unwrap();
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).unwrap();
+    assert_eq!(status_of(&String::from_utf8_lossy(&raw)), 200);
+    assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
+}
+
+#[test]
+fn a_stalled_request_is_answered_at_the_deadline_and_holds_nothing() {
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let mut stalled = TcpStream::connect(addr).unwrap();
+    stalled
+        .set_read_timeout(Some(gsi::REQUEST_TIMEOUT * 3))
+        .unwrap();
+    stalled
+        .write_all(b"POST /gsi HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 50\r\n\r\n{}")
+        .unwrap();
+    let started = Instant::now();
+    let mut raw = Vec::new();
+    stalled.read_to_end(&mut raw).unwrap();
+    let elapsed = started.elapsed();
+    assert_eq!(
+        status_of(&String::from_utf8_lossy(&raw)),
+        413,
+        "a body shorter than it claims"
+    );
+    assert!(
+        elapsed >= gsi::REQUEST_TIMEOUT - Duration::from_millis(200)
+            && elapsed < gsi::REQUEST_TIMEOUT + Duration::from_secs(1),
+        "answered at the deadline, not before and not long after: {elapsed:?}"
+    );
+}
+
+#[test]
+fn a_request_a_web_page_made_is_refused_even_with_the_right_token() {
+    // `fetch(..., {mode: 'no-cors'})` from any page sends Sec-Fetch-* headers that the page
+    // cannot remove. The game never does, so these are refused outright and cost no budget.
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let body = CS2_COMPETITIVE;
+    let request = format!(
+        "POST /gsi HTTP/1.1\r\nHost: {addr}\r\nOrigin: https://example.test\r\n\
+         Sec-Fetch-Site: cross-site\r\nSec-Fetch-Mode: no-cors\r\nSec-Fetch-Dest: empty\r\n\
+         Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    assert_eq!(status_of(&raw_request(addr, request.as_bytes())), 403);
+    assert!(
+        harness.drained().is_empty(),
+        "a page's request derives nothing, token or not"
+    );
+    // Many of them leave the game's budget alone.
+    for _ in 0..gsi::MAX_REQUESTS_PER_WINDOW * 2 {
+        assert_eq!(status_of(&raw_request(addr, request.as_bytes())), 403);
+    }
+    assert_eq!(status_of(&post(addr, "/gsi", CS2_COMPETITIVE)), 200);
+}
+
+#[test]
+fn a_payload_whose_auth_block_is_last_behind_a_large_scoreboard_is_heard() {
+    // The game writes `auth` after the other blocks. The token probe used to read 64 KiB and
+    // stop, so a payload bigger than that was answered 400 and the game went silent.
+    let harness = Harness::start();
+    let addr = harness.addr();
+    let mut body = without_auth(CS2_COMPETITIVE);
+    let close = body.rfind('}').expect("a JSON object");
+    let mut padding = String::from(r#","allgrenades":["#);
+    while padding.len() < 200 * 1024 {
+        padding.push_str(r#"{"type":"flashbang","owner":"76561198000000000"},"#);
+    }
+    padding.push_str(r#"{}]"#);
+    body.truncate(close);
+    body.push_str(&padding);
+    body.push_str(&format!(r#","auth":{{"token":"{TOKEN}"}}}}"#));
+    assert!(body.len() > 64 * 1024 && body.find("\"auth\"").unwrap() > 64 * 1024);
+
+    assert_eq!(status_of(&post(addr, "/gsi", &body)), 200);
+    assert_eq!(kinds(&harness.drained()), vec![EventKind::GameStart]);
 }
 
 #[test]

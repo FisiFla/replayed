@@ -24,8 +24,9 @@
 //! signatures other crates build against. [`crate::cleanup::DeletionReasons`] is reused verbatim,
 //! so both plans explain themselves identically.
 
-use crate::cleanup::{plan_cleanup, CleanupPolicy, DeletionReasons};
-use crate::{Clip, Session, Store};
+use crate::cleanup::{plan_cleanup, CleanupOutcome, CleanupPolicy, DeletionReasons};
+use crate::roots::{Gate, Target};
+use crate::{Clip, Eviction, LibraryRoots, Session, Store, Tombstone};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
@@ -38,11 +39,32 @@ const MS_PER_DAY: i64 = 24 * 60 * 60 * 1_000;
 pub struct RetentionRules {
     /// Total bytes this class may occupy, favourites included. An unsatisfiable cap is reported,
     /// never paid for out of the class's other artefacts (see [`ClassPlan::over_cap_by_bytes`]).
+    /// Must be non-zero (see [`RetentionRules::validate`]).
     pub max_total_bytes: u64,
     /// A member of the class older than this many days is deleted, unless it is a favourite (or, for
-    /// a session, still recording). As in [`CleanupPolicy::max_age_days`], `0` means everything older
-    /// than `now_ms`, and the comparison is strictly greater.
+    /// a session, still recording). The comparison is strictly greater. Must be non-zero (see
+    /// [`RetentionRules::validate`]).
     pub max_age_days: u32,
+}
+
+impl RetentionRules {
+    /// Refuse a zero limit, for the reason [`CleanupPolicy::validate`] gives: a `0` that deletes
+    /// everything is not a retention rule, and "plan nothing" is the only fail-closed reading.
+    pub fn validate(&self) -> Result<()> {
+        clip_rules(*self).validate()
+    }
+}
+
+impl RetentionPolicy {
+    /// Refuse a policy in which either class has a zero limit.
+    pub fn validate(&self) -> Result<()> {
+        self.clips
+            .validate()
+            .map_err(|err| err.context("the clips rules"))?;
+        self.sessions
+            .validate()
+            .map_err(|err| err.context("the sessions rules"))
+    }
 }
 
 /// Sessions and clips are evicted independently: a session store at 100 GB must not push clips
@@ -239,6 +261,19 @@ fn clip_rules(rules: RetentionRules) -> CleanupPolicy {
 /// [`plan_retention`] for what a session adds: a different LRU instant, whole-session units, and
 /// immunity while recording.
 fn plan_sessions(sessions: &[Session], rules: &RetentionRules, now_ms: i64) -> ClassPlan {
+    if let Err(reason) = rules.validate() {
+        tracing::warn!(
+            "retention: the sessions rules are invalid and no session will be deleted: {reason:#}"
+        );
+        return ClassPlan {
+            deletions: Vec::new(),
+            cap_bytes: rules.max_total_bytes,
+            bytes_after: sessions.iter().fold(0, |total, s| {
+                total.saturating_add(s.size_bytes.max(0) as u64)
+            }),
+            over_cap_by_bytes: 0,
+        };
+    }
     let max_age_ms = (rules.max_age_days as i64).saturating_mul(MS_PER_DAY);
 
     // Oldest-started first, deterministic under ties. Both rules walk this one order.
@@ -338,9 +373,18 @@ pub struct ClassOutcome {
     /// class (a scratch directory that is a symlink, a bare relative name, a filesystem root). The
     /// path stays on disk, the row is already gone, and the caller is told.
     pub refused: Vec<PathBuf>,
-    /// Total size of the class after the pass, re-read from the database.
+    /// Planned deletions skipped because the member became a favourite after the plan was made. The
+    /// row and its files are untouched.
+    pub protected: usize,
+    /// Size of the planned population after the pass: the plan's forecast plus the bytes of every
+    /// planned deletion that did not happen (failed, or protected since planning).
+    ///
+    /// Not a re-read of every row in the database: the plan is made over the rows whose file exists,
+    /// and a re-read that counted the rest again made `cap_met` false, and the caller's "the cap
+    /// cannot be satisfied" warning wrong, for a class the pass had brought under its cap.
     pub bytes_after: u64,
-    /// Whether the class is at or under the plan's cap after the pass, measured rather than forecast.
+    /// Whether the planned population is at or under the plan's cap after the pass, measured
+    /// against what the pass actually did rather than forecast.
     pub cap_met: bool,
 }
 
@@ -378,31 +422,62 @@ impl RetentionOutcome {
     }
 }
 
-/// Apply a retention plan: for every deletion, delete the row and commit, then remove what that
-/// committed delete handed back.
+/// Apply a retention plan: for every deletion, evict the row and commit, then remove what that
+/// committed eviction handed back.
 ///
-/// The same safety property as [`crate::cleanup::execute_cleanup`]: delete the row via
-/// [`Store::delete_clip_returning_path`], which returns a path only when its own `DELETE` removed
-/// a row, then unlink that path and nothing else. A file is removed because a committed row named
-/// it, never on a plan's say-so.
+/// The same safety properties as [`crate::cleanup::execute_cleanup`], which this extends to
+/// sessions:
 ///
-/// For a session the row delete is [`Store::delete_session_returning_paths`], returning two things:
+/// * **Row first, file second, and the second step is retried.** [`Store::evict_clip`] and
+///   [`Store::evict_session`] delete the row and queue its paths in `pending_deletes` in one
+///   transaction. A path that cannot be removed (open in another program, an I/O error) stays
+///   queued and is retried at the start of the next pass, whatever that pass's plan holds, so a
+///   file can no longer escape the index and the cap for good.
+/// * **Favourites survive a race.** The eviction refuses a favourite under the lock it deletes
+///   under; a member starred after the plan was made is counted in [`ClassOutcome::protected`].
+/// * **Only what the library owns is removed.** Every path must be inside `roots` (see
+///   [`LibraryRoots`]): a clip's file inside the clips directory, a session's file inside the
+///   sessions directory, a session's scratch directory a `session-<digits>[-<digits>]` child of it.
+///   Anything else is [`ClassOutcome::refused`]: the row is gone, the path is untouched.
+/// * **The shared scratch directory is never touched.** A replay-buffer row names the ring's one
+///   shared `[buffer].scratch_dir`, which the row does not own; the eviction queues no scratch
+///   removal for it, and containment would refuse it anyway.
 ///
-/// * the final file, removed like a clip's, with a failed or already-missing removal reported alike;
-/// * the scratch directory, removed as a tree. That is the most destructive operation in this
-///   crate, so it is guarded: the path must look like a directory this application could have
-///   created (non-empty, with a final component, a real directory rather than a symlink) before
-///   anything inside is touched (see [`remove_scratch_dir`]). A refused path is reported in
-///   [`ClassOutcome::refused`] and left as is.
+/// The scratch directory, removed as a tree, is still the most destructive operation in this crate,
+/// so on top of containment [`remove_scratch_dir`] requires a real directory rather than a symlink.
 ///
-/// A session still recording cannot reach the removal code: the store refuses its row delete,
-/// which counts as a failed deletion and is logged. The planner never selects one, so that means
-/// a hand-built plan or one held across the moment the session started; both warrant a warning, not a crash.
+/// A session still recording cannot reach the removal code: the store refuses its eviction, which
+/// counts as a failed deletion and is logged. The planner never selects one, so that means a
+/// hand-built plan or one held across the moment the session started.
 ///
 /// Errors are per-row: a failed row is counted in [`ClassOutcome::failed`] and logged instead of
-/// ending the pass. The returned `Err` is reserved for the final re-read of the store.
-pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<RetentionOutcome> {
+/// ending the pass. The returned `Err` is reserved for failures this function cannot attribute to a row.
+pub fn execute_retention(
+    store: &Store,
+    plan: &RetentionPlan,
+    roots: &LibraryRoots,
+) -> Result<RetentionOutcome> {
     let mut outcome = RetentionOutcome::default();
+
+    // First, what earlier passes could not finish. The clip class's and the session class's
+    // leftovers are reported in their own class.
+    match store.pending_deletes() {
+        Ok(pending) => {
+            for tombstone in &pending {
+                let class = match tombstone.target {
+                    Target::ClipFile => &mut outcome.clips,
+                    Target::SessionFile | Target::SessionDir => &mut outcome.sessions,
+                };
+                let removal = settle(store, roots, tombstone);
+                record(class, &tombstone.path, removal, None);
+            }
+        }
+        Err(err) => tracing::warn!("retention: could not read the queued removals: {err:#}"),
+    }
+
+    // The planned bytes still in each class at the end: failed and protected deletions.
+    let mut clips_unreclaimed: u64 = 0;
+    let mut sessions_unreclaimed: u64 = 0;
 
     // Clips first, then sessions: the plan's order, which leaves a session's links to its clips detached by the time the clips go.
     for entry in &plan.clips.deletions {
@@ -415,14 +490,26 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
             outcome.clips.failed += 1;
             continue;
         };
-        match store.delete_clip_returning_path(id) {
-            Ok(Some(path)) => {
-                // That DELETE ran in autocommit: it is committed before this line.
+        match store.evict_clip(id) {
+            Ok(Eviction::Evicted(tombstone)) => {
+                // Committed before this line, together with the queued path.
                 outcome.clips.deleted += 1;
-                let path = PathBuf::from(path);
-                record(&mut outcome.clips, &path, unlink(&path), entry.size_bytes);
+                let removal = settle(store, roots, &tombstone);
+                record(
+                    &mut outcome.clips,
+                    &tombstone.path,
+                    removal,
+                    Some(entry.size_bytes),
+                );
             }
-            Ok(None) => {
+            Ok(Eviction::Protected) => {
+                tracing::info!(
+                    "retention: clip #{id} became a favourite after the plan was made; it was kept"
+                );
+                outcome.clips.protected += 1;
+                clips_unreclaimed = clips_unreclaimed.saturating_add(entry.size_bytes);
+            }
+            Ok(Eviction::Gone) => {
                 tracing::debug!(
                     "retention: clip #{id} had no row left to delete; nothing was removed"
                 );
@@ -430,6 +517,7 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
             Err(err) => {
                 tracing::warn!("retention: could not delete the row for clip #{id}: {err:#}");
                 outcome.clips.failed += 1;
+                clips_unreclaimed = clips_unreclaimed.saturating_add(entry.size_bytes);
             }
         }
     }
@@ -444,46 +532,48 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
             outcome.sessions.failed += 1;
             continue;
         };
-        let paths = match store.delete_session_returning_paths(id) {
-            Ok(Some(paths)) => paths,
-            Ok(None) => {
+        match store.evict_session(id) {
+            Ok(Eviction::Evicted(tombstones)) => {
+                // Committed before this line, together with the queued paths.
+                outcome.sessions.deleted += 1;
+                for tombstone in &tombstones {
+                    let removal = settle(store, roots, tombstone);
+                    record(
+                        &mut outcome.sessions,
+                        &tombstone.path,
+                        removal,
+                        Some(entry.size_bytes),
+                    );
+                }
+            }
+            Ok(Eviction::Protected) => {
+                tracing::info!(
+                    "retention: session #{id} became a favourite after the plan was made; it was kept"
+                );
+                outcome.sessions.protected += 1;
+                sessions_unreclaimed = sessions_unreclaimed.saturating_add(entry.size_bytes);
+            }
+            Ok(Eviction::Gone) => {
                 tracing::debug!(
                     "retention: session #{id} had no row left to delete; nothing was removed"
                 );
-                continue;
             }
             Err(err) => {
                 // The expected reason is the store refusing a session still recording; any other is a real
                 // failure. Either way the session is left whole, the safe direction.
                 tracing::warn!("retention: session #{id} was not deleted: {err:#}");
                 outcome.sessions.failed += 1;
-                continue;
+                sessions_unreclaimed = sessions_unreclaimed.saturating_add(entry.size_bytes);
             }
-        };
-        // Committed before this line, as for a clip.
-        outcome.sessions.deleted += 1;
-
-        if let Some(final_path) = paths.final_path.as_deref() {
-            let final_path = PathBuf::from(final_path);
-            record(
-                &mut outcome.sessions,
-                &final_path,
-                unlink(&final_path),
-                entry.size_bytes,
-            );
         }
-        let scratch = PathBuf::from(&paths.scratch_dir);
-        record(
-            &mut outcome.sessions,
-            &scratch,
-            remove_scratch_dir(&scratch),
-            entry.size_bytes,
-        );
     }
 
-    outcome.clips.bytes_after = store.total_bytes()?;
+    outcome.clips.bytes_after = plan.clips.bytes_after.saturating_add(clips_unreclaimed);
     outcome.clips.cap_met = outcome.clips.bytes_after <= plan.clips.cap_bytes;
-    outcome.sessions.bytes_after = store.total_session_bytes()?;
+    outcome.sessions.bytes_after = plan
+        .sessions
+        .bytes_after
+        .saturating_add(sessions_unreclaimed);
     outcome.sessions.cap_met = outcome.sessions.bytes_after <= plan.sessions.cap_bytes;
     Ok(outcome)
 }
@@ -492,7 +582,7 @@ pub fn execute_retention(store: &Store, plan: &RetentionPlan) -> Result<Retentio
 ///
 /// Not `PartialEq`: `Removal::Failed` carries an `io::Error`, which does not compare. Tests match on the variant.
 #[derive(Debug)]
-enum Removal {
+pub(crate) enum Removal {
     /// Removed. The `u64` is what it actually held, measured from the disk first.
     Removed(u64),
     /// Not there in the first place.
@@ -507,13 +597,14 @@ enum Removal {
 /// Every non-removal lands in one of the three path lists, so an outcome is a complete account of
 /// what a pass could not remove, not dependent on a log line nobody reads.
 ///
-/// `planned_bytes` only feeds a debug line noticing a file differed from its row; the bytes
-/// counted into `bytes_reclaimed` are the measured ones.
-fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_bytes: u64) {
+/// `planned_bytes` only feeds a debug line noticing a file differed from its row (and is `None` for
+/// a removal retried from the queue, which has no row to compare with); the bytes counted into
+/// `bytes_reclaimed` are the measured ones.
+fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_bytes: Option<u64>) {
     match removal {
         Removal::Removed(actual) => {
             outcome.bytes_reclaimed = outcome.bytes_reclaimed.saturating_add(actual);
-            if actual != planned_bytes {
+            if let Some(planned_bytes) = planned_bytes.filter(|planned| *planned != actual) {
                 tracing::debug!(
                     "retention: removed {actual} bytes from {} where the row claimed \
                      {planned_bytes}",
@@ -538,13 +629,74 @@ fn record(outcome: &mut ClassOutcome, path: &Path, removal: Removal, planned_byt
         }
         Removal::Failed(err) => {
             tracing::warn!(
-                "retention: a deleted row named {} and it could not be removed ({err}); it is \
-                 orphaned on disk and needs a sweep",
+                "retention: a deleted row named {} and it could not be removed ({err}); it stays \
+                 queued and the next pass retries it",
                 path.display()
             );
             outcome.orphaned.push(path.to_path_buf());
         }
     }
+}
+
+/// [`record`] for the flat clips executor, whose outcome has no per-class lists to share.
+pub(crate) fn record_cleanup(
+    outcome: &mut CleanupOutcome,
+    path: &Path,
+    removal: Removal,
+    planned_bytes: Option<u64>,
+) {
+    let mut class = ClassOutcome::default();
+    record(&mut class, path, removal, planned_bytes);
+    outcome.bytes_reclaimed = outcome
+        .bytes_reclaimed
+        .saturating_add(class.bytes_reclaimed);
+    outcome.orphaned.extend(class.orphaned);
+    outcome.already_missing.extend(class.already_missing);
+    outcome.refused.extend(class.refused);
+}
+
+/// Remove `path` as what `target` says it is, once `roots` vouch for it.
+///
+/// The one function every removal passes through: the containment decision comes first, and only a
+/// path it admits reaches [`unlink`] or [`remove_scratch_dir`], which keep their own, narrower
+/// checks as a second line.
+fn remove_admitted(roots: &LibraryRoots, target: Target, path: &Path) -> Removal {
+    match roots.admit(target, path) {
+        Ok(()) => match target {
+            Target::ClipFile | Target::SessionFile => unlink(path),
+            Target::SessionDir => remove_scratch_dir(path),
+        },
+        Err(Gate::Missing) => Removal::Missing,
+        Err(Gate::Refused(reason)) => Removal::Refused(reason),
+        Err(Gate::Failed(err)) => Removal::Failed(err),
+    }
+}
+
+/// Carry out one queued removal and, unless it is worth retrying, take it off the queue.
+///
+/// Removed, already missing and refused all end the entry: the first two are done, and a refusal
+/// (a path outside the library, relative, a symlinked directory) will be the same next pass, so
+/// retrying it for ever would only repeat the warning. Only a *failure* stays queued.
+///
+/// A path a live row names again is refused and dequeued without being touched: the same file name
+/// re-recorded while the old removal kept failing is somebody's footage once more.
+pub(crate) fn settle(store: &Store, roots: &LibraryRoots, tombstone: &Tombstone) -> Removal {
+    let removal = match store.path_is_indexed(tombstone.target, &tombstone.path) {
+        Ok(true) => Removal::Refused("a live row names it again, so it is footage once more"),
+        Ok(false) => remove_admitted(roots, tombstone.target, &tombstone.path),
+        Err(err) => Removal::Failed(std::io::Error::other(format!(
+            "could not check whether the index still names it: {err:#}"
+        ))),
+    };
+    if !matches!(removal, Removal::Failed(_)) {
+        if let Err(err) = store.forget_pending(tombstone.id) {
+            tracing::warn!(
+                "retention: could not take {} off the queue of removals: {err:#}",
+                tombstone.path.display()
+            );
+        }
+    }
+    removal
 }
 
 /// Remove one regular file, measuring what actually went away.
@@ -588,8 +740,8 @@ fn unlink(path: &Path) -> Removal {
 /// [`Removal::Missing`], an ordinary end state (a session-mode recorder may remove its own
 /// scratch directory once the final file exists), not a refusal.
 ///
-/// The tree is measured before removal, and a tree that cannot be measured is not removed: an
-/// unreadable directory is a question for a human.
+/// The tree is measured before removal, best-effort: the measurement is for the report and never
+/// decides whether the tree goes (see [`tree_bytes`]).
 fn remove_scratch_dir(path: &Path) -> Removal {
     if path.as_os_str().is_empty() || path.file_name().is_none() {
         return Removal::Refused(
@@ -610,10 +762,9 @@ fn remove_scratch_dir(path: &Path) -> Removal {
     if !meta.is_dir() {
         return Removal::Refused("it is not a directory");
     }
-    let bytes = match tree_bytes(path) {
-        Ok(bytes) => bytes,
-        Err(err) => return Removal::Failed(err),
-    };
+    // Measured for the report only: a size that cannot be read must never be the reason a tree
+    // whose row is already gone stays on disk, so an unreadable entry counts as zero.
+    let bytes = tree_bytes(path);
     match std::fs::remove_dir_all(path) {
         Ok(()) => Removal::Removed(bytes),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Removal::Missing,
@@ -623,22 +774,26 @@ fn remove_scratch_dir(path: &Path) -> Removal {
 
 /// The bytes a directory tree holds: every regular file in it, to any depth. Symlinks count as
 /// zero and are never followed; a symlink is a path elsewhere, not bytes this application wrote.
-fn tree_bytes(path: &Path) -> std::io::Result<u64> {
-    let meta = std::fs::symlink_metadata(path)?;
-    if meta.is_symlink() {
-        return Ok(0);
-    }
+///
+/// Best-effort by design: this number only feeds the report, so an entry that cannot be read (it
+/// vanished mid-walk, permissions) counts as zero instead of failing the whole measurement, which
+/// used to leave a multi-gigabyte tree orphaned after its row was already deleted.
+fn tree_bytes(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
     if meta.is_file() {
-        return Ok(meta.len());
+        return meta.len();
     }
     if !meta.is_dir() {
-        return Ok(0);
+        return 0;
     }
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(path)? {
-        total = total.saturating_add(tree_bytes(&entry?.path())?);
-    }
-    Ok(total)
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    entries.flatten().fold(0, |total, entry| {
+        total.saturating_add(tree_bytes(&entry.path()))
+    })
 }
 
 #[cfg(test)]
@@ -664,6 +819,11 @@ mod tests {
     /// A cap nothing reaches and an age nothing exceeds: the plan must be a no-op.
     fn generous() -> RetentionRules {
         rules(u64::MAX, 3_650)
+    }
+
+    /// Rules that select a 400-day-old member by age alone: a positive cap nothing reaches, a 30-day limit.
+    fn generous_aged() -> RetentionRules {
+        rules(u64::MAX, 30)
     }
 
     fn clip(id: i64, created_at_ms: i64, size_bytes: u64, favourite: bool) -> Clip {
@@ -757,13 +917,44 @@ mod tests {
     }
 
     #[test]
+    fn a_zero_limit_in_either_class_plans_nothing_for_that_class() {
+        let now = 1_000 * DAY;
+        let clips = vec![clip(1, now - 400 * DAY, 100, false)];
+        let sessions = vec![session(7, now - 400 * DAY, 900, false)];
+
+        for zero in [rules(0, 30), rules(1_000, 0)] {
+            assert!(zero.validate().is_err());
+            let plan = plan_retention(&clips, &sessions, &policy(zero, generous_aged()), now);
+            assert!(
+                plan.clips.deletions.is_empty(),
+                "{zero:?} clips: fail closed"
+            );
+            assert_eq!(
+                plan.sessions.ids(),
+                vec![7],
+                "the other class is unaffected"
+            );
+
+            let plan = plan_retention(&clips, &sessions, &policy(generous_aged(), zero), now);
+            assert!(
+                plan.sessions.deletions.is_empty(),
+                "{zero:?} sessions: fail closed"
+            );
+            assert_eq!(plan.clips.ids(), vec![1]);
+            assert_eq!(plan.sessions.bytes_after, 900);
+        }
+        assert!(policy(rules(1, 1), rules(1, 1)).validate().is_ok());
+        assert!(policy(rules(0, 1), rules(1, 1)).validate().is_err());
+    }
+
+    #[test]
     fn the_two_classes_are_independent_in_both_directions() {
         let now = 1_000 * DAY;
         let clips = vec![clip(1, now - 40 * DAY, 100, false)];
         let sessions = vec![session(7, now - 40 * DAY, 900, false)];
 
-        // A sessions cap of zero must not evict a clip, however small the clips library.
-        let plan = plan_retention(&clips, &sessions, &policy(generous(), rules(0, 3_650)), now);
+        // A sessions cap smaller than any session must not evict a clip, however small the clips library.
+        let plan = plan_retention(&clips, &sessions, &policy(generous(), rules(1, 3_650)), now);
         assert_eq!(plan.sessions.ids(), vec![7]);
         assert!(
             plan.clips.deletions.is_empty(),
@@ -771,7 +962,7 @@ mod tests {
         );
 
         // And a clips cap of zero must not evict a session.
-        let plan = plan_retention(&clips, &sessions, &policy(rules(0, 3_650), generous()), now);
+        let plan = plan_retention(&clips, &sessions, &policy(rules(1, 3_650), generous()), now);
         assert_eq!(plan.clips.ids(), vec![1]);
         assert!(
             plan.sessions.deletions.is_empty(),
@@ -958,7 +1149,7 @@ mod tests {
             session(2, now - 39 * DAY, 100, false),
         ];
 
-        let plan = plan_retention(&[], &sessions, &policy(generous(), rules(0, 3_650)), now);
+        let plan = plan_retention(&[], &sessions, &policy(generous(), rules(1, 3_650)), now);
 
         assert_eq!(plan.sessions.ids(), vec![1, 2]);
         assert_eq!(
@@ -986,6 +1177,11 @@ mod tests {
         let store = Store::open_in_memory().expect("an in-memory store");
         store.migrate().expect("migrate");
         store
+    }
+
+    // Roots that nothing in these in-memory tests reaches: the rows name paths that do not exist.
+    fn roots() -> LibraryRoots {
+        LibraryRoots::new("/no-such-clips-dir", "/no-such-sessions-dir")
     }
 
     #[test]
@@ -1016,7 +1212,7 @@ mod tests {
             sessions: ClassPlan::default(),
         };
 
-        let outcome = execute_retention(&store, &plan).expect("the pass completes");
+        let outcome = execute_retention(&store, &plan, &roots()).expect("the pass completes");
 
         assert_eq!(outcome.clips.deleted, 0);
         assert_eq!(
@@ -1061,7 +1257,7 @@ mod tests {
             },
         };
 
-        let outcome = execute_retention(&store, &plan).expect("the pass completes");
+        let outcome = execute_retention(&store, &plan, &roots()).expect("the pass completes");
 
         assert_eq!(outcome.sessions.deleted, 0);
         assert_eq!(
@@ -1107,7 +1303,7 @@ mod tests {
             .expect("delete it")
             .is_some());
 
-        let outcome = execute_retention(&store, &plan).expect("the pass completes");
+        let outcome = execute_retention(&store, &plan, &roots()).expect("the pass completes");
 
         assert_eq!(outcome.sessions.deleted, 0);
         assert_eq!(

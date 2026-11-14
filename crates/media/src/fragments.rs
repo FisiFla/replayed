@@ -39,9 +39,15 @@ pub struct Fragment {
     pub duration_ms: u64,
     /// The bytes: this fragment's `moof` and its `mdat`, and nothing else.
     pub bytes: Vec<u8>,
-    /// Whether the fragment starts on a keyframe. Always `true` for fragments this splitter
-    /// produces (`frag_keyframe`), but carried so the code picking a clip's first fragment asserts
-    /// it: a clip beginning mid-GOP would play garbage first.
+    /// Whether the fragment's first video sample is a sync (key) sample, read from the fragment's own
+    /// `trun`/`tfhd` sample flags, so the code picking a clip's first fragment can assert it: a clip
+    /// beginning mid-GOP would play garbage first.
+    ///
+    /// `frag_keyframe` makes this `true` for the stream this pipeline asks ffmpeg for, but it is
+    /// measured rather than assumed: a constant would make the assertion built on it unable to fail,
+    /// and a muxer flag change would then go unnoticed until clips opened on grey frames. A fragment
+    /// whose flags cannot be read is `false`: a start that cannot be shown to be a keyframe is not
+    /// claimed to be one.
     pub keyframe: bool,
 }
 
@@ -58,10 +64,10 @@ pub struct FragmentSplitter {
     /// track's own timescale (15360 for video, 48000 for audio in one measured stream), and the
     /// video one is the clock a clip's range is measured on.
     tracks: HashMap<u32, (bool, u32)>,
-    /// A `moof` whose `mdat` has not arrived yet, with the start time and sample span read out of
-    /// it. The duration is read here because it is in the same `moof`, and reading it at assembly
-    /// would leave the ring guessing.
-    pending: Option<(u64, u64, Vec<u8>)>,
+    /// A `moof` whose `mdat` has not arrived yet, with the start time, sample span and keyframe flag
+    /// read out of it. The duration is read here because it is in the same `moof`, and reading it at
+    /// assembly would leave the ring guessing.
+    pending: Option<(Placement, Vec<u8>)>,
     next_seq: u64,
 }
 
@@ -135,11 +141,11 @@ impl FragmentSplitter {
                              received its `mdat`, so its samples cannot be recovered"
                         );
                     }
-                    let (start_ms, duration_ms) = self.placement(&body)?;
-                    self.pending = Some((start_ms, duration_ms, body));
+                    let placement = self.placement(&body)?;
+                    self.pending = Some((placement, body));
                 }
                 "mdat" => {
-                    let Some((start_ms, duration_ms, moof)) = self.pending.take() else {
+                    let Some((placement, moof)) = self.pending.take() else {
                         // A bare `mdat` with no `moof` is not a fragment. Not an error (`free`/`skip` boxes and other
                         // muxer furniture are legal at top level) but not footage, so it is dropped.
                         continue;
@@ -148,11 +154,10 @@ impl FragmentSplitter {
                     bytes.extend_from_slice(&body);
                     out.push(Fragment {
                         seq: self.next_seq,
-                        start_ms,
-                        duration_ms,
+                        start_ms: placement.start_ms,
+                        duration_ms: placement.duration_ms,
                         bytes,
-                        // See `Fragment::keyframe`: `frag_keyframe` guarantees it.
-                        keyframe: true,
+                        keyframe: placement.keyframe,
                     });
                     self.next_seq += 1;
                 }
@@ -163,9 +168,9 @@ impl FragmentSplitter {
         Ok(out)
     }
 
-    /// The `tfdt` of a fragment's **video** track (its start, in ms) and how long its video
-    /// samples span (its duration, in ms).
-    fn placement(&self, moof: &[u8]) -> Result<(u64, u64)> {
+    /// The `tfdt` of a fragment's **video** track (its start, in ms), how long its video samples
+    /// span (its duration, in ms) and whether its first video sample is a keyframe.
+    fn placement(&self, moof: &[u8]) -> Result<Placement> {
         for traf in children(moof, 8, "traf") {
             let Some(track_id) = track_id(traf) else {
                 continue;
@@ -186,12 +191,24 @@ impl FragmentSplitter {
             // an untrusted segment: held, not measured.
             let duration_ms =
                 sample_span_ticks(traf).map_or(0, |t| t.saturating_mul(1_000) / scale);
-            return Ok((start_ms, duration_ms));
+            return Ok(Placement {
+                start_ms,
+                duration_ms,
+                keyframe: first_sample_is_sync(traf).unwrap_or(false),
+            });
         }
         // A fragment with no video track is not something this pipeline produces (video is input 0 and
         // always mapped), so it is a malformed stream rather than a case to guess at.
         bail!("no video `tfdt` in this fragment: its start time cannot be placed on the timeline")
     }
+}
+
+/// What a `moof` says about where its fragment sits and how it starts.
+#[derive(Debug, Clone, Copy)]
+struct Placement {
+    start_ms: u64,
+    duration_ms: u64,
+    keyframe: bool,
 }
 
 /// The kind and declared size of the box at the front of `buf`, or `None` if fewer than eight
@@ -399,6 +416,65 @@ fn sample_span_ticks(traf: &[u8]) -> Option<u64> {
     default_duration.map(|d| u64::from(d).saturating_mul(u64::from(sample_count)))
 }
 
+/// The `sample_is_non_sync_sample` bit of ISO/IEC 14496-12 sample flags.
+const SAMPLE_IS_NON_SYNC: u32 = 0x0001_0000;
+
+/// Whether the first sample of this `traf` is a sync (key) sample, from its sample flags.
+///
+/// The flags of the first sample can be in three places, and the spec's own order of precedence is
+/// followed:
+///
+/// * `trun`'s `first_sample_flags` (bit `0x000004`), which is how ffmpeg marks a fragment that
+///   starts on a keyframe followed by dependent frames;
+/// * else the first entry's own flags, when the `trun` carries per-sample flags (`0x000400`);
+/// * else `tfhd`'s `default_sample_flags` (`0x000020`).
+///
+/// `None` when none of them is present. The movie header's `trex` default would apply by the spec,
+/// but this build does not read it, so it reports "unknown" and the caller treats that as not a
+/// keyframe rather than claiming what it cannot show.
+fn first_sample_is_sync(traf: &[u8]) -> Option<bool> {
+    let tfhd = *children(traf, 0, "tfhd").first()?;
+    let tf_flags = u32::from_be_bytes([*tfhd.get(1)?, *tfhd.get(2)?, *tfhd.get(3)?, 0]) >> 8;
+    // After version/flags and track_id: the optional fields in order, four bytes each except the
+    // eight-byte base_data_offset.
+    let mut at = 8usize;
+    if tf_flags & 0x00_0001 != 0 {
+        at += 8; // base_data_offset
+    }
+    for bit in [0x00_0002, 0x00_0008, 0x00_0010] {
+        // sample_description_index, default_sample_duration, default_sample_size
+        if tf_flags & bit != 0 {
+            at += 4;
+        }
+    }
+    let default_flags = if tf_flags & 0x00_0020 != 0 {
+        let b = tfhd.get(at..at + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    } else {
+        None
+    };
+
+    let trun = *children(traf, 0, "trun").first()?;
+    let tr_flags = u32::from_be_bytes([*trun.get(1)?, *trun.get(2)?, *trun.get(3)?, 0]) >> 8;
+    let mut at = 8usize;
+    if tr_flags & 0x00_0001 != 0 {
+        at += 4; // data_offset
+    }
+    let flags = if tr_flags & 0x00_0004 != 0 {
+        let b = trun.get(at..at + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    } else if tr_flags & 0x00_0400 != 0 {
+        // The first entry: its duration and size come before its flags when present.
+        let skip = if tr_flags & 0x00_0100 != 0 { 4 } else { 0 }
+            + if tr_flags & 0x00_0200 != 0 { 4 } else { 0 };
+        let b = trun.get(at + skip..at + skip + 4)?;
+        Some(u32::from_be_bytes([b[0], b[1], b[2], b[3]]))
+    } else {
+        default_flags
+    };
+    flags.map(|f| f & SAMPLE_IS_NON_SYNC == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +518,129 @@ mod tests {
             .expect("spawning ffmpeg to generate a fragmented-MP4 stream");
         assert!(out.status.success(), "ffmpeg could not generate the stream");
         out.stdout
+    }
+
+    /// A real stream cut by time (`frag_duration`) rather than by keyframe, so fragments begin
+    /// mid-GOP: 1s keyframes, a fragment every 0.5s.
+    fn stream_cut_mid_gop(seconds: u32) -> Vec<u8> {
+        let bin = replayed_media_ffmpeg();
+        let out = crate::sidecar_command(&bin.ffmpeg)
+            .args([
+                "-v",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc2=size=320x180:rate=30:duration={seconds}"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-g",
+                "30",
+                "-bf",
+                "0",
+                "-f",
+                "mp4",
+                "-frag_duration",
+                "500000",
+                "-movflags",
+                "empty_moov+default_base_moof",
+                "-",
+            ])
+            .output()
+            .expect("spawning ffmpeg to generate a stream cut mid-GOP");
+        assert!(out.status.success(), "ffmpeg could not generate the stream");
+        out.stdout
+    }
+
+    /// `keyframe` is measured: a fragment that starts mid-GOP says so.
+    ///
+    /// It was the constant `true`, so the "the first fragment is a keyframe" check built on it could
+    /// never fail, and a muxer change that cut fragments mid-GOP would have produced clips that
+    /// open on garbage with every check passing.
+    #[test]
+    fn a_fragment_that_starts_mid_gop_is_not_claimed_to_be_a_keyframe() {
+        let mut splitter = FragmentSplitter::new();
+        let fragments = splitter
+            .push(&stream_cut_mid_gop(3))
+            .expect("the stream splits");
+        let flags: Vec<bool> = fragments.iter().map(|f| f.keyframe).collect();
+        assert!(
+            flags[0],
+            "the first fragment opens on the first keyframe: {flags:?}"
+        );
+        assert!(
+            flags.iter().any(|k| !k),
+            "fragments cut on a timer start mid-GOP and must not claim otherwise: {flags:?}"
+        );
+        assert!(
+            flags.iter().filter(|k| **k).count() >= 2,
+            "while the ones that land on a keyframe still do: {flags:?}"
+        );
+    }
+
+    /// Sample flags are found wherever the muxer put them.
+    #[test]
+    fn the_first_samples_flags_are_read_from_each_place_they_can_be() {
+        fn boxed(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+            let mut out = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            out.extend_from_slice(kind);
+            out.extend_from_slice(body);
+            out
+        }
+        const KEY: u32 = 0x0200_0000;
+        const NON_SYNC: u32 = 0x0101_0000;
+        let be = |v: u32| v.to_be_bytes();
+        // `tfhd`: version/flags, track id, then the default_sample_flags field when 0x20.
+        let tfhd = |default_flags: Option<u32>| {
+            let flags: u32 = if default_flags.is_some() { 0x20 } else { 0 };
+            let mut b = flags.to_be_bytes().to_vec();
+            b.extend_from_slice(&be(1));
+            if let Some(f) = default_flags {
+                b.extend_from_slice(&be(f));
+            }
+            boxed(b"tfhd", &b)
+        };
+        // `trun` with `flags`, one sample, and whichever fields they select.
+        let trun = |flags: u32, fields: &[u32]| {
+            let mut b = flags.to_be_bytes().to_vec();
+            b.extend_from_slice(&be(1));
+            for f in fields {
+                b.extend_from_slice(&be(*f));
+            }
+            boxed(b"trun", &b)
+        };
+        let traf = |parts: &[Vec<u8>]| parts.concat();
+
+        // first_sample_flags (0x4) after data_offset (0x1).
+        assert_eq!(
+            first_sample_is_sync(&traf(&[tfhd(None), trun(0x5, &[0, KEY])])),
+            Some(true)
+        );
+        assert_eq!(
+            first_sample_is_sync(&traf(&[tfhd(None), trun(0x5, &[0, NON_SYNC])])),
+            Some(false)
+        );
+        // The first entry's own flags (0x400), after its duration (0x100) and size (0x200).
+        assert_eq!(
+            first_sample_is_sync(&traf(&[tfhd(None), trun(0x700, &[10, 20, NON_SYNC])])),
+            Some(false)
+        );
+        // Neither: tfhd's default_sample_flags.
+        assert_eq!(
+            first_sample_is_sync(&traf(&[tfhd(Some(KEY)), trun(0x0, &[])])),
+            Some(true)
+        );
+        assert_eq!(
+            first_sample_is_sync(&traf(&[tfhd(Some(NON_SYNC)), trun(0x0, &[])])),
+            Some(false)
+        );
+        // Nowhere: unknown, which the splitter reads as "not shown to be a keyframe".
+        assert_eq!(
+            first_sample_is_sync(&traf(&[tfhd(None), trun(0x0, &[])])),
+            None
+        );
     }
 
     fn replayed_media_ffmpeg() -> crate::FfmpegBinaries {

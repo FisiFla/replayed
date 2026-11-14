@@ -21,6 +21,14 @@ replayed-media   = { path = "../../crates/media" }
 replayed-events  = { path = "../../crates/events" }
 replayed-store   = { path = "../../crates/store" }
 
+# Ctrl+C / console close / SIGTERM, so a quit stops the recorder instead of killing the process
+# (`src/shutdown.rs`). Target-specific and already in the lockfile: the same `windows-sys` the
+# capture backend and the xtask pull in, and the same `libc` the xtask uses on the dev host.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Console"] }
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 # Enables the hidden `--dev-software-encoder` flag for pipeline smoke tests on a
 # host with no GPU encoder. Never enabled in a release build. Forwarded to the engine,
 # which is where the flag is acted on.

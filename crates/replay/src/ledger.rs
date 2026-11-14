@@ -1,5 +1,17 @@
-//! The scratch ring index: the only thing that survives a crash. Media itself is plain appended
-//! segment files, deliberately not memory-mapped.
+//! The scratch ring index: an in-memory list of the completed segments on the scratch volume, with
+//! eviction by byte cap. Media itself is plain appended segment files, deliberately not
+//! memory-mapped.
+//!
+//! **Crash recovery does not depend on this type being persisted.** What survives a crash is the
+//! segment *files* in the scratch directory: the recorder rebuilds its view of them by scanning that
+//! directory (`replayed_recorder::session::segments_on_disk`, with sequence numbers read from the
+//! file names by [`crate::scanner::segment_seq`]), and numbers a new encoder's segments from what it
+//! finds there. [`SegmentLedger::save_atomic`], [`SegmentLedger::load`] and the TOML round trip
+//! below are public API that no production caller uses: nothing writes a `ledger.toml` and nothing
+//! reads one, so they are tested but not part of any recovery path, and hardening them (an `fsync`
+//! before the rename, say) would change nothing a user can observe. They are kept as the shape a
+//! persisted index would take, not as a promise that one exists. Do not rely on them without first
+//! wiring them in and adding that `fsync`.
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -96,6 +108,10 @@ impl SegmentLedger {
 
     /// Persist atomically via temp file + rename, so a crash mid-write cannot leave a truncated
     /// ledger.
+    ///
+    /// Not called outside tests (see the module docs): recovery rescans the scratch directory
+    /// instead. It does not `fsync` before the rename, so a power loss can still leave an empty
+    /// file under the final name; a caller wiring this in must add that.
     pub fn save_atomic(&self, path: &Path) -> Result<()> {
         let text = self.to_toml()?;
         let tmp = path.with_extension("toml.tmp");
@@ -104,6 +120,7 @@ impl SegmentLedger {
         Ok(())
     }
 
+    /// Read a ledger written by [`SegmentLedger::save_atomic`]. Not called outside tests.
     pub fn load(path: &Path) -> Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;

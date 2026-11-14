@@ -1,11 +1,9 @@
 {
   "identifier": "default",
-  "description": "The default capability for the replayed review window: the core Tauri APIs plus the open-file dialog the settings panel's folder picker uses (open only — it returns a path and grants nothing else), and the updater's check and download-and-install commands, which the settings panel's \"Check for updates\" button calls and nothing else does. There is no filesystem, shell or http permission here — clip files reach the webview through the asset protocol, whose scope is configured in tauri.conf.json and extended at runtime in src/lib.rs to the resolved clips directory. The updater's two permissions are the whole of the internet this application can reach: they ask one fixed GitHub URL for the release manifest, and every artifact they download is verified against the minisign public key pinned in tauri.conf.json before it is installed.",
+  "description": "The default capability for the replayed review window: the core Tauri APIs, and the updater's check and download-and-install commands, which the settings panel's \"Check for updates\" button calls and nothing else does. There is no filesystem, shell, http, dialog or notification permission here. The folder picker for the clips directory and the \"clip saved\" toast are driven from Rust (src/lib.rs), which the capability system does not gate, so the webview cannot call either itself: a dialog permission would let the page open a picker whose answer widens the asset protocol's read scope, and the webview is deliberately not allowed to widen it. Clip files reach the webview through the asset protocol, whose scope is configured in tauri.conf.json and extended at runtime in src/lib.rs to the resolved clips directory. The updater's two permissions are the whole of the internet this application can reach: they ask one fixed GitHub URL for the release manifest, and every artifact they download is verified against the minisign public key pinned in tauri.conf.json before it is installed.",
   "windows": ["main"],
   "permissions": [
     "core:default",
-    "dialog:allow-open",
-    "notification:default",
     "updater:allow-check",
     "updater:allow-download-and-install"
   ]

@@ -1,0 +1,34 @@
+--- a/src/platform_impl/windows/mod.rs
++++ b/src/platform_impl/windows/mod.rs
+@@ -1207,27 +1207,11 @@
+             EditCommand::Undo => VK_Z,
+             EditCommand::Redo => VK_Y,
+         };
+-
+-        unsafe {
+-            let mut inputs: [INPUT; 4] = std::mem::zeroed();
+-            inputs[0].r#type = INPUT_KEYBOARD;
+-            inputs[0].Anonymous.ki.wVk = VK_CONTROL;
+-            inputs[0].Anonymous.ki.dwFlags = 0;
+-
+-            inputs[1].r#type = INPUT_KEYBOARD;
+-            inputs[1].Anonymous.ki.wVk = key;
+-            inputs[1].Anonymous.ki.dwFlags = 0;
+ 
+-            inputs[2].r#type = INPUT_KEYBOARD;
+-            inputs[2].Anonymous.ki.wVk = key;
+-            inputs[2].Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+-
+-            inputs[3].r#type = INPUT_KEYBOARD;
+-            inputs[3].Anonymous.ki.wVk = VK_CONTROL;
+-            inputs[3].Anonymous.ki.dwFlags = KEYEVENTF_KEYUP;
+-
+-            SendInput(4, &inputs as *const _, std::mem::size_of::<INPUT>() as _);
+-        }
++        // replayed: upstream synthesised Ctrl+<key> with `SendInput` to run a predefined
++        // edit-menu item. The project never synthesises input, and it uses no predefined edit
++        // items, so the call is gone.
++        let _ = key;
+     }
+ }
+ 

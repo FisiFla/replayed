@@ -7,6 +7,7 @@
 use replayed_capture::{AudioBuffer, Frame};
 use std::path::PathBuf;
 
+mod audio_link;
 pub mod ffmpeg;
 /// Media Foundation hardware encoders. Windows only, inert elsewhere.
 #[cfg(windows)]
@@ -90,6 +91,81 @@ impl Vendor {
             Vendor::Qsv => "qsv",
             Vendor::Amf => "amf",
         }
+    }
+
+    /// The PCI vendor id of the silicon behind this encoder: NVIDIA, Intel, AMD.
+    ///
+    /// The one fact that ties a vendor name to a GPU. A Media Foundation encoder names its
+    /// vendor this way (`MFT_ENUM_HARDWARE_VENDOR_ID_Attribute`, see [`Vendor::names_mft_vendor`])
+    /// and so does a DXGI adapter, which is how "the Quick Sync encoder" and "the adapter this
+    /// texture lives on" can be asked to agree.
+    pub fn pci_vendor_id(self) -> u32 {
+        match self {
+            Vendor::Nvenc => 0x10DE,
+            Vendor::Qsv => 0x8086,
+            Vendor::Amf => 0x1002,
+        }
+    }
+
+    /// The vendor whose silicon has this PCI id, if it is one of the three this app encodes with.
+    pub fn from_pci_vendor_id(id: u32) -> Option<Self> {
+        [Vendor::Nvenc, Vendor::Qsv, Vendor::Amf]
+            .into_iter()
+            .find(|vendor| vendor.pci_vendor_id() == id)
+    }
+
+    /// Whether an MFT's hardware vendor attribute (`VEN_8086`) names this vendor.
+    ///
+    /// Strict, because the answer decides whether a texture is handed to an encoder: anything
+    /// that is not exactly `VEN_` and four hex digits naming this vendor is a no, so an encoder
+    /// that does not say whose it is can never be mistaken for the one that was asked for.
+    pub fn names_mft_vendor(self, attribute: &str) -> bool {
+        let Some(digits) = attribute.strip_prefix("VEN_") else {
+            return false;
+        };
+        digits.len() == 4 && u32::from_str_radix(digits, 16).ok() == Some(self.pci_vendor_id())
+    }
+}
+
+/// How many frames an asynchronous encoder has said it will take and has not been given yet.
+///
+/// An async MFT announces `METransformNeedInput` once for every frame it has room for, and the
+/// encoders differ in how many they announce at a time. NVENC's one, a frame at a time. Intel's
+/// Quick Sync encoder announces **three** before it has seen a frame (a measured sequence on the
+/// test machine: three `NeedInput` events within 70 ms of the stream starting, then one more with
+/// every `HaveOutput`). Each announcement is a credit, and credits are not repeated: an encoder
+/// that has said "I have room for three" will not say it again until they are used.
+///
+/// The loop that fed the encoder treated `NeedInput` as a *moment* (return when one is seen) and
+/// not as a *count*, and drained the queue after every frame without keeping what it found. With
+/// NVENC the queue never held a second announcement, so that worked; with Quick Sync the first
+/// frame's drain swallowed the other two credits, and the second frame waited for an announcement
+/// that had already come and gone, until the deadline reported an encoder that "never asked". The
+/// credits are therefore counted where they are read, and spent where a frame is handed over, so
+/// the number of frames accepted never exceeds the number offered and never falls short of it.
+///
+/// Not Windows-only: the rule is arithmetic, and a rule only the Windows host can run is a rule
+/// only the Windows host tests.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct InputCredits(u32);
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl InputCredits {
+    /// The encoder announced room for one more frame.
+    pub(crate) fn offered(&mut self) {
+        self.0 = self.0.saturating_add(1);
+    }
+
+    /// Whether a frame can be handed over now.
+    pub(crate) fn available(self) -> bool {
+        self.0 > 0
+    }
+
+    /// A frame was handed over. Spending a credit that was never offered is not possible: the
+    /// count stays at zero, and [`InputCredits::available`] stays false for the next frame.
+    pub(crate) fn spent(&mut self) {
+        self.0 = self.0.saturating_sub(1);
     }
 }
 
@@ -271,6 +347,75 @@ pub fn classify_output_failure(code: u32) -> OutputFailure {
         MF_NEED_MORE_INPUT => OutputFailure::NeedsInput,
         MF_STREAM_CHANGE => OutputFailure::TypeChanged,
         _ => OutputFailure::Failed,
+    }
+}
+
+/// The Win32 code for "the call was made when the object had nothing to do" (`E_UNEXPECTED`,
+/// "Catastrophic failure").
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) const E_UNEXPECTED: u32 = 0x8000FFFF;
+
+/// Whether an output call that failed, right after the streams were renegotiated, only means
+/// there is no sample to take.
+///
+/// **A stream change can *be* the output.** An asynchronous encoder announces output with
+/// `METransformHaveOutput`, and the announcement for a change of output type is the same event:
+/// `ProcessOutput` answers it with `MF_E_TRANSFORM_STREAM_CHANGE` and carries no sample. NVENC
+/// holds the frame it was working on behind that answer, so asking again once the type is set (the
+/// rule in [`OutputFailure::TypeChanged`]) produces it. Intel's Quick Sync encoder does not: its
+/// first announcement is the type change and nothing else, and the call that follows the
+/// renegotiation answers `E_UNEXPECTED`, because there is nothing queued. The next
+/// `METransformHaveOutput` carries the first real frame (measured on the test machine: the failed
+/// retry, then 10 882, 17 824, 24 778 and 21 673 bytes for the frames that followed).
+///
+/// Read as a failure, that one answer ended the recording at its second frame. Read as "nothing
+/// here", it costs nothing, and it is read that way **only** for the call that immediately follows
+/// a renegotiation: the same code at any other moment is the driver's report and stays an error,
+/// so an encoder that has really died is not mistaken for one that was merely quiet.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn empty_after_renegotiation(code: u32, just_renegotiated: bool) -> bool {
+    just_renegotiated && code == E_UNEXPECTED
+}
+
+/// A count of consecutive failures with a limit: how many times in a row something may go wrong
+/// before it is called broken.
+///
+/// The hardware encoder's thread used to give up for good on the first refused or stalled frame
+/// (and the recording went on with no video and nothing said), and the opposite policy, retrying
+/// an open on every frame, enumerated and activated every encoder at the capture rate. Neither
+/// "never" nor "always" is right: a GPU that is busy for a moment refuses a frame and recovers, and
+/// one that is gone refuses all of them. Counting consecutive failures tells the two apart, and a
+/// success clears the count, so only a run of failures with nothing between them is fatal.
+///
+/// Plain data, off the Windows-only module, so the policy is tested where the tests run every day.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) struct Strikes {
+    consecutive: u32,
+    limit: u32,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl Strikes {
+    /// A count that is exhausted by `limit` failures in a row. A limit of zero is exhausted by the
+    /// first.
+    pub(crate) fn new(limit: u32) -> Self {
+        Self {
+            consecutive: 0,
+            limit,
+        }
+    }
+
+    /// Record one failure. `true` when this one exhausted the count, which is the caller's cue to
+    /// stop retrying and report.
+    pub(crate) fn record_failure(&mut self) -> bool {
+        self.consecutive = self.consecutive.saturating_add(1);
+        self.consecutive >= self.limit
+    }
+
+    /// Record a success, which forgives every failure before it.
+    pub(crate) fn record_success(&mut self) {
+        self.consecutive = 0;
     }
 }
 
@@ -841,7 +986,14 @@ pub trait Encoder: Send {
         0
     }
 
-    /// The loopback port the microphone input is listening on, or `None` without a microphone input.
+    /// The loopback TCP port the microphone input is listening on (Windows), or `None` without a
+    /// microphone input.
+    ///
+    /// On Unix the input is a Unix-domain socket in a private directory, which has no port, so this
+    /// is `Some(1)` there: "a microphone input exists" without an address to give, and not 0 because
+    /// the recorder's status reads 0 as "no microphone input". A caller must
+    /// not dial it either way; the encoder owns the listener and authenticates the one peer it will
+    /// accept (see `audio_link`), so a connection from anything else is refused.
     ///
     /// The encoder owns the listener; a caller can log the port and tell "microphone enabled" apart
     /// from "requested but not wired up".
@@ -897,6 +1049,103 @@ mod tests {
         assert_eq!(RateControl::Quality.as_str(), "quality");
         // And the default is the mode every build before this existed used.
         assert_eq!(RateControl::default(), RateControl::Cbr);
+    }
+
+    /// `E_UNEXPECTED` is "nothing to take" only straight after a renegotiation.
+    #[test]
+    fn an_empty_answer_is_only_forgiven_straight_after_a_renegotiation() {
+        assert!(empty_after_renegotiation(E_UNEXPECTED, true));
+        assert!(
+            !empty_after_renegotiation(E_UNEXPECTED, false),
+            "the same code with no renegotiation before it is the driver reporting a fault"
+        );
+        for other in [MF_STREAM_CHANGE, MF_NEED_MORE_INPUT, 0xC00D6D60, 0x8007000E] {
+            assert!(
+                !empty_after_renegotiation(other, true),
+                "{other:#x} after a renegotiation is still a failure"
+            );
+        }
+    }
+
+    /// An encoder that announces several frames at once is fed several frames, and no more.
+    ///
+    /// Quick Sync announces three `NeedInput` before the first frame; the feed loop used to keep
+    /// only the one it stopped at (see [`InputCredits`]).
+    #[test]
+    fn an_encoders_announcements_are_counted_and_each_pays_for_one_frame() {
+        let mut credits = InputCredits::default();
+        assert!(
+            !credits.available(),
+            "nothing offered, nothing to hand over"
+        );
+
+        // The Quick Sync opening: three announcements before any frame.
+        credits.offered();
+        credits.offered();
+        credits.offered();
+        for frame in 0..3 {
+            assert!(credits.available(), "frame {frame} was offered room");
+            credits.spent();
+        }
+        assert!(
+            !credits.available(),
+            "the fourth frame was not offered room"
+        );
+
+        // NVENC's shape: one in, one out, and a spent credit never goes negative.
+        credits.offered();
+        assert!(credits.available());
+        credits.spent();
+        credits.spent();
+        assert!(!credits.available());
+        credits.offered();
+        assert!(
+            credits.available(),
+            "an over-spend must not leave a debt that eats the next announcement"
+        );
+    }
+
+    /// The PCI ids are the ones adapters and Media Foundation encoders report, and an MFT's
+    /// vendor attribute is matched exactly: it decides which encoder a texture is handed to.
+    #[test]
+    fn a_vendor_is_matched_to_its_mft_by_pci_id() {
+        assert_eq!(Vendor::Qsv.pci_vendor_id(), 0x8086);
+        assert_eq!(Vendor::Nvenc.pci_vendor_id(), 0x10DE);
+        assert_eq!(Vendor::Amf.pci_vendor_id(), 0x1002);
+        assert_eq!(Vendor::from_pci_vendor_id(0x8086), Some(Vendor::Qsv));
+        assert_eq!(Vendor::from_pci_vendor_id(0x10DE), Some(Vendor::Nvenc));
+        assert_eq!(
+            Vendor::from_pci_vendor_id(0x1414),
+            None,
+            "Microsoft's software rasterizer is not an encoder"
+        );
+
+        // What `MFT_ENUM_HARDWARE_VENDOR_ID_Attribute` held on the test machine.
+        assert!(Vendor::Qsv.names_mft_vendor("VEN_8086"));
+        assert!(Vendor::Nvenc.names_mft_vendor("VEN_10DE"));
+        assert!(
+            Vendor::Nvenc.names_mft_vendor("VEN_10de"),
+            "hex digits are not case-sensitive"
+        );
+        assert!(Vendor::Amf.names_mft_vendor("VEN_1002"));
+
+        // Never another vendor's encoder, and nothing that does not say whose it is.
+        assert!(!Vendor::Qsv.names_mft_vendor("VEN_10DE"));
+        assert!(!Vendor::Nvenc.names_mft_vendor("VEN_8086"));
+        for unreadable in [
+            "",
+            "8086",
+            "VEN_",
+            "VEN_80860",
+            "VEN_808",
+            "ven_8086",
+            "VEN_zzzz",
+        ] {
+            assert!(
+                !Vendor::Qsv.names_mft_vendor(unreadable),
+                "{unreadable:?} does not name Quick Sync"
+            );
+        }
     }
 
     /// The family an encoder name belongs to, and the vendor behind it.
@@ -957,6 +1206,35 @@ mod tests {
             classify_output_failure(0xC00D6D60),
             OutputFailure::Failed,
             "anything else is the driver's own words to report"
+        );
+    }
+
+    /// One refusal is a hiccup and a run of them is a dead encoder: the count tells them apart.
+    #[test]
+    fn strikes_are_consecutive_failures_and_a_success_forgives_them() {
+        let mut strikes = Strikes::new(3);
+        assert!(
+            !strikes.record_failure(),
+            "one refusal is not a dead encoder"
+        );
+        assert!(!strikes.record_failure());
+        strikes.record_success();
+        assert!(
+            !strikes.record_failure(),
+            "a success in between clears the count, so two earlier failures do not add up to three"
+        );
+        assert!(!strikes.record_failure());
+        assert!(
+            strikes.record_failure(),
+            "three in a row with nothing between them is the limit"
+        );
+        assert!(
+            strikes.record_failure(),
+            "and it stays exhausted until a success"
+        );
+        assert!(
+            Strikes::new(0).record_failure(),
+            "a limit of zero is exhausted by the first failure"
         );
     }
 

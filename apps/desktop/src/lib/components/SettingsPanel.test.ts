@@ -178,6 +178,21 @@ describe('the automatic-recording section', () => {
     expect(applyAutomatic(target)!.disabled).toBe(true);
   });
 
+  it('refuses the exact same executable twice, instead of throwing on the duplicate row', async () => {
+    // A keyed each over `exe` threw each_key_duplicate here, so the list never updated and the
+    // explanation never appeared; the case-variant test above has different keys and missed it.
+    const { target } = await mountPanel(settings());
+    field(target, 'Executable')!.value = 'cs2.exe';
+    field(target, 'Executable')!.dispatchEvent(new Event('input', { bubbles: true }));
+    await settle();
+    button(target, 'Add game')!.click();
+    await settle();
+
+    expect(listed(target)).toEqual(['League of Legends', 'Counter-Strike 2', 'cs2']);
+    expect(text(target)).toContain('cs2.exe is watched twice');
+    expect(applyAutomatic(target)!.disabled).toBe(true);
+  });
+
   it('refuses to empty the list, because that brings the default titles back', async () => {
     const { target } = await mountPanel(settings());
     target.querySelector<HTMLButtonElement>('button[aria-label="Stop watching Counter-Strike 2"]')!

@@ -69,6 +69,16 @@ wildcards = "allow"
 # client.
 deny = [
   "attohttpc", "isahc", "surf", "ureq",
+  # Input synthesis and global input capture (docs/anti-cheat.md). The project captures with
+  # Windows Graphics Capture and WASAPI and never synthesises, hooks or polls input: on a machine
+  # running kernel-level anti-cheat that is hostile behaviour, and a crate that does it would
+  # call `SendInput`, `SetWindowsHookEx` or `GetAsyncKeyState` without our source ever spelling
+  # the name — which the source guard (`scripts/check-forbidden-apis.sh`) cannot see. Denying
+  # the crates that exist to do it means a new dependency cannot bring that behaviour in
+  # quietly; the built executable's import table (`scripts/check-pe-imports.py`) is the check
+  # for the ones that do it without being on this list.
+  "enigo", "rdev", "autopilot", "inputbot", "device_query", "rustautogui", "winput",
+  "willhook", "mki", "mouse-rs", "multiinput",
 ]
 
 [sources]

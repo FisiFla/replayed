@@ -151,10 +151,20 @@ impl SessionRing {
     /// Reserve the sequence number the encoder must start at (the ring's rule, [`next_segment_number`]),
     /// so a directory that already holds segments cannot be overwritten.
     pub fn reserve_number(&mut self) -> Result<u64> {
-        let names = observed_names(&self.dir)?;
-        let number = next_segment_number(&self.ledger.seqs(), &names);
+        let number = self.next_number()?;
         self.origin_ms = number.saturating_mul(self.segment_ms);
         Ok(number)
+    }
+
+    /// The number the next encoder must start at *without* moving this run's zero.
+    ///
+    /// [`SessionRing::reserve_number`] is for the start of a run: it also sets the run's origin on the
+    /// ledger timeline. A capture resize starts a second encoder in the middle of the run, and
+    /// moving the origin then would put every position published so far (events, clips waiting for
+    /// their post-roll) on a different timeline from the footage.
+    pub fn next_number(&self) -> Result<u64> {
+        let names = observed_names(&self.dir)?;
+        Ok(next_segment_number(&self.ledger.seqs(), &names))
     }
 
     /// The ledger position, in ms, of this run's zero.
@@ -312,11 +322,14 @@ pub fn segments_on_disk(dir: &Path, segment_ms: u64) -> Result<Vec<Segment>> {
 /// already started in that second.
 ///
 /// The name is claimed by creation (`create_dir` fails rather than overwriting), so two processes
-/// cannot mix their segments into one session file.
+/// cannot mix their segments into one session file. A name whose finished file
+/// ([`session_file_for_dir`]) is already there is skipped too: the directory of a session that
+/// finalised within the same second is gone, so creation alone would hand its name out again and the
+/// second run's concatenation would overwrite the first run's file while its row still named it.
 pub fn create_session_dir(sessions_dir: &Path, started_at_ms: i64) -> Result<PathBuf> {
     std::fs::create_dir_all(sessions_dir)
         .with_context(|| format!("creating {}", sessions_dir.display()))?;
-    // The same instant as the row's `started_at` and `session_file_path`, so directory and file read as one session.
+    // The same instant as the row's `started_at`, so directory and file read as one session.
     let stamp = started_at_ms.div_euclid(1_000) as u64;
     for attempt in 1..=MAX_SESSION_DIR_ATTEMPTS {
         let name = if attempt == 1 {
@@ -325,6 +338,9 @@ pub fn create_session_dir(sessions_dir: &Path, started_at_ms: i64) -> Result<Pat
             format!("session-{stamp}-{attempt}")
         };
         let dir = sessions_dir.join(name);
+        if session_file_for_dir(&dir).exists() {
+            continue;
+        }
         match std::fs::create_dir(&dir) {
             Ok(()) => return Ok(dir),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -340,13 +356,46 @@ pub fn create_session_dir(sessions_dir: &Path, started_at_ms: i64) -> Result<Pat
     )
 }
 
-/// The concatenated file a session with this start instant writes: `sessions/session-<unix seconds>.mp4`.
+/// The concatenated file for the session whose segments live in `session_dir`:
+/// `sessions/<directory name>.mp4`, so `session-<seconds>[-N].mp4`.
 ///
-/// Derived from the session's own start instant, not "now", so a recovery retry writes the same path
-/// rather than a second file beside a partial one.
-pub fn session_file_path(sessions_dir: &Path, started_at_ms: i64) -> PathBuf {
-    let seconds = started_at_ms.div_euclid(1_000);
-    sessions_dir.join(format!("session-{seconds}.mp4"))
+/// Derived from the session's directory, which is already unique ([`create_session_dir`] claims
+/// it), not from its start second: two runs that started in the same second used to compute the
+/// same file name and the second finalise overwrote the first. It is still stable across a recovery
+/// retry (the directory name does not change), so a retry rewrites the same path rather than leaving
+/// a second file beside a partial one.
+pub fn session_file_for_dir(session_dir: &Path) -> PathBuf {
+    let name = session_dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "session".to_string());
+    session_dir
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(format!("{name}.mp4"))
+}
+
+/// Make `path` durable on disk before anything that depends on it is deleted.
+///
+/// `finalise` writes the session file and the caller then removes the segments, which are the only
+/// other copy. Without a flush the file can still be in the page cache when power goes, leaving a
+/// short or empty session file and no segments. Opened for writing because Windows refuses to flush a
+/// read-only handle; the parent directory is flushed as well on Unix so the new name is durable too
+/// (Windows has no directory flush to call).
+pub fn sync_output(path: &Path) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .with_context(|| format!("opening {} to flush it", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("flushing {} to disk", path.display()))?;
+    #[cfg(unix)]
+    if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .with_context(|| format!("flushing the directory {}", parent.display()))?;
+    }
+    Ok(())
 }
 
 /// Concatenate a finished session's segments into one file.
@@ -395,6 +444,8 @@ pub fn finalise(
 
     let info = MediaInfo::probe(bin, out)
         .with_context(|| format!("probing the concatenated session {}", out.display()))?;
+    // Durable before the caller removes the segments: they are the only other copy.
+    sync_output(out)?;
     if info.video.is_none() {
         tracing::warn!(
             "{} has no video stream: the concatenation produced a file ffprobe cannot see \
@@ -458,6 +509,8 @@ pub fn finalise_part(
     }
     let info = MediaInfo::probe(bin, out)
         .with_context(|| format!("probing the saved session {}", out.display()))?;
+    // Durable before the caller removes the part: it is the only other copy.
+    sync_output(out)?;
     if info.video.is_none() {
         tracing::warn!(
             "{} has no video stream: the remux produced a file ffprobe cannot see a picture in",
@@ -522,6 +575,18 @@ pub struct Recovery {
     /// Session directories still holding segments although their session is finished (a crash between
     /// concatenation and removal). Left in place; retention removes them with the row.
     pub leftover_dirs: Vec<PathBuf>,
+    /// Trailing segments that could not be read (a kill or power loss leaves a plain segment with no
+    /// `moov`) and were left out of the recovered session. What the recovered file lacks, by name.
+    pub dropped_segments: Vec<DroppedSegment>,
+}
+
+/// A segment recovery left out of a session because ffprobe could not open it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedSegment {
+    pub session_id: i64,
+    pub seq: u64,
+    pub file: PathBuf,
+    pub bytes: u64,
 }
 
 impl Recovery {
@@ -532,6 +597,7 @@ impl Recovery {
             && self.closed_empty.is_empty()
             && self.orphan_dirs.is_empty()
             && self.leftover_dirs.is_empty()
+            && self.dropped_segments.is_empty()
     }
 }
 
@@ -551,12 +617,32 @@ impl Recovery {
 ///   this application's to remove.
 ///
 /// `encoder` is a label only: the encoder that wrote the segments lived in a previous process.
+///
+/// # Only ever beside no live recorder
+///
+/// "A row with `ended_at IS NULL` is a crash" holds only if no other recorder is running against this
+/// data directory: a second process (the CLI started while the desktop records) would otherwise
+/// finalise or delete a live session. `_owner` is the proof that none is: the data directory's
+/// exclusive lock ([`crate::lock::DataDirLock`]), which the operating system releases when a process
+/// dies. A row left running while this process holds it belongs to a dead one, by construction,
+/// and the signature makes the check impossible to forget.
+///
+/// # A session cut off mid-segment
+///
+/// A kill or a power loss leaves the last plain segment without its `moov` index, which `ffmpeg`
+/// refuses, so concatenating *every* segment failed at every start and the row never closed. Trailing
+/// segments ffprobe cannot open are therefore left out of the concatenation and named in
+/// [`Recovery::dropped_segments`]; the readable ones are recovered. This probes each file instead of
+/// assuming a layout, so a fragmented segment (readable up to its last whole fragment) is kept whole
+/// and a plain one is judged by whether it opens. Only the tail is dropped: an unreadable segment in
+/// the middle would leave a hole in the timeline, so that session is left running and its footage kept.
 pub fn recover_sessions(
     store: &Store,
     sessions_dir: &Path,
     bin: &FfmpegBinaries,
     segment_ms: u64,
     encoder: &str,
+    _owner: &crate::lock::DataDirLock,
 ) -> Recovery {
     let mut report = Recovery::default();
     let rows = match store.list_sessions() {
@@ -575,15 +661,7 @@ pub fn recover_sessions(
 
     for row in &rows {
         if row.mode == SESSION_MODE_SESSION {
-            recover_session_row(
-                store,
-                row,
-                sessions_dir,
-                bin,
-                segment_ms,
-                encoder,
-                &mut report,
-            );
+            recover_session_row(store, row, bin, segment_ms, encoder, &mut report);
         } else if row.ended_at_ms.is_none() {
             // A buffer-mode row (or a mode a newer build wrote): the ring owns its footage; just stamp the end so retention sees it as history.
             match store.end_session(row.id, now_ms(), None, row.size_bytes, 0) {
@@ -635,7 +713,6 @@ pub fn recover_sessions(
 fn recover_session_row(
     store: &Store,
     row: &Session,
-    sessions_dir: &Path,
     bin: &FfmpegBinaries,
     segment_ms: u64,
     encoder: &str,
@@ -658,7 +735,7 @@ fn recover_session_row(
     // A replay buffer that was also saving its session leaves one fragmented file instead of segments.
     let part = dir.join(crate::memory_ring::SESSION_PART);
     if running && segments.is_empty() && part.is_file() {
-        let out = session_file_path(sessions_dir, row.started_at_ms);
+        let out = session_file_for_dir(&dir);
         match finalise_part(bin, &part, &out, encoder, true) {
             Ok(meta) => {
                 let (path, size, duration) = match &meta {
@@ -744,7 +821,41 @@ fn recover_session_row(
         return;
     }
 
-    let out = session_file_path(sessions_dir, row.started_at_ms);
+    let out = session_file_for_dir(&dir);
+    let (segments, dropped) = split_unreadable_tail(bin, segments);
+    for gone in &dropped {
+        tracing::warn!(
+            "session #{}: {} ({} bytes) cannot be read (the recording was cut off while it was \
+             being written) and is left out of the recovered session",
+            row.id,
+            gone.display(),
+            std::fs::metadata(gone).map(|m| m.len()).unwrap_or(0)
+        );
+        report.dropped_segments.push(DroppedSegment {
+            session_id: row.id,
+            seq: segment_seq(gone),
+            file: gone.clone(),
+            bytes: std::fs::metadata(gone).map(|m| m.len()).unwrap_or(0),
+        });
+    }
+    if segments.is_empty() {
+        // Nothing readable: close the row so it stops being retried, with no file. The damaged
+        // segments stay where they are for retention to remove with the row; recovering nothing is no
+        // reason to delete anything.
+        match store.end_session(row.id, now_ms(), None, row.size_bytes, 0) {
+            Ok(()) => {
+                tracing::warn!(
+                    "session #{} left no readable segment; closed with no file (its damaged \
+                     files remain in {})",
+                    row.id,
+                    dir.display()
+                );
+                report.closed_empty.push(row.id);
+            }
+            Err(err) => tracing::warn!("could not close session #{}: {err:#}", row.id),
+        }
+        return;
+    }
     let bytes: u64 = segments.iter().map(|s| s.bytes).sum();
     // `true` asks for the audio-stream count: the row does not say whether a recovered session had a
     // microphone, and a silently absent voice track is what the check catches.
@@ -795,6 +906,36 @@ fn recover_session_row(
             report.unfinalised.push(row.id);
         }
     }
+}
+
+/// Split off the trailing segments ffprobe cannot open: `(readable prefix, unreadable files)`.
+///
+/// Walks back from the newest segment and stops at the first one that opens, so the cost is one probe
+/// in the normal case (a crash leaves at most the segment being written damaged). Never looks at the
+/// middle: see [`recover_sessions`].
+fn split_unreadable_tail(
+    bin: &FfmpegBinaries,
+    mut segments: Vec<Segment>,
+) -> (Vec<Segment>, Vec<PathBuf>) {
+    let mut dropped = Vec::new();
+    while let Some(last) = segments.last() {
+        if MediaInfo::probe(bin, &last.file).is_ok() {
+            break;
+        }
+        dropped.push(last.file.clone());
+        segments.pop();
+    }
+    dropped.reverse();
+    (segments, dropped)
+}
+
+/// The sequence number in a `seg-NNNNNN.mp4` file name (0 when the name is not one).
+fn segment_seq(file: &Path) -> u64 {
+    file.file_stem()
+        .and_then(|stem| stem.to_str())
+        .and_then(|stem| stem.strip_prefix("seg-"))
+        .and_then(|digits| digits.parse().ok())
+        .unwrap_or(0)
 }
 
 /// Remove a session's segment directory, reporting what could not go.
@@ -918,12 +1059,28 @@ mod tests {
             .expect("opening a session row")
     }
 
+    /// [`recover_sessions`] as the engine calls it: holding the data directory's lock, which the
+    /// test directory stands in for.
+    fn recover(store: &Store, sessions_dir: &Path) -> Recovery {
+        let owner = tempfile::tempdir().expect("a lock directory");
+        let lock = crate::lock::DataDirLock::acquire(owner.path()).expect("the lock");
+        recover_sessions(store, sessions_dir, &bin(), 1_000, "libx264", &lock)
+    }
+
+    /// Cut a plain segment short, as a kill or a power loss does: the `moov` index is written last, so
+    /// a segment that did not get to finish has none and ffprobe cannot open it.
+    fn truncate(file: &Path) {
+        let len = std::fs::metadata(file).unwrap().len();
+        let handle = std::fs::OpenOptions::new().write(true).open(file).unwrap();
+        handle.set_len(len / 2).unwrap();
+    }
+
     /// Both lossless concatenation paths keep every audio stream.
     ///
     /// Regression test: `concat_lossless` once passed no `-map`, so ffmpeg kept one audio stream and a
-    /// clip from a session recorded with a microphone silently lost the voice track. The splicer and
-    /// `finalise` now share one `-map 0` invocation; the two halves below would disagree and show which
-    /// path regressed.
+    /// clip from a session recorded with a microphone silently lost the voice track. Both now keep every
+    /// recorded track, and a clip also leads with the game and the voice mixed
+    /// (`edit::concat_clip_sized`); the two halves below would disagree and show which path regressed.
     #[test]
     fn every_lossless_concat_path_keeps_a_second_audio_track() {
         let dir = temp_dir("session-");
@@ -941,8 +1098,8 @@ mod tests {
                 .expect("the splice");
         assert_eq!(
             audio_stream_count(&bin(), &spliced),
-            Some(2),
-            "the splicer must keep the microphone track as well as the game audio"
+            Some(3),
+            "the splicer must keep the microphone track and the game audio, after their mix"
         );
 
         // The finalise: both tracks, and the file is as long as the two segments.
@@ -1093,7 +1250,7 @@ mod tests {
             .set_session_size(id, bytes as i64)
             .expect("the running size");
 
-        let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
+        let report = recover(&store, &sessions_dir);
 
         assert_eq!(
             report.recovered,
@@ -1114,16 +1271,14 @@ mod tests {
         );
         assert_eq!(
             final_path,
-            session_file_path(&sessions_dir, row.started_at_ms)
-                .display()
-                .to_string(),
-            "the file is named from the session's own start instant"
+            session_file_for_dir(&session_dir).display().to_string(),
+            "the file is named from the session's own directory"
         );
         assert_eq!(audio_stream_count(&bin(), Path::new(&final_path)), Some(1));
         assert!(!session_dir.exists(), "the temporary segments are gone");
 
         // A second pass has nothing to recover, and must not touch the finished session.
-        let again = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
+        let again = recover(&store, &sessions_dir);
         assert!(again.is_empty(), "nothing left to do: {again:?}");
         assert!(store.get_session(id).unwrap().unwrap().final_path.is_some());
     }
@@ -1135,13 +1290,14 @@ mod tests {
         let dir = temp_dir("session-");
         let sessions_dir = dir.path().join("sessions");
         let session_dir = sessions_dir.join("session-1700000000");
-        std::fs::create_dir_all(&session_dir).unwrap();
-        // Not a media file: ffmpeg refuses it, as it would a write that cannot complete.
+        // A bad segment in the middle, not at the end: only a trailing one is dropped (it is the one a
+        // kill leaves unfinished), so this is a session that cannot be assembled, as one on a full disk is.
+        write_segments(&session_dir, 1);
         std::fs::write(session_dir.join("seg-000000.mp4"), b"this is not an mp4").unwrap();
         let store = store();
         let id = running_session(&store, &session_dir, SESSION_MODE_SESSION);
 
-        let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
+        let report = recover(&store, &sessions_dir);
 
         assert_eq!(report.unfinalised, vec![id], "{report:?}");
         assert!(report.recovered.is_empty());
@@ -1156,9 +1312,108 @@ mod tests {
         );
         assert!(row.final_path.is_none());
         assert!(
-            !session_file_path(&sessions_dir, row.started_at_ms).exists(),
+            !session_file_for_dir(&session_dir).exists(),
             "and no partial file is left behind"
         );
+    }
+
+    /// After a kill or power loss the last plain segment has no `moov`, so the whole session used to
+    /// fail to finalise at every start, forever, and the row never closed. Recovery now drops the
+    /// unreadable tail, concatenates what is readable and says what it dropped.
+    #[test]
+    fn a_truncated_last_segment_is_dropped_and_the_rest_is_recovered() {
+        let dir = temp_dir("session-");
+        let sessions_dir = dir.path().join("sessions");
+        let session_dir = sessions_dir.join("session-1700000000");
+        write_segments(&session_dir, 1);
+        truncate(&session_dir.join("seg-000001.mp4"));
+        let store = store();
+        let id = running_session(&store, &session_dir, SESSION_MODE_SESSION);
+
+        let report = recover(&store, &sessions_dir);
+
+        assert_eq!(report.recovered, vec![id], "{report:?}");
+        assert!(report.unfinalised.is_empty(), "{report:?}");
+        assert_eq!(report.dropped_segments.len(), 1, "{report:?}");
+        assert_eq!(report.dropped_segments[0].session_id, id);
+        assert_eq!(report.dropped_segments[0].seq, 1);
+        assert!(report.dropped_segments[0].bytes > 0);
+        let row = store.get_session(id).unwrap().unwrap();
+        assert!(row.ended_at_ms.is_some(), "the row is closed");
+        let final_path = row.final_path.expect("the session file is named");
+        let info = MediaInfo::probe(&bin(), Path::new(&final_path)).expect("a playable file");
+        assert!(
+            (900..1_500).contains(&info.duration_ms),
+            "one good second survived, got {}ms",
+            info.duration_ms
+        );
+        // Recovery is a one-shot: the next start finds nothing to do.
+        assert!(recover(&store, &sessions_dir).is_empty());
+    }
+
+    /// A crash inside the first segment leaves nothing readable. The row must still close (it used to
+    /// stay running forever), and the damaged bytes are kept for retention to remove with the row.
+    #[test]
+    fn a_session_with_no_readable_segment_is_closed_and_its_files_are_kept() {
+        let dir = temp_dir("session-");
+        let sessions_dir = dir.path().join("sessions");
+        let session_dir = sessions_dir.join("session-1700000000");
+        write_segments(&session_dir, 1);
+        truncate(&session_dir.join("seg-000000.mp4"));
+        truncate(&session_dir.join("seg-000001.mp4"));
+        let store = store();
+        let id = running_session(&store, &session_dir, SESSION_MODE_SESSION);
+
+        let report = recover(&store, &sessions_dir);
+
+        assert_eq!(report.closed_empty, vec![id], "{report:?}");
+        assert_eq!(report.dropped_segments.len(), 2, "{report:?}");
+        let row = store.get_session(id).unwrap().unwrap();
+        assert!(row.ended_at_ms.is_some() && row.final_path.is_none());
+        assert!(
+            session_dir.join("seg-000000.mp4").is_file(),
+            "nothing is deleted when nothing was recovered"
+        );
+    }
+
+    /// Two runs in one second used to share `session-<seconds>.mp4`: the second finalise overwrote the
+    /// first run's file while its row still named it. The file now takes its directory's name, and a
+    /// name whose file already exists is never handed out.
+    #[test]
+    fn two_sessions_in_the_same_second_get_different_files() {
+        let dir = temp_dir("session-");
+        let sessions_dir = dir.path().join("sessions");
+        let first = create_session_dir(&sessions_dir, 1_700_000_000_500).unwrap();
+        let second = create_session_dir(&sessions_dir, 1_700_000_000_900).unwrap();
+        assert_ne!(first, second);
+        assert_ne!(session_file_for_dir(&first), session_file_for_dir(&second));
+        assert_eq!(
+            session_file_for_dir(&first),
+            sessions_dir.join("session-1700000000.mp4")
+        );
+
+        // The first session finished long ago: its directory is gone but its file stays.
+        std::fs::remove_dir(&first).unwrap();
+        std::fs::remove_dir(&second).unwrap();
+        std::fs::write(session_file_for_dir(&first), b"finished").unwrap();
+        let third = create_session_dir(&sessions_dir, 1_700_000_000_100).unwrap();
+        assert_ne!(
+            session_file_for_dir(&third),
+            session_file_for_dir(&first),
+            "a finished session's file is not reused for a new run in its second"
+        );
+    }
+
+    #[test]
+    fn the_output_is_synced_before_its_segments_may_go() {
+        let dir = temp_dir("session-");
+        let file = dir.path().join("out.mp4");
+        assert!(
+            sync_output(&file).is_err(),
+            "a file that is not there cannot be durable"
+        );
+        std::fs::write(&file, b"x").unwrap();
+        sync_output(&file).expect("an existing file syncs");
     }
 
     /// A row for a recording that wrote nothing is closed; a buffer-mode row left running is closed
@@ -1183,7 +1438,7 @@ mod tests {
         let orphan = sessions_dir.join("session-nobody");
         write_segments(&orphan, 1);
 
-        let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
+        let report = recover(&store, &sessions_dir);
 
         let mut closed = report.closed_empty.clone();
         closed.sort_unstable();
@@ -1223,7 +1478,7 @@ mod tests {
         write_segments(&session_dir, 1);
         let store = store();
         let id = running_session(&store, &session_dir, SESSION_MODE_SESSION);
-        let file = session_file_path(&sessions_dir, 1_700_000_000_000);
+        let file = session_file_for_dir(&session_dir);
         std::fs::write(&file, b"a finished session").unwrap();
         store
             .end_session(
@@ -1235,7 +1490,7 @@ mod tests {
             )
             .expect("ending it");
 
-        let report = recover_sessions(&store, &sessions_dir, &bin(), 1_000, "libx264");
+        let report = recover(&store, &sessions_dir);
 
         assert_eq!(
             report.leftover_dirs,
@@ -1267,9 +1522,7 @@ mod tests {
             "named from the session's start instant, like its file"
         );
         assert_eq!(
-            session_file_path(&sessions, 1_700_000_000_000)
-                .file_name()
-                .unwrap(),
+            session_file_for_dir(&first).file_name().unwrap(),
             "session-1700000000.mp4"
         );
     }

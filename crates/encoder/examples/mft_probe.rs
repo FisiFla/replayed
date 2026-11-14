@@ -1,8 +1,10 @@
 //! Ask this machine what hardware video encoders it has, and whether they take a GPU texture.
 //!
 //! The same shape as `xtask probe`: it starts Media Foundation, enumerates the hardware H.264
-//! encoder MFTs, and runs the zero-copy handshake on each, passing a device manager built over a
-//! D3D11 device of the kind Windows Graphics Capture requires. A machine with no hardware
+//! encoder MFTs of each adapter, and runs the zero-copy handshake on each, passing a device manager
+//! built over a D3D11 device of the kind Windows Graphics Capture requires, **created on that
+//! encoder's own adapter**. Run it from the desktop session: the Quick Sync MFTs cannot even be
+//! created from an SSH session (session 0), and answer `0x80004005` there. A machine with no hardware
 //! encoder MFT, or one that refuses the handshake, cannot take the zero-copy path at all.
 //!
 //! ```text
@@ -45,10 +47,11 @@ fn main() -> anyhow::Result<()> {
     println!("hardware {codec:?} encoder MFTs: {}", encoders.len());
     for encoder in &encoders {
         println!(
-            "  {:<46} d3d11={:<5} async={:<5}\n      url: {}",
+            "  {:<46} d3d11={:<5} async={:<5}\n      adapter: {}\n      url: {}",
             encoder.name,
             encoder.accepts_d3d11,
             encoder.asynchronous,
+            encoder.adapter,
             encoder.hardware_url.as_deref().unwrap_or("-"),
         );
         if encoder.accepts.is_empty() {
@@ -136,6 +139,7 @@ fn main() -> anyhow::Result<()> {
                     bitrate_kbps: BITRATE_KBPS,
                     fps: FPS,
                     mode: replayed_encoder::RateControl::Cbr,
+                    vendor: None,
                 },
             )
         }) {
@@ -171,6 +175,7 @@ fn main() -> anyhow::Result<()> {
                 bitrate_kbps: BITRATE_KBPS,
                 fps: FPS,
                 mode: replayed_encoder::RateControl::Cbr,
+                vendor: None,
             },
         ) {
             Ok(mut encoder) => {
@@ -202,7 +207,7 @@ fn main() -> anyhow::Result<()> {
                 // Streamed into ffmpeg as produced, not batched: an H.264 elementary stream has no timestamps,
                 // so ffmpeg uses arrival times, and a batch write makes every frame arrive at once (30 frames
                 // paced over a second once produced a 196ms fragment).
-                let mut sink = FfmpegSink::spawn()?;
+                let mut sink = FfmpegSink::spawn(codec)?;
                 // Paced at 30fps for the same reason.
                 let pace = std::time::Duration::from_millis(33);
                 // Three seconds, so the one-fragment-per-keyframe contract is visible (one keyframe a second).
@@ -235,13 +240,14 @@ fn main() -> anyhow::Result<()> {
                         std::thread::sleep(pace - spent);
                     }
                 }
-                match encoder.finish(std::time::Duration::from_secs(2)) {
-                    Ok(encoded) => {
-                        for frame in encoded {
-                            total += frame.bytes.len();
-                        }
-                    }
-                    Err(err) => println!("drain failed: {err:#}"),
+                // The frames the drain produced count even when it reports a problem: they are
+                // collected as they arrive and kept on failure.
+                let mut tail = Vec::new();
+                if let Err(err) = encoder.finish(std::time::Duration::from_secs(2), &mut tail) {
+                    println!("drain failed: {err:#}");
+                }
+                for frame in tail {
+                    total += frame.bytes.len();
                 }
                 println!("{frames} frames submitted, {total} bytes of H.264 out");
                 println!("the stream starts {:02x?}", &stream[..stream.len().min(8)]);
@@ -279,7 +285,7 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// An ffmpeg child taking an H.264 elementary stream on stdin and writing fragmented MP4 to stdout.
+/// An ffmpeg child taking an elementary stream of `codec` on stdin and writing fragmented MP4 to stdout.
 ///
 /// The command line is the project's replay-buffer shape (`empty_moov+frag_keyframe+default_base_moof`).
 /// `-use_wallclock_as_timestamps 1` is load-bearing: an elementary stream has no timestamps, and
@@ -293,7 +299,7 @@ struct FfmpegSink {
 
 #[cfg(windows)]
 impl FfmpegSink {
-    fn spawn() -> anyhow::Result<Self> {
+    fn spawn(codec: replayed_encoder::VideoCodec) -> anyhow::Result<Self> {
         use anyhow::Context;
         use std::io::Read;
         use std::process::{Command, Stdio};
@@ -304,8 +310,11 @@ impl FfmpegSink {
                 "-hide_banner",
                 "-loglevel",
                 "error",
+                // The raw demuxer's name is the codec's: `h264` or `hevc`. It was `h264` for both,
+                // so probing HEVC wrote an H.265 stream through the H.264 parser and the output
+                // was unplayable, which misled whoever was investigating a hardware problem.
                 "-f",
-                "h264",
+                codec.as_str(),
                 "-use_wallclock_as_timestamps",
                 "1",
                 "-i",

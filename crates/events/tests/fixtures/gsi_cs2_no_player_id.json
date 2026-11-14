@@ -1,0 +1,59 @@
+{
+  "provider": {
+    "name": "Counter-Strike: Global Offensive",
+    "appid": 730,
+    "version": 14013,
+    "steamid": "76561198000000001",
+    "timestamp": 1699999999
+  },
+  "map": {
+    "mode": "competitive",
+    "name": "de_dust2",
+    "phase": "live",
+    "round": 5,
+    "team_ct": {
+      "score": 3,
+      "name": "CT"
+    },
+    "team_t": {
+      "score": 1,
+      "name": "T"
+    },
+    "num_rounds": 24
+  },
+  "round": {
+    "phase": "live",
+    "bomb": "planted"
+  },
+  "player": {
+    "state": {
+      "health": 74,
+      "armor": 100,
+      "helmet": true,
+      "flashed": 0,
+      "money": 4200,
+      "round_kills": 1,
+      "round_killhs": 1
+    },
+    "match_stats": {
+      "kills": 12,
+      "assists": 3,
+      "deaths": 5,
+      "mvps": 2,
+      "score": 31
+    }
+  },
+  "bomb": {
+    "state": "planted",
+    "countdown": "38.5",
+    "player": "76561198000000002",
+    "position": "-1120.5, 2100.0, 0.0"
+  },
+  "phase_countdowns": {
+    "phase": "bomb",
+    "phase_ends_in": "38.5"
+  },
+  "auth": {
+    "token": "fixture-token-not-a-secret"
+  }
+}

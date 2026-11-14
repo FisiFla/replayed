@@ -52,33 +52,33 @@ pub enum AuthToken {
     Unreadable,
 }
 
-/// How much of a body the token probe looks at.
-///
-/// The game sends the `auth` block first — it is the block the installed file declares, and
-/// it is the first key in every payload this project has seen — so the token is within the
-/// first few dozen bytes. The bound is what keeps the gate cheap: without it, a peer who
-/// sends two megabytes of JSON with no `auth` block in it would make the recorder walk all
-/// of it, and the walk is exactly what an unauthenticated peer gets to spend.
-///
-/// A body whose `auth` block is further in than this is refused. The game does not send
-/// one, and a refusal is loud: the listener answers `400` and says so in the log, rather
-/// than a game that silently posts into the void.
-pub const PROBE_BYTES: usize = 64 * 1024;
-
-/// The token in a GSI POST body's `auth` block, read without parsing the rest of the body.
+/// The token in a GSI POST body's `auth` block, read without building the rest of the body.
 ///
 /// The whole document is parsed only once the token has been accepted; this is the cheap
-/// look that comes first, and it is cheap in two ways: it stops at the `auth` block, so the
-/// rest of the body is never turned into values, and it never reads past [`PROBE_BYTES`].
+/// look that comes first, and it is cheap in one way that matters: it never turns the rest of
+/// the body into values. It skips everything that is not `auth` ([`serde::de::IgnoredAny`]) and
+/// stops at the block once it has it.
+///
+/// # The block is usually the last key
+///
+/// An earlier version read only the first 64 KiB, on the belief that the game sends `auth`
+/// first. It does not: Valve writes the blocks in its own order and `auth` (the block the
+/// installed cfg declares) comes after `provider`, `map`, `round`, `player`, `allplayers_*`
+/// and `previously`/`added`. A body over the window was therefore cut off before its token and
+/// answered `400`, and a game whose payload grew past 64 KiB (a full ten-player scoreboard with
+/// weapons and positions can) would silently stop being heard. The probe now walks the body as
+/// far as it must. The walk is bounded by the body's size, which [`crate::gsi::http`] has
+/// already capped at [`crate::gsi::http::MAX_BODY_BYTES`] before this is called, and an
+/// unauthenticated peer's walks are charged to the anonymous request budget in
+/// [`crate::gsi`], not to the game's.
 ///
 /// The first `auth` block wins. A body carrying two is not something the game sends, and
 /// the document that is finally parsed is the authority on the token anyway
 /// ([`crate::gsi::token_matches`]), so a body that hides a second block behind the first
 /// is refused rather than believed.
 pub fn auth_token(body: &[u8]) -> AuthToken {
-    let window = &body[..body.len().min(PROBE_BYTES)];
     let mut found: Option<BTreeMap<String, String>> = None;
-    let mut deserializer = serde_json::Deserializer::from_slice(window);
+    let mut deserializer = serde_json::Deserializer::from_slice(body);
     let outcome =
         serde::Deserializer::deserialize_any(&mut deserializer, AuthVisitor { found: &mut found });
     match found {
@@ -93,6 +93,82 @@ pub fn auth_token(body: &[u8]) -> AuthToken {
             Err(_) => AuthToken::Unreadable,
         },
     }
+}
+
+/// How much of each end of a body [`carries_token`] looks at.
+const HINT_WINDOW: usize = 8 * 1024;
+
+/// The most `"token"` keys looked at in each window, so a body made of nothing else costs a
+/// bounded amount.
+const HINT_CANDIDATES: usize = 8;
+
+/// The longest string taken as a candidate token. The generated token is 32 hex digits; a
+/// longer string cannot be it, and refusing to read one keeps the scan bounded.
+const HINT_MAX_TOKEN: usize = 128;
+
+/// Whether the start or the end of `body` holds the string `expected` as the value of a
+/// `"token"` key. An advisory look, not a gate.
+///
+/// The listener uses it to tell, before it has parsed anything, a request that is very likely
+/// the game's own from one that is not, so that the game's POSTs are not charged to the budget
+/// an anonymous peer burns through ([`crate::gsi`]). It reads only the first and the last
+/// `HINT_WINDOW` bytes, because the block sits at one end or the other of a real payload and
+/// a scan of the middle of a two-megabyte body is the cost it exists to avoid.
+///
+/// What it decides is only which queue a request waits in. [`auth_token`] and
+/// [`crate::gsi::token_matches`] still decide whether it is believed, so fooling this saves an
+/// attacker nothing without the token: the comparison against the secret is constant time
+/// (`crate::gsi::token_equals`, the same constant-time comparison the gate uses) and happens only on a string this function has cut out of
+/// the body, never as a search of the body for the secret.
+pub fn carries_token(body: &[u8], expected: &str) -> bool {
+    if expected.is_empty() {
+        return false;
+    }
+    let head = &body[..body.len().min(HINT_WINDOW)];
+    let tail = &body[body.len().saturating_sub(HINT_WINDOW)..];
+    window_carries_token(head, expected)
+        || (body.len() > HINT_WINDOW && window_carries_token(tail, expected))
+}
+
+fn window_carries_token(window: &[u8], expected: &str) -> bool {
+    const KEY: &[u8] = b"\"token\"";
+    let mut matched = false;
+    let mut from = 0;
+    for _ in 0..HINT_CANDIDATES {
+        let Some(at) = window[from..]
+            .windows(KEY.len())
+            .position(|candidate| candidate == KEY)
+        else {
+            break;
+        };
+        let mut rest = &window[from + at + KEY.len()..];
+        from += at + KEY.len();
+        rest = skip_blanks(rest);
+        let Some(after_colon) = rest.strip_prefix(b":") else {
+            continue;
+        };
+        let Some(value) = skip_blanks(after_colon).strip_prefix(b"\"") else {
+            continue;
+        };
+        let end = value
+            .iter()
+            .take(HINT_MAX_TOKEN + 1)
+            .position(|byte| *byte == b'"');
+        if let Some(end) = end {
+            if let Ok(candidate) = std::str::from_utf8(&value[..end]) {
+                // No early exit: every candidate is compared whether or not an earlier one matched.
+                matched |= super::token_equals(expected, candidate);
+            }
+        }
+    }
+    matched
+}
+
+fn skip_blanks(mut bytes: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t' | b'\r' | b'\n', rest @ ..] = bytes {
+        bytes = rest;
+    }
+    bytes
 }
 
 /// A visitor that reads a document's `auth` block and stops there.
@@ -455,5 +531,97 @@ mod tests {
         ] {
             assert_eq!(auth_token(body), AuthToken::Unreadable, "got for {body:?}");
         }
+    }
+
+    /// A realistic payload: `auth` is the last key, after a scoreboard of the requested size.
+    fn payload_with_auth_last(filler_bytes: usize, token: &str) -> Vec<u8> {
+        let mut body =
+            String::from(r#"{"provider":{"name":"Counter-Strike 2","appid":730},"allplayers":{"#);
+        let mut n = 0;
+        while body.len() < filler_bytes {
+            body.push_str(&format!(
+                r#""7656119800000{n:04}":{{"name":"p{n}","state":{{"health":100}}}},"#
+            ));
+            n += 1;
+        }
+        body.push_str(&format!(r#""x":{{}}}},"auth":{{"token":"{token}"}}}}"#));
+        body.into_bytes()
+    }
+
+    #[test]
+    fn the_token_is_found_when_auth_is_the_last_key_however_large_the_body() {
+        // The probe used to stop at 64 KiB, so a payload whose `auth` block sat behind a large
+        // scoreboard (where the game puts it) was answered 400 and never heard.
+        for size in [
+            200,
+            60 * 1024,
+            64 * 1024 + 10,
+            300 * 1024,
+            1024 * 1024 + 512 * 1024,
+        ] {
+            let body = payload_with_auth_last(size, "the-token");
+            assert!(body.len() >= size);
+            assert_eq!(
+                auth_token(&body),
+                AuthToken::Present("the-token".to_string()),
+                "a {}-byte body with auth last",
+                body.len()
+            );
+        }
+        // And the same body with no auth block is still a document with no token.
+        assert_eq!(
+            auth_token(br#"{"provider":{"appid":730},"player":{"name":"x"}}"#),
+            AuthToken::Absent
+        );
+    }
+
+    #[test]
+    fn the_hint_sees_a_token_at_either_end_and_only_the_exact_token() {
+        let token = "0123456789abcdef0123456789abcdef"; // gitleaks:allow
+                                                        // First key (small body), and last key behind a large body.
+        assert!(carries_token(
+            format!(r#"{{"auth":{{"token":"{token}"}},"map":{{}}}}"#).as_bytes(),
+            token
+        ));
+        assert!(carries_token(
+            &payload_with_auth_last(500 * 1024, token),
+            token
+        ));
+        // Spacing the game might use.
+        assert!(carries_token(
+            format!("{{\n  \"auth\": {{\n    \"token\" : \"{token}\"\n  }}\n}}").as_bytes(),
+            token
+        ));
+        // Not the token: wrong, a prefix, an extension, empty, absent, and the token in the
+        // middle of a large body where the hint does not look.
+        for wrong in [
+            "0123456789abcdef0123456789abcdee",
+            &token[..31],
+            "0123456789abcdef0123456789abcdef0",
+            "",
+        ] {
+            assert!(
+                !carries_token(
+                    format!(r#"{{"auth":{{"token":"{wrong}"}}}}"#).as_bytes(),
+                    token
+                ),
+                "{wrong:?}"
+            );
+        }
+        assert!(!carries_token(b"{}", token));
+        assert!(!carries_token(b"not json", token));
+        assert!(!carries_token(
+            format!(r#"{{"auth":{{"token":"{token}"}}}}"#).as_bytes(),
+            ""
+        ));
+        let mut middle = vec![b' '; 100 * 1024];
+        let block = format!(r#""token":"{token}""#);
+        middle[50 * 1024..50 * 1024 + block.len()].copy_from_slice(block.as_bytes());
+        assert!(!carries_token(&middle, token));
+        // The token as a *key* or in another field is not a `"token": "<value>"` pair.
+        assert!(!carries_token(
+            format!(r#"{{"note":"{token}"}}"#).as_bytes(),
+            token
+        ));
     }
 }

@@ -33,6 +33,10 @@ pub enum ErrorCode {
     /// The recording engine refused the operation: no hardware encoder, a recorder that
     /// is already running, a config file that cannot describe a recording.
     Recording,
+    /// A recording is running and the operation would end it, so it was refused rather than
+    /// done: the caller has to stop the recording, or say that stopping it is fine, first. The
+    /// update install asks (`prepare_for_update`), because the installer ends this process.
+    RecordingActive,
     /// A filesystem operation failed.
     Io,
 }

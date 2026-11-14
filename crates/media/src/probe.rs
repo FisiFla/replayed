@@ -132,19 +132,41 @@ impl StreamLayout {
 
 /// Probe the full stream layout of a file on disk.
 pub fn stream_layout(bin: &FfmpegBinaries, path: &Path) -> Result<StreamLayout> {
+    match probe_layout(bin, path)? {
+        Ok(layout) => Ok(layout),
+        Err(rejection) => bail!("{rejection}"),
+    }
+}
+
+/// As [`stream_layout`], but tells "ffprobe ran and could not read this file" apart from "ffprobe
+/// could not be run".
+///
+/// The outer `Err` is the second: ffprobe would not spawn or was killed at its deadline, which says
+/// nothing about the file. The inner `Err` is the first, carrying ffprobe's own words: a file with
+/// no `moov` atom (the newest segment of a session that was killed mid-write) or other bytes that
+/// are not a media file. A caller deciding whether a file is *unreadable* must act on only the
+/// inner one: dropping a good segment because a probe timed out would lose footage on a transient.
+pub fn probe_layout(
+    bin: &FfmpegBinaries,
+    path: &Path,
+) -> Result<std::result::Result<StreamLayout, String>> {
     let mut cmd = crate::sidecar_command(&bin.ffprobe);
     cmd.args(["-v", "error", "-print_format", "json", "-show_streams"])
         .arg(path);
     let out = run_with_timeout(cmd, PROBE_TIMEOUT)?;
     if !out.status.success() {
-        bail!(
+        return Ok(Err(format!(
             "ffprobe failed reading the stream layout of {}: {}",
             path.display(),
             String::from_utf8_lossy(&out.stderr).trim()
-        );
+        )));
     }
-    StreamLayout::from_ffprobe_json(&String::from_utf8_lossy(&out.stdout))
-        .with_context(|| format!("reading the stream layout of {}", path.display()))
+    Ok(Ok(StreamLayout::from_ffprobe_json(
+        &String::from_utf8_lossy(&out.stdout),
+    )
+    .with_context(|| {
+        format!("reading the stream layout of {}", path.display())
+    })?))
 }
 
 /// A/V offset observed within one produced file: the audio timeline against the video timeline

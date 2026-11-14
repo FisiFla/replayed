@@ -118,6 +118,24 @@ describe('the timeline', () => {
     expect(seeks).toEqual([30_000 - MARKER_LEAD_MS]);
   });
 
+  it('seeks to the lead-in when a marker is activated from the keyboard', async () => {
+    // Enter and Space on a focused button arrive as a click with no pointer gesture behind
+    // it. The marker is announced as a control, so it has to do what a click on it does.
+    const { seeks, query } = await mountTimeline({ markers: [marker(30_000)] });
+    query<HTMLButtonElement>('button.marker').click();
+    expect(seeks).toEqual([30_000 - MARKER_LEAD_MS]);
+  });
+
+  it('does not seek twice for a mouse click, which the track already handled', async () => {
+    const { seeks, query } = await mountTimeline({ markers: [marker(30_000)] });
+    const button = query<HTMLButtonElement>('button.marker');
+    pointer(button, 'pointerdown', TRACK_WIDTH / 2);
+    pointer(button, 'pointerup', TRACK_WIDTH / 2);
+    // The browser's click that follows a mouse press has a click count of 1.
+    button.dispatchEvent(new MouseEvent('click', { bubbles: true, detail: 1 }));
+    expect(seeks).toEqual([30_000 - MARKER_LEAD_MS]);
+  });
+
   it('scrubs to the pointer when the track itself is pressed', async () => {
     const { seeks, query } = await mountTimeline();
     const track = query<HTMLElement>('.track');

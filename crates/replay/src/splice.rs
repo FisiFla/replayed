@@ -22,7 +22,8 @@ pub struct ClipMetadata {
 pub struct ClipSplicer;
 
 impl ClipSplicer {
-    /// Concatenate whole segments with `-c copy`, keeping every stream.
+    /// Concatenate whole segments with `-c copy`, keeping every stream (plus the voice mix of
+    /// `edit::concat_clip_sized` when there is a microphone).
     ///
     /// No leading-segment trim: segment boundaries are keyframes, so `-ss`/`-c copy` would resolve
     /// to the same frame and change nothing.
@@ -50,12 +51,11 @@ impl ClipSplicer {
         let list = out.with_extension("concat.txt");
         let total_bytes = edit::write_concat_list(&files, &list)?;
         // The list is removed whether the copy succeeded or not.
-        let concat =
-            edit::concat_lossless_sized(bin, &list, out, total_bytes, layout.audio_count());
+        let concat = edit::concat_clip_sized(bin, &list, out, total_bytes, layout.audio_count());
         let _ = std::fs::remove_file(&list);
         concat?;
 
-        let info = replayed_media::MediaInfo::probe(bin, out)?;
+        let info = probe_or_remove(bin, out)?;
         log_drift(out, &info);
 
         Ok(ClipMetadata {
@@ -107,7 +107,7 @@ impl ClipSplicer {
     ) -> Result<ClipMetadata> {
         replayed_media::edit::remux_stream_lossless(bin, bytes, out, audio_tracks)?;
 
-        let info = replayed_media::MediaInfo::probe(bin, out)?;
+        let info = probe_or_remove(bin, out)?;
         log_drift(out, &info);
 
         Ok(ClipMetadata {
@@ -117,6 +117,16 @@ impl ClipSplicer {
             encoder: encoder.to_string(),
         })
     }
+}
+
+/// Probe the clip just written; a file ffprobe cannot read is removed before the error returns.
+///
+/// The caller gets an error and no `ClipMetadata`, so nothing would ever index the file: left in
+/// place it is an unnamed, unaccounted file in the library directory.
+fn probe_or_remove(bin: &FfmpegBinaries, out: &Path) -> Result<replayed_media::MediaInfo> {
+    replayed_media::MediaInfo::probe(bin, out).inspect_err(|_| {
+        let _ = std::fs::remove_file(out);
+    })
 }
 
 /// Log the A/V offset of a clip just written. One definition for both splice paths, so a RAM
@@ -149,4 +159,23 @@ fn log_drift(out: &Path, info: &replayed_media::MediaInfo) {
 fn opt_ms(ms: Option<u64>) -> String {
     ms.map(|m| m.to_string())
         .unwrap_or_else(|| "unavailable".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A clip whose post-write probe fails is removed rather than left unindexed.
+    #[test]
+    fn a_clip_that_cannot_be_probed_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("clip.mp4");
+        std::fs::write(&out, b"not a video").unwrap();
+        let bin = FfmpegBinaries {
+            ffmpeg: "/nonexistent/ffmpeg".into(),
+            ffprobe: "/nonexistent/ffprobe".into(),
+        };
+        probe_or_remove(&bin, &out).expect_err("the probe cannot run");
+        assert!(!out.exists(), "no file is left for nothing to index");
+    }
 }

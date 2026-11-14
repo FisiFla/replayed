@@ -17,6 +17,7 @@ import {
   describeRecordedClip,
   formatDrift,
   formatRate,
+  describeRecorderNotice,
   recordingLabel,
   recordingState,
 } from "./recording";
@@ -42,7 +43,7 @@ function status(overrides: Partial<RecordingStatus> = {}): RecordingStatus {
     watching_games: false,
     matched_game: null,
     recorder_mode: "buffer",
-    mic_enabled: false,
+    mic_enabled: false, ended: null, stalled_for_ms: null,
     ...overrides,
   };
 }
@@ -265,5 +266,31 @@ describe("the automatic-recording line", () => {
     ],
   ])("says the right thing %s", (_when, st, text) => {
     expect(describeAutoRecord(st)).toBe(text);
+  });
+});
+
+describe("a recording that ended or stalled without failing", () => {
+  it("says why a cleanly ended recording stopped, and is not a failure", () => {
+    const ended = status({ running: false, ended: "the captured window was closed" });
+    expect(recordingState(ended)).toBe("idle");
+    expect(describeRecorderNotice(ended)).toBe(
+      "The recording ended: the captured window was closed",
+    );
+  });
+
+  it("shows a stall only while running and only from 5 s", () => {
+    expect(describeRecorderNotice(status({ stalled_for_ms: 4_999 }))).toBeNull();
+    expect(describeRecorderNotice(status({ stalled_for_ms: 12_400 }))).toBe(
+      "No new frames for 12 s (minimised or unchanging window).",
+    );
+    expect(describeRecorderNotice(status({ running: false, stalled_for_ms: 12_400 }))).toBeNull();
+  });
+
+  it("leaves a failure to the error line", () => {
+    expect(
+      describeRecorderNotice(status({ running: false, error: "disk full", ended: "x" })),
+    ).toBeNull();
+    expect(describeRecorderNotice(null)).toBeNull();
+    expect(describeRecorderNotice(status())).toBeNull();
   });
 });
