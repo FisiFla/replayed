@@ -180,6 +180,19 @@ signed update has never been offered to an installed copy**; the ledger
   Tauri 2 signs the installer itself, so there is no `.nsis.zip`. See `docs/packaging.md`.
 
 ### Fixed
+- **A 4K recording no longer drops a burst of frames when the app is used during it.** The
+  zero-copy path's video passes through ffmpeg's muxer queue, which was left at its default of
+  8 packets. When the reader of ffmpeg's output stops for a moment — the replay buffer's ring
+  assembles a clip's bytes under its lock, and the splice that follows runs on another thread
+  only after that copy — ffmpeg's muxer blocks, that queue fills, and ffmpeg stops reading the
+  video pipe too. The encoder's two-deep feed then overflows and the whole stall's frames are
+  lost, and the schedule treated the resulting hole as a capture gap and waited half of it, so
+  the drops continued after the stall ended. That is the owner's "222 frames never reached the
+  hardware encoder" and the 45 to 50 of 60 fps: a deliberate 2 s stall in the reproduction
+  dropped 375 of 602 frames and did not recover. The encoded path's muxer queue is now four
+  seconds of packets (`MUX_QUEUE_PACKETS`), the raw path keeps its default, and `FrameSchedule`
+  writes the first frame after a hole at once instead of spacing it by the hole. The same 2 s
+  stall now costs no frames (`crates/encoder/tests/zero_copy_rate.rs`).
 - **The microphone could be recorded and never heard.** It was a separate second audio track,
   and the app's player (like most players a clip is shared to) plays only the first, so the
   voice was in the file and nobody heard it. And an export kept one audio track, the game

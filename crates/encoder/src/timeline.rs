@@ -152,13 +152,23 @@ impl FrameSchedule {
         let due = match (self.last_capture, self.last_written) {
             (Some(previous_capture), Some(previous_written)) => {
                 let gap = captured_at.saturating_sub(previous_capture);
-                // Faster than the frames arrive while there is a lag to be rid of.
-                let gap = if draining { gap / 2 } else { gap };
-                previous_written
-                    // `checked_add`: a capture time far in the future would overflow an `Instant`,
-                    // and a frame that cannot be placed is written now rather than never.
-                    .checked_add(gap)
-                    .unwrap_or(now)
+                if gap > MAX_LAG {
+                    // The frames missing from this gap were dropped, so the picture has already
+                    // been held for it and the wall clock has spent that time. Waiting any part
+                    // of the gap again keeps the queue full and drops the frames that follow:
+                    // measured, a 2 s stall in ffmpeg's reader became drops for the rest of the
+                    // recording. The frame is current, so it is written now.
+                    now
+                } else {
+                    // Faster than the frames arrive while there is a lag to be rid of.
+                    let gap = if draining { gap / 2 } else { gap };
+                    previous_written
+                        // `checked_add`: a capture time far in the future would overflow an
+                        // `Instant`, and a frame that cannot be placed is written now rather
+                        // than never.
+                        .checked_add(gap)
+                        .unwrap_or(now)
+                }
             }
             _ => now,
         };
@@ -472,6 +482,35 @@ mod tests {
             wait,
             Duration::ZERO,
             "a late frame is written at once, not at the slot the capture time would have given it"
+        );
+    }
+
+    /// A hole left by dropped frames does not delay the frame after it.
+    ///
+    /// The defect this prevents: after a stall the frames that could not be queued are dropped, so
+    /// the next frame's capture time is a whole stall later than the last one written. Spacing it
+    /// by that gap (or half of it) leaves the writer waiting while new frames pile up behind it,
+    /// which drops more frames and makes the next gap bigger — a stall that never recovers, even
+    /// though the stall itself is over.
+    #[test]
+    fn a_hole_left_by_dropped_frames_does_not_delay_the_next_frame() {
+        let base = Instant::now();
+        let mut schedule = FrameSchedule::default();
+        schedule.wait_for(Duration::ZERO, at(base, 0));
+        // Half a second of frames was dropped; the one that arrives now was captured at 500 ms.
+        let wait = schedule.wait_for(Duration::from_millis(500), at(base, 505));
+        assert_eq!(
+            wait,
+            Duration::ZERO,
+            "the picture was already held for the missing half second, so the next frame is written \
+             at once rather than half a gap later"
+        );
+        // The stream resumes its normal spacing from there.
+        let next = schedule.wait_for(Duration::from_millis(517), at(base, 505));
+        assert_eq!(
+            next,
+            Duration::from_millis(17),
+            "the frames after the hole are spaced by their own capture interval again"
         );
     }
 
