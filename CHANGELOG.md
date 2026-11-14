@@ -15,6 +15,13 @@ signed update has never been offered to an installed copy**; the ledger
 (`docs/verification-status.md`) says what each run did and did not prove.
 
 ### Security
+- **The bundled SQLite is 3.54.1** (`rusqlite` 0.41.1, `libsqlite3-sys` 0.39.1), for RUSTSEC-2026-0459:
+  an older SQLite could return uninitialised memory when a database was opened with a crafted `-wal`
+  file beside it. The app only opens its own library database, so the exposure was small, but the
+  advisory failed `cargo deny`.
+- **The updater's archive reader is `zip` 9.5.1** (`tauri-plugin-updater` 2.14.1), for
+  RUSTSEC-2026-0429: `zip` 4.x aborted the process on a crafted symlink entry. A yanked
+  `async-executor` (1.14.0, under the notification and single-instance plugins) is now 1.14.1.
 - **The audio link authenticates its peer process.** ffmpeg reads the game's and the microphone's PCM
   from a local socket, and the first thing to connect used to win. Another program dialling freshly
   opened loopback ports (one was seen doing exactly that) could become the audio input and be fed the

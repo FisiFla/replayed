@@ -2,7 +2,7 @@
 #
 # The secret scan is the guard behind the "nothing leaves this machine" claim, so it has
 # to stay strict. It is strict by default: every rule gitleaks ships with is on, and the
-# only exceptions are the two below — both of them test fixtures, and both of them written
+# only exceptions are the three below — two test fixtures and one line of vendored docs, all written
 # down here rather than left as a fingerprint in `.gitleaksignore`, which goes stale the
 # moment a line moves and says nothing about *why*.
 #
@@ -50,4 +50,16 @@ description = "A TLS test key that was committed once and has since been removed
 ruleIDs = ["private-key"]
 paths = [
   '''^crates/events/tests/fixtures/tls/''',
+]
+
+# The vendored `muda` (the tray menu crate, patched to drop `SendInput`; see
+# `apps/desktop/src-tauri/vendor/README.md`) documents its accelerator syntax with
+# examples such as `shift+alt+KeyQ`, which the generic rule reads as a key assignment.
+# It is upstream documentation, not a credential. Only that file is allowed, so the rest of
+# `vendor/` is still scanned in full.
+[[allowlists]]
+description = "Vendored muda: keyboard-shortcut examples in its docs, not credentials"
+ruleIDs = ["generic-api-key"]
+paths = [
+  '''^apps/desktop/src-tauri/vendor/muda/src/accelerator/mod\.rs$''',
 ]
