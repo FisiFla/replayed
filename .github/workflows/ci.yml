@@ -459,12 +459,12 @@ jobs:
       # Every step below runs even when an earlier one failed (`!cancelled()`): the job is red
       # if any of them is, but a failing audit does not hide a leaked secret behind it. The
       # secret scan used to come after `npm audit` and was skipped whenever the audit was red.
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         if: ${{ !cancelled() }}
         with:
           command: check
           manifest-path: Cargo.toml
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+      - uses: EmbarkStudios/cargo-deny-action@70f81531115945ba6eb6b941ec9d39d063438eb9 # v2.1.2
         if: ${{ !cancelled() }}
         with:
           command: check
